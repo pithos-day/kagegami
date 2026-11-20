@@ -40,7 +40,11 @@ fn seed_for<T: std::hash::Hash>(salt: &T) -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     salt.hash(&mut h);
-    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
     h.finish()
 }
 
@@ -88,11 +92,14 @@ pub struct App {
     pub bench: Option<crate::bench::Bench>,
 }
 
-
 impl App {
     fn add_output(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        let Some(info) = self.output_state.info(&output) else { return };
-        let Some(name) = info.name.clone() else { return };
+        let Some(info) = self.output_state.info(&output) else {
+            return;
+        };
+        let Some(name) = info.name.clone() else {
+            return;
+        };
         if !self.args.output.matches(&name) || self.wallpapers.iter().any(|w| w.output == output) {
             return;
         }
@@ -147,7 +154,13 @@ impl App {
             if w.width == 0 {
                 continue;
             }
-            match Script::load(&self.args.script, &w.name, seed_for(&w.seed), w.width, w.height) {
+            match Script::load(
+                &self.args.script,
+                &w.name,
+                seed_for(&w.seed),
+                w.width,
+                w.height,
+            ) {
                 Ok(s) => {
                     w.script = Some(s);
                     w.failed = false;
@@ -185,7 +198,10 @@ impl App {
                     eprintln!("kagegami: {}: {e}", w.name);
                 }
             }
-            let dt = w.last_frame.map_or(0.0, |t| now.duration_since(t).as_secs_f64()).min(0.25);
+            let dt = w
+                .last_frame
+                .map_or(0.0, |t| now.duration_since(t).as_secs_f64())
+                .min(0.25);
             w.last_frame = Some(now);
 
             let w = &self.wallpapers[i];
@@ -214,7 +230,12 @@ impl App {
             let glsl = false;
             match &w.script {
                 #[cfg(feature = "gpu-bench")]
-                _ if glsl => self.bench.as_mut().unwrap().draw_glsl(renderer.gl(), w.width, w.height),
+                _ if glsl => {
+                    self.bench
+                        .as_mut()
+                        .unwrap()
+                        .draw_glsl(renderer.gl(), w.width, w.height)
+                }
                 Some(script) if !w.failed => match script.frame(dt) {
                     Ok(dl) => renderer.submit(&dl),
                     Err(e) => {
@@ -257,15 +278,49 @@ impl App {
 }
 
 impl CompositorHandler for App {
-    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
-    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
+    fn scale_factor_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: i32,
+    ) {
+    }
+    fn transform_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: wl_output::Transform,
+    ) {
+    }
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
         if let Some(w) = self.find(surface) {
             w.frame_pending = false;
         }
     }
-    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
-    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
+    fn surface_leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl OutputHandler for App {
@@ -275,10 +330,18 @@ impl OutputHandler for App {
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         self.add_output(qh, output);
     }
-    fn update_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+    fn update_output(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
         // 名前が後から届いた場合に備えて再試行する。
         self.add_output(qh, output.clone());
-        let scale = self.output_state.info(&output).map_or(1, |i| i.scale_factor.max(1));
+        let scale = self
+            .output_state
+            .info(&output)
+            .map_or(1, |i| i.scale_factor.max(1));
         if let Some(w) = self.wallpapers.iter_mut().find(|w| w.output == output) {
             if w.scale != scale {
                 w.scale = scale;
@@ -287,7 +350,12 @@ impl OutputHandler for App {
             }
         }
     }
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+    fn output_destroyed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
         if let Some(i) = self.wallpapers.iter().position(|w| w.output == output) {
             let mut w = self.wallpapers.remove(i);
             eprintln!("kagegami: output {} removed", w.name);
@@ -308,8 +376,17 @@ impl LayerShellHandler for App {
         }
     }
 
-    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface, configure: LayerSurfaceConfigure, _: u32) {
-        let Some(i) = self.wallpapers.iter().position(|w| &w.layer == layer) else { return };
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        layer: &LayerSurface,
+        configure: LayerSurfaceConfigure,
+        _: u32,
+    ) {
+        let Some(i) = self.wallpapers.iter().position(|w| &w.layer == layer) else {
+            return;
+        };
         let w = &mut self.wallpapers[i];
         let (lw, lh) = configure.new_size;
         if lw == 0 || lh == 0 {
@@ -319,10 +396,15 @@ impl LayerShellHandler for App {
         w.height = lh * w.scale as u32;
         match &w.egl_surface {
             Some(s) => s.resize(w.width as i32, w.height as i32),
-            None => match self.egl.create_surface(layer.wl_surface(), w.width as i32, w.height as i32) {
-                Ok(s) => w.egl_surface = Some(s),
-                Err(e) => eprintln!("kagegami: {}: {e}", w.name),
-            },
+            None => {
+                match self
+                    .egl
+                    .create_surface(layer.wl_surface(), w.width as i32, w.height as i32)
+                {
+                    Ok(s) => w.egl_surface = Some(s),
+                    Err(e) => eprintln!("kagegami: {}: {e}", w.name),
+                }
+            }
         }
         match &w.script {
             Some(script) => {
@@ -330,13 +412,15 @@ impl LayerShellHandler for App {
                     eprintln!("kagegami: {}: {e}", w.name);
                 }
             }
-            None if !w.failed => match Script::load(&self.args.script, &w.name, w.seed, w.width, w.height) {
-                Ok(s) => w.script = Some(s),
-                Err(e) => {
-                    eprintln!("kagegami: {}: {e}", w.name);
-                    w.failed = true;
+            None if !w.failed => {
+                match Script::load(&self.args.script, &w.name, w.seed, w.width, w.height) {
+                    Ok(s) => w.script = Some(s),
+                    Err(e) => {
+                        eprintln!("kagegami: {}: {e}", w.name);
+                        w.failed = true;
+                    }
                 }
-            },
+            }
             None => {}
         }
         // 設定が変わったらすぐに描き直す。
@@ -360,7 +444,13 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
         if capability == Capability::Pointer && self.pointer.is_none() {
             match self.seat_state.get_pointer(qh, &seat) {
                 Ok(p) => self.pointer = Some(p),
@@ -368,7 +458,13 @@ impl SeatHandler for App {
             }
         }
     }
-    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, capability: Capability) {
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
         if capability == Capability::Pointer {
             if let Some(p) = self.pointer.take() {
                 p.release();
@@ -379,9 +475,17 @@ impl SeatHandler for App {
 }
 
 impl PointerHandler for App {
-    fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
         for event in events {
-            let Some(w) = self.find(&event.surface) else { continue };
+            let Some(w) = self.find(&event.surface) else {
+                continue;
+            };
             // Wayland の座標は論理ピクセルなので、バッファーのピクセルに直す。
             let x = (event.position.0 * w.scale as f64) as f32;
             let y = (event.position.1 * w.scale as f64) as f32;
@@ -392,10 +496,15 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Leave { .. } => {
                     // カーソルが外に出たら、押していたボタンの状態も分からなくなる。
-                    w.mouse = MouseState { x: w.mouse.x, y: w.mouse.y, ..Default::default() };
+                    w.mouse = MouseState {
+                        x: w.mouse.x,
+                        y: w.mouse.y,
+                        ..Default::default()
+                    };
                     continue;
                 }
-                PointerEventKind::Press { button, .. } | PointerEventKind::Release { button, .. } => {
+                PointerEventKind::Press { button, .. }
+                | PointerEventKind::Release { button, .. } => {
                     let pressed = matches!(event.kind, PointerEventKind::Press { .. });
                     let b = match button {
                         BTN_LEFT => Button::Left,
@@ -408,7 +517,11 @@ impl PointerHandler for App {
                         Button::Right => &mut w.mouse.right,
                         Button::Middle => &mut w.mouse.middle,
                     } = pressed;
-                    click = Some(if pressed { MouseEvent::Pressed(x, y, b) } else { MouseEvent::Released(x, y, b) });
+                    click = Some(if pressed {
+                        MouseEvent::Pressed(x, y, b)
+                    } else {
+                        MouseEvent::Released(x, y, b)
+                    });
                 }
                 PointerEventKind::Axis { .. } => continue,
             }
@@ -418,7 +531,9 @@ impl PointerHandler for App {
                 if w.failed {
                     continue;
                 }
-                let r = script.set_mouse(&w.mouse).and_then(|_| script.mouse_event(ev));
+                let r = script
+                    .set_mouse(&w.mouse)
+                    .and_then(|_| script.mouse_event(ev));
                 if let Err(e) = r {
                     eprintln!("kagegami: {}: {e}", w.name);
                     w.failed = true;

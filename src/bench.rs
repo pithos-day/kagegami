@@ -28,9 +28,21 @@ struct Glsl {
 
 impl Bench {
     pub fn from_env() -> Option<Self> {
-        let target = std::env::var("KAGEGAMI_BENCH_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
-        let glsl_src = std::env::var("KAGEGAMI_BENCH_GLSL").ok().map(|p| std::fs::read_to_string(p).expect("read glsl"));
-        Some(Self { frames: 0, target, total: Duration::ZERO, glsl: None, glsl_src, started: Instant::now() })
+        let target = std::env::var("KAGEGAMI_BENCH_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let glsl_src = std::env::var("KAGEGAMI_BENCH_GLSL")
+            .ok()
+            .map(|p| std::fs::read_to_string(p).expect("read glsl"));
+        Some(Self {
+            frames: 0,
+            target,
+            total: Duration::ZERO,
+            glsl: None,
+            glsl_src,
+            started: Instant::now(),
+        })
     }
 
     pub fn uses_glsl(&self) -> bool {
@@ -51,7 +63,10 @@ impl Bench {
         }
         if self.frames >= WARMUP + self.target {
             let avg = self.total.as_secs_f64() * 1000.0 / self.target as f64;
-            println!("bench {label}: {avg:.3} ms/frame over {} frames", self.target);
+            println!(
+                "bench {label}: {avg:.3} ms/frame over {} frames",
+                self.target
+            );
             std::process::exit(0);
         }
     }
@@ -69,7 +84,12 @@ impl Bench {
             }
             gl.disable(glow::BLEND);
             let loc = |n: &str| gl.get_uniform_location(g.program, n);
-            gl.uniform_3_f32(loc("iResolution").as_ref(), width as f32, height as f32, 1.0);
+            gl.uniform_3_f32(
+                loc("iResolution").as_ref(),
+                width as f32,
+                height as f32,
+                1.0,
+            );
             gl.uniform_1_f32(loc("iTime").as_ref(), t);
             gl.uniform_4_f32(loc("iMouse").as_ref(), 0.0, 0.0, 0.0, 0.0);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
@@ -85,16 +105,27 @@ unsafe fn compile(gl: &glow::Context, src: &str) -> Glsl {
     let vert = "attribute vec2 a_pos; void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }";
     unsafe {
         let program = gl.create_program().unwrap();
-        for (ty, s) in [(glow::VERTEX_SHADER, vert), (glow::FRAGMENT_SHADER, frag.as_str())] {
+        for (ty, s) in [
+            (glow::VERTEX_SHADER, vert),
+            (glow::FRAGMENT_SHADER, frag.as_str()),
+        ] {
             let sh = gl.create_shader(ty).unwrap();
             gl.shader_source(sh, s);
             gl.compile_shader(sh);
-            assert!(gl.get_shader_compile_status(sh), "{}", gl.get_shader_info_log(sh));
+            assert!(
+                gl.get_shader_compile_status(sh),
+                "{}",
+                gl.get_shader_info_log(sh)
+            );
             gl.attach_shader(program, sh);
         }
         gl.bind_attrib_location(program, 0, "a_pos");
         gl.link_program(program);
-        assert!(gl.get_program_link_status(program), "{}", gl.get_program_info_log(program));
+        assert!(
+            gl.get_program_link_status(program),
+            "{}",
+            gl.get_program_info_log(program)
+        );
         let vbo = gl.create_buffer().unwrap();
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         let quad: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];

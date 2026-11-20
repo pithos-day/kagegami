@@ -56,14 +56,24 @@ impl Batch {
     fn quad(&mut self, corners: [[f32; 2]; 4], locals: [[f32; 2]; 4], shape: [f32; 2]) {
         let color = self.color;
         for i in 0..4 {
-            self.vertices.push(Vertex { pos: corners[i], local: locals[i], shape, color });
+            self.vertices.push(Vertex {
+                pos: corners[i],
+                local: locals[i],
+                shape,
+                color,
+            });
         }
     }
 
     pub fn circle(&mut self, x: f32, y: f32, r: f32) {
         let e = r.max(0.0) + AA_PAD;
         self.quad(
-            [[x - e, y - e], [x + e, y - e], [x - e, y + e], [x + e, y + e]],
+            [
+                [x - e, y - e],
+                [x + e, y - e],
+                [x - e, y + e],
+                [x + e, y + e],
+            ],
             [[-e, -e], [e, -e], [-e, e], [e, e]],
             [0.0, r.max(0.0)],
         );
@@ -81,7 +91,12 @@ impl Batch {
         let e = hw + AA_PAD;
         let at = |px: f32, py: f32, s: f32, n: f32| [px + ux * s + nx * n, py + uy * s + ny * n];
         self.quad(
-            [at(x1, y1, -e, -e), at(x2, y2, e, -e), at(x1, y1, -e, e), at(x2, y2, e, e)],
+            [
+                at(x1, y1, -e, -e),
+                at(x2, y2, e, -e),
+                at(x1, y1, -e, e),
+                at(x2, y2, e, e),
+            ],
             [[-e, -e], [len + e, -e], [-e, e], [len + e, e]],
             [len, hw],
         );
@@ -160,14 +175,19 @@ impl Renderer {
                 gl.attach_shader(program, sh);
                 gl.delete_shader(sh);
             }
-            for (i, name) in ["a_pos", "a_local", "a_shape", "a_color"].iter().enumerate() {
+            for (i, name) in ["a_pos", "a_local", "a_shape", "a_color"]
+                .iter()
+                .enumerate()
+            {
                 gl.bind_attrib_location(program, i as u32, name);
             }
             gl.link_program(program);
             if !gl.get_program_link_status(program) {
                 return Err(format!("shader link: {}", gl.get_program_info_log(program)));
             }
-            let u_res = gl.get_uniform_location(program, "u_res").ok_or("u_res not found")?;
+            let u_res = gl
+                .get_uniform_location(program, "u_res")
+                .ok_or("u_res not found")?;
 
             // 四角形 1 つ = 頂点 4 つ = 三角形 2 つ。インデックスは固定なので最初に 1 回だけ送る。
             let mut indices = Vec::with_capacity(MAX_QUADS * 6);
@@ -177,7 +197,11 @@ impl Renderer {
             }
             let ibo = gl.create_buffer()?;
             gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ibo));
-            gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, as_bytes(&indices), glow::STATIC_DRAW);
+            gl.buffer_data_u8_slice(
+                glow::ELEMENT_ARRAY_BUFFER,
+                as_bytes(&indices),
+                glow::STATIC_DRAW,
+            );
 
             let vbo = gl.create_buffer()?;
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
@@ -215,7 +239,8 @@ impl Renderer {
                 Blend::Alpha => glow::ONE_MINUS_SRC_ALPHA,
                 Blend::Add => glow::ONE,
             };
-            self.gl.blend_func_separate(glow::SRC_ALPHA, dst, glow::ZERO, glow::ONE);
+            self.gl
+                .blend_func_separate(glow::SRC_ALPHA, dst, glow::ZERO, glow::ONE);
         }
     }
 
@@ -229,7 +254,8 @@ impl Renderer {
         unsafe {
             self.gl.viewport(0, 0, width as i32, height as i32);
             self.gl.use_program(Some(self.program));
-            self.gl.uniform_2_f32(Some(&self.u_res), width as f32, height as f32);
+            self.gl
+                .uniform_2_f32(Some(&self.u_res), width as f32, height as f32);
             self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
         }
         self.blend = Blend::Alpha;
@@ -269,11 +295,16 @@ impl Renderer {
 
     fn draw_quads(&self, vertices: &[Vertex]) {
         unsafe {
-            self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(vertices), glow::STREAM_DRAW);
-            self.gl.draw_elements(glow::TRIANGLES, (vertices.len() / 4 * 6) as i32, glow::UNSIGNED_SHORT, 0);
+            self.gl
+                .buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(vertices), glow::STREAM_DRAW);
+            self.gl.draw_elements(
+                glow::TRIANGLES,
+                (vertices.len() / 4 * 6) as i32,
+                glow::UNSIGNED_SHORT,
+                0,
+            );
         }
     }
-
 
     /// 開発用: 現在のフレームバッファーを PPM で書き出す。
     #[cfg(debug_assertions)]
@@ -281,7 +312,12 @@ impl Renderer {
         let mut px = vec![0u8; (width * height * 4) as usize];
         unsafe {
             self.gl.read_pixels(
-                0, 0, width as i32, height as i32, glow::RGBA, glow::UNSIGNED_BYTE,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
                 glow::PixelPackData::Slice(Some(&mut px)),
             );
         }

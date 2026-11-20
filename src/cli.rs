@@ -108,10 +108,14 @@ mod tests {
 
     #[test]
     fn star_means_all_and_default_fps() {
-        let Ok(ParseResult::Run(a)) = p(&["*", "a.lua"]) else { panic!() };
+        let Ok(ParseResult::Run(a)) = p(&["*", "a.lua"]) else {
+            panic!()
+        };
         assert_eq!(a.output, OutputSelector::All);
         assert_eq!(a.fps, 30.0);
-        let Ok(ParseResult::Run(a)) = p(&["--layer", "overlay", "*", "a.lua"]) else { panic!() };
+        let Ok(ParseResult::Run(a)) = p(&["--layer", "overlay", "*", "a.lua"]) else {
+            panic!()
+        };
         assert_eq!(a.layer, LayerName::Overlay);
     }
 

@@ -119,13 +119,18 @@ pub const WATCHDOG_EXIT_CODE: i32 = 3;
 /// Lua を外から安全に止める手段はないので、終了して再起動（systemd の Restart= など）に任せる。
 pub fn spawn_watchdog(limit: Duration) {
     now_ms();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_millis(500));
-        let since = BUSY_SINCE.load(Ordering::Relaxed);
-        if since != 0 && now_ms().saturating_sub(since) > limit.as_millis() as u64 {
-            eprintln!("kagegami: wallpaper script did not return for {}s, exiting", limit.as_secs());
-            // メインスレッドは Lua の中で止まっているので、後始末をせずに終了する。
-            unsafe { libc::_exit(WATCHDOG_EXIT_CODE) };
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let since = BUSY_SINCE.load(Ordering::Relaxed);
+            if since != 0 && now_ms().saturating_sub(since) > limit.as_millis() as u64 {
+                eprintln!(
+                    "kagegami: wallpaper script did not return for {}s, exiting",
+                    limit.as_secs()
+                );
+                // メインスレッドは Lua の中で止まっているので、後始末をせずに終了する。
+                unsafe { libc::_exit(WATCHDOG_EXIT_CODE) };
+            }
         }
     });
 }
@@ -145,8 +150,19 @@ pub struct Script {
 
 /// 壁紙スクリプトに見せないグローバル。ファイル読み込みや別環境への抜け道になるもの。
 const REMOVED_GLOBALS: &[&str] = &[
-    "dofile", "loadfile", "load", "loadstring", "require", "module",
-    "getfenv", "setfenv", "collectgarbage", "gcinfo", "newproxy", "jit", "ffi",
+    "dofile",
+    "loadfile",
+    "load",
+    "loadstring",
+    "require",
+    "module",
+    "getfenv",
+    "setfenv",
+    "collectgarbage",
+    "gcinfo",
+    "newproxy",
+    "jit",
+    "ffi",
     // LuaJIT の基本ライブラリに含まれる。hook はスレッドごとなので、コルーチンの中では時間制限が効かない。
     "coroutine",
 ];
@@ -165,15 +181,22 @@ fn install_prelude(lua: &Lua, buf: *mut Vertex) -> mlua::Result<(Function, Funct
     let base = buf as usize;
     let take = lua.create_function(move |lua, n: i64| {
         if n < 0 || n as usize > PRELUDE_CAP || n % 4 != 0 {
-            return Err(mlua::Error::runtime(format!("internal: bad vertex count {n}")));
+            return Err(mlua::Error::runtime(format!(
+                "internal: bad vertex count {n}"
+            )));
         }
         // JIT コンパイルされた描画ループは hook では止まらないが、ここは必ず通るので時間もここで確かめる。
-        if lua.app_data_ref::<Deadline>().is_some_and(|d| Instant::now() > d.0) {
+        if lua
+            .app_data_ref::<Deadline>()
+            .is_some_and(|d| Instant::now() > d.0)
+        {
             return Err(mlua::Error::runtime("time limit exceeded"));
         }
         let mut dl = lua.app_data_mut::<DrawList>().unwrap();
         if dl.batch.quads() + n as usize / 4 > MAX_FRAME_QUADS {
-            return Err(mlua::Error::runtime(format!("too many shapes in one frame (max {MAX_FRAME_QUADS})")));
+            return Err(mlua::Error::runtime(format!(
+                "too many shapes in one frame (max {MAX_FRAME_QUADS})"
+            )));
         }
         // 安全性: buf は PRELUDE_CAP 個の Vertex を持つ Box で、Script が生きている間は動かない。
         let src = unsafe { std::slice::from_raw_parts(base as *const Vertex, n as usize) };
@@ -223,22 +246,46 @@ fn install_prelude(lua: &Lua, buf: *mut Vertex) -> mlua::Result<(Function, Funct
 }
 
 impl Script {
-    pub fn load(path: &Path, output: &str, seed: u64, width: u32, height: u32) -> Result<Self, String> {
+    pub fn load(
+        path: &Path,
+        output: &str,
+        seed: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
         let src = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Self::from_source(&src, &path.display().to_string(), output, seed, width, height)
+        Self::from_source(
+            &src,
+            &path.display().to_string(),
+            output,
+            seed,
+            width,
+            height,
+        )
     }
 
-    pub fn from_source(src: &str, chunk_name: &str, output: &str, seed: u64, width: u32, height: u32) -> Result<Self, String> {
+    pub fn from_source(
+        src: &str,
+        chunk_name: &str,
+        output: &str,
+        seed: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
         // LuaJIT は jit ライブラリを開いたときに JIT コンパイラーを有効にするので、JIT も読み込む。
         // スクリプトから jit.off() などを呼べないよう、読み込んだ後にグローバルから外す。
         // ffi は描画関数（prelude）の中だけで使い、読み込んだ後にグローバルから外す。
         // ffi を開くには mlua の safe モードを外す必要がある。
-        let libs = StdLib::MATH | StdLib::STRING | StdLib::TABLE | StdLib::BIT | StdLib::JIT | StdLib::FFI;
+        let libs =
+            StdLib::MATH | StdLib::STRING | StdLib::TABLE | StdLib::BIT | StdLib::JIT | StdLib::FFI;
         let lua = unsafe { Lua::unsafe_new_with(libs, LuaOptions::default()) };
         let _busy = BusyGuard::new();
         let buf = vec![Vertex::default(); PRELUDE_CAP].into_boxed_slice();
-        let script = Self::setup(lua, buf, output, seed, width, height).map_err(|e| e.to_string())?;
-        script.lua.set_app_data(Deadline(Instant::now() + LOAD_BUDGET));
+        let script =
+            Self::setup(lua, buf, output, seed, width, height).map_err(|e| e.to_string())?;
+        script
+            .lua
+            .set_app_data(Deadline(Instant::now() + LOAD_BUDGET));
         script
             .lua
             .load(src)
@@ -250,7 +297,14 @@ impl Script {
         Ok(script)
     }
 
-    fn setup(lua: Lua, buf: Box<[Vertex]>, output: &str, seed: u64, width: u32, height: u32) -> mlua::Result<Self> {
+    fn setup(
+        lua: Lua,
+        buf: Box<[Vertex]>,
+        output: &str,
+        seed: u64,
+        width: u32,
+        height: u32,
+    ) -> mlua::Result<Self> {
         let buf_ptr = buf.as_ptr() as *mut Vertex;
         let g = lua.globals();
         let jit: Table = g.get("jit")?;
@@ -263,14 +317,18 @@ impl Script {
 
         // 出力ごとに乱数を変える（スクリプトからは時刻を取れないため）。
         let math: Table = g.get("math")?;
-        math.get::<Function>("randomseed")?.call::<()>((seed % (1 << 52)) as f64)?;
+        math.get::<Function>("randomseed")?
+            .call::<()>((seed % (1 << 52)) as f64)?;
 
         // print は stderr に出力名付きで出す。
         let prefix = format!("[{output}]");
         g.set(
             "print",
             lua.create_function(move |_, args: mlua::Variadic<mlua::Value>| {
-                let parts: Vec<String> = args.iter().map(|v| v.to_string().unwrap_or_else(|_| "?".into())).collect();
+                let parts: Vec<String> = args
+                    .iter()
+                    .map(|v| v.to_string().unwrap_or_else(|_| "?".into()))
+                    .collect();
                 eprintln!("{prefix} {}", parts.join("\t"));
                 Ok(())
             })?,
@@ -294,15 +352,25 @@ impl Script {
 
         // 無限ループ対策。JIT コンパイルされたコードでは呼ばれないことがあるので、
         // 最終的な歯止めは main 側の watchdog が担う。
-        lua.set_hook(HookTriggers::new().every_nth_instruction(HOOK_INTERVAL), |lua, _| {
-            match lua.app_data_ref::<Deadline>() {
+        lua.set_hook(
+            HookTriggers::new().every_nth_instruction(HOOK_INTERVAL),
+            |lua, _| match lua.app_data_ref::<Deadline>() {
                 Some(d) if Instant::now() > d.0 => Err(mlua::Error::runtime("time limit exceeded")),
                 _ => Ok(VmState::Continue),
-            }
-        })?;
+            },
+        )?;
 
-        let s = Self { lua, screen, mouse, jit_enabled, begin, finish, _buf: buf };
-        s.set_mouse(&MouseState::default()).map_err(mlua::Error::runtime)?;
+        let s = Self {
+            lua,
+            screen,
+            mouse,
+            jit_enabled,
+            begin,
+            finish,
+            _buf: buf,
+        };
+        s.set_mouse(&MouseState::default())
+            .map_err(mlua::Error::runtime)?;
         Ok(s)
     }
 
@@ -336,7 +404,8 @@ impl Script {
     /// マウスのボタン操作をコールバックに渡す。
     pub fn mouse_event(&self, ev: MouseEvent) -> Result<(), String> {
         let _busy = BusyGuard::new();
-        self.lua.set_app_data(Deadline(Instant::now() + FRAME_BUDGET));
+        self.lua
+            .set_app_data(Deadline(Instant::now() + FRAME_BUDGET));
         match ev {
             MouseEvent::Pressed(x, y, b) => self.call("mousepressed", (x, y, b.name())),
             MouseEvent::Released(x, y, b) => self.call("mousereleased", (x, y, b.name())),
@@ -347,7 +416,8 @@ impl Script {
     /// update と draw を呼び、積まれた描画命令を返す。
     pub fn frame(&self, dt: f64) -> Result<mlua::AppDataRef<'_, DrawList>, String> {
         let _busy = BusyGuard::new();
-        self.lua.set_app_data(Deadline(Instant::now() + FRAME_BUDGET));
+        self.lua
+            .set_app_data(Deadline(Instant::now() + FRAME_BUDGET));
         self.lua.app_data_mut::<DrawList>().unwrap().reset();
         self.begin.call::<()>(()).map_err(|e| e.to_string())?;
         self.call("update", dt).map_err(|e| e.to_string())?;
@@ -420,14 +490,27 @@ mod tests {
             function mousepressed(x, y, b) got.click = b .. ":" .. x .. "," .. y end
         "#)
         .unwrap();
-        s.set_mouse(&MouseState { x: 3.0, y: 4.0, inside: true, left: true, ..Default::default() }).unwrap();
-        s.mouse_event(MouseEvent::Pressed(3.0, 4.0, Button::Left)).unwrap();
+        s.set_mouse(&MouseState {
+            x: 3.0,
+            y: 4.0,
+            inside: true,
+            left: true,
+            ..Default::default()
+        })
+        .unwrap();
+        s.mouse_event(MouseEvent::Pressed(3.0, 4.0, Button::Left))
+            .unwrap();
         drop(s.frame(0.5).unwrap());
-        s.lua.load(r#"
+        s.lua
+            .load(
+                r#"
             assert(got.dt == 0.5)
             assert(got.click == "left:3,4")
             assert(mouse.inside == true and mouse.left == true and mouse.x == 3)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
     }
 
     /// hook で止まるのはインタープリターで動いている間だけ。JIT コンパイルされたループは
@@ -455,15 +538,22 @@ mod tests {
         "#)
         .unwrap();
         let dl = s.frame(0.0).unwrap();
-        let mut reference = Batch { vertices: Vec::new(), color: crate::render::color_u8(0.2, 0.4, 0.6, 0.8) };
+        let mut reference = Batch {
+            vertices: Vec::new(),
+            color: crate::render::color_u8(0.2, 0.4, 0.6, 0.8),
+        };
         reference.line(10.5, 20.0, 300.0, 140.25, 3.0);
         reference.circle(50.0, 60.0, 7.5);
         reference.rect(1.0, 2.0, 30.0, 40.0);
         reference.line(5.0, 5.0, 5.0, 5.0, 4.0);
         assert_eq!(dl.batch.vertices.len(), reference.vertices.len());
         for (a, b) in dl.batch.vertices.iter().zip(&reference.vertices) {
-            let close = |x: [f32; 2], y: [f32; 2]| (x[0] - y[0]).abs() < 1e-3 && (x[1] - y[1]).abs() < 1e-3;
-            assert!(close(a.pos, b.pos) && close(a.local, b.local) && close(a.shape, b.shape), "{a:?} != {b:?}");
+            let close =
+                |x: [f32; 2], y: [f32; 2]| (x[0] - y[0]).abs() < 1e-3 && (x[1] - y[1]).abs() < 1e-3;
+            assert!(
+                close(a.pos, b.pos) && close(a.local, b.local) && close(a.shape, b.shape),
+                "{a:?} != {b:?}"
+            );
             assert_eq!(a.color, b.color);
         }
     }
@@ -471,7 +561,9 @@ mod tests {
     #[test]
     fn ffi_is_unreachable_and_draw_functions_return_nothing() {
         let s = run("").unwrap();
-        s.lua.load(r#"
+        s.lua
+            .load(
+                r#"
             assert(ffi == nil and jit == nil)
             assert(select('#', line(0, 0, 1, 1)) == 0)
             assert(select('#', circle(0, 0, 1)) == 0)
@@ -479,7 +571,10 @@ mod tests {
             assert(select('#', color(1, 1, 1)) == 0)
             -- 描画関数は C 関数ではなく Lua 関数だが、upvalue を覗く手段がない
             assert(debug == nil and getfenv == nil and string.dump == nil)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
     }
 
     #[test]
@@ -527,8 +622,20 @@ mod tests {
         assert_eq!(dl.batch.vertices[0].color, [0, 255, 0, 255]);
         assert_eq!(dl.batch.quads(), 2);
         drop(dl);
-        assert!(run("function draw() line('a', 0, 1, 1) end").unwrap().frame(0.0).err().unwrap().contains("number expected"));
-        assert!(run("function draw() blend('multiply') end").unwrap().frame(0.0).is_err());
+        assert!(
+            run("function draw() line('a', 0, 1, 1) end")
+                .unwrap()
+                .frame(0.0)
+                .err()
+                .unwrap()
+                .contains("number expected")
+        );
+        assert!(
+            run("function draw() blend('multiply') end")
+                .unwrap()
+                .frame(0.0)
+                .is_err()
+        );
     }
 
     #[test]
@@ -551,13 +658,20 @@ mod tests {
         let s = run("function draw() while true do circle(0, 0, 1) end end").unwrap();
         let start = Instant::now();
         let err = s.frame(0.0).err().unwrap();
-        assert!(err.contains("time limit exceeded") || err.contains("too many shapes"), "{err}");
+        assert!(
+            err.contains("time limit exceeded") || err.contains("too many shapes"),
+            "{err}"
+        );
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
     fn shape_count_per_frame_is_capped() {
-        let s = run(&format!("function draw() for i = 1, {} do circle(0, 0, 1) end end", MAX_FRAME_QUADS + 10)).unwrap();
+        let s = run(&format!(
+            "function draw() for i = 1, {} do circle(0, 0, 1) end end",
+            MAX_FRAME_QUADS + 10
+        ))
+        .unwrap();
         assert!(s.frame(0.0).err().unwrap().contains("too many shapes"));
     }
 
@@ -607,10 +721,18 @@ mod bench {
     fn hook_cost() {
         let plain = Lua::new();
         let hooked = Lua::new();
-        hooked.set_hook(HookTriggers::new().every_nth_instruction(10_000), |_, _| Ok(VmState::Continue)).unwrap();
+        hooked
+            .set_hook(HookTriggers::new().every_nth_instruction(10_000), |_, _| {
+                Ok(VmState::Continue)
+            })
+            .unwrap();
         let sandboxed = Lua::new_with(mlua::StdLib::MATH, mlua::LuaOptions::default()).unwrap();
         eprintln!("no jit lib: {:.3}s", time(&sandboxed));
-        let with_jit = Lua::new_with(mlua::StdLib::MATH | mlua::StdLib::JIT, mlua::LuaOptions::default()).unwrap();
+        let with_jit = Lua::new_with(
+            mlua::StdLib::MATH | mlua::StdLib::JIT,
+            mlua::LuaOptions::default(),
+        )
+        .unwrap();
         eprintln!("jit lib  : {:.3}s", time(&with_jit));
         let jit_off = Lua::new();
         jit_off.load("jit.off()").exec().unwrap();
@@ -631,7 +753,13 @@ mod frame_bench {
     fn geometry_frame_cost() {
         let src = std::fs::read_to_string("examples/geometry.lua").unwrap();
         let s = Script::from_source(&src, "geometry", "B", 1, 1920, 1080).unwrap();
-        s.set_mouse(&MouseState { x: 900.0, y: 500.0, inside: true, ..Default::default() }).unwrap();
+        s.set_mouse(&MouseState {
+            x: 900.0,
+            y: 500.0,
+            inside: true,
+            ..Default::default()
+        })
+        .unwrap();
         for _ in 0..200 {
             drop(s.frame(1.0 / 60.0).unwrap());
         }
@@ -650,8 +778,13 @@ mod frame_bench {
     fn per_call_cost() {
         let s = Script::from_source(
             "function draw() for i = 1, 10000 do color(1, 1, 1, 0.5) line(i, 0, i, 100, 1) end end",
-            "calls", "B", 1, 1920, 1080,
-        ).unwrap();
+            "calls",
+            "B",
+            1,
+            1920,
+            1080,
+        )
+        .unwrap();
         for _ in 0..20 {
             drop(s.frame(0.0).unwrap());
         }
