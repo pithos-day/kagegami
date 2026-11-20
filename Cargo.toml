@@ -1,0 +1,13 @@
+[package]
+name = "kagegami"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glow = "0.18.0"
+khronos-egl = { version = "6.0.0", features = ["static"] }
+mlua = { version = "0.12.2", features = ["luajit", "vendored"] }
+smithay-client-toolkit = { version = "0.21.1", default-features = false }
+wayland-backend = { version = "0.3.17", features = ["client_system"] }
+wayland-client = "0.31.15"
+wayland-egl = "0.32.11"
