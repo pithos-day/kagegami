@@ -147,7 +147,12 @@ pub struct Script {
 const REMOVED_GLOBALS: &[&str] = &[
     "dofile", "loadfile", "load", "loadstring", "require", "module",
     "getfenv", "setfenv", "collectgarbage", "gcinfo", "newproxy", "jit", "ffi",
+    // LuaJIT の基本ライブラリに含まれる。hook はスレッドごとなので、コルーチンの中では時間制限が効かない。
+    "coroutine",
 ];
+
+/// 1 フレームに描ける図形の上限。暴走したループでメモリを使い尽くさないようにする。
+const MAX_FRAME_QUADS: usize = 1_000_000;
 
 /// prelude の頂点バッファーの容量（頂点数、4 の倍数）。満杯になるたびに DrawList へ移す。
 const PRELUDE_CAP: usize = 4096;
@@ -162,9 +167,17 @@ fn install_prelude(lua: &Lua, buf: *mut Vertex) -> mlua::Result<(Function, Funct
         if n < 0 || n as usize > PRELUDE_CAP || n % 4 != 0 {
             return Err(mlua::Error::runtime(format!("internal: bad vertex count {n}")));
         }
+        // JIT コンパイルされた描画ループは hook では止まらないが、ここは必ず通るので時間もここで確かめる。
+        if lua.app_data_ref::<Deadline>().is_some_and(|d| Instant::now() > d.0) {
+            return Err(mlua::Error::runtime("time limit exceeded"));
+        }
+        let mut dl = lua.app_data_mut::<DrawList>().unwrap();
+        if dl.batch.quads() + n as usize / 4 > MAX_FRAME_QUADS {
+            return Err(mlua::Error::runtime(format!("too many shapes in one frame (max {MAX_FRAME_QUADS})")));
+        }
         // 安全性: buf は PRELUDE_CAP 個の Vertex を持つ Box で、Script が生きている間は動かない。
         let src = unsafe { std::slice::from_raw_parts(base as *const Vertex, n as usize) };
-        lua.app_data_mut::<DrawList>().unwrap().batch.vertices.extend_from_slice(src);
+        dl.batch.vertices.extend_from_slice(src);
         Ok(())
     })?;
     let clear = lua.create_function(|lua, (r, g, b): (f32, f32, f32)| {
@@ -356,7 +369,7 @@ mod tests {
     fn sandbox_hides_dangerous_globals() {
         let s = run("").unwrap();
         let check = r#"
-            local names = { "io", "os", "require", "package", "debug", "ffi", "jit",
+            local names = { "io", "os", "require", "package", "debug", "ffi", "jit", "coroutine",
                 "dofile", "loadfile", "load", "loadstring", "getfenv", "setfenv",
                 "collectgarbage", "module" }
             for _, n in ipairs(names) do
@@ -531,6 +544,32 @@ mod tests {
         .unwrap();
         assert!(s.frame(0.0).is_err());
         assert_eq!(s.frame(0.0).unwrap().batch.quads(), 1);
+    }
+
+    #[test]
+    fn runaway_drawing_loop_is_stopped_even_when_jit_compiled() {
+        let s = run("function draw() while true do circle(0, 0, 1) end end").unwrap();
+        let start = Instant::now();
+        let err = s.frame(0.0).err().unwrap();
+        assert!(err.contains("time limit exceeded") || err.contains("too many shapes"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn shape_count_per_frame_is_capped() {
+        let s = run(&format!("function draw() for i = 1, {} do circle(0, 0, 1) end end", MAX_FRAME_QUADS + 10)).unwrap();
+        assert!(s.frame(0.0).err().unwrap().contains("too many shapes"));
+    }
+
+    #[test]
+    fn bytecode_is_rejected() {
+        assert!(run("\x1bLJ\x02\x00\x00").is_err());
+    }
+
+    #[test]
+    fn cdata_literals_cannot_reach_draw_functions() {
+        let s = run("function draw() line(1LL, 0, 1, 1) end").unwrap();
+        assert!(s.frame(0.0).err().unwrap().contains("number expected"));
     }
 
     #[test]
