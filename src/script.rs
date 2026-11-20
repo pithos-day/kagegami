@@ -88,12 +88,14 @@ pub struct Script {
     lua: Lua,
     screen: Table,
     mouse: Table,
+    #[allow(dead_code)]
+    jit_enabled: bool,
 }
 
 /// 壁紙スクリプトに見せないグローバル。ファイル読み込みや別環境への抜け道になるもの。
 const REMOVED_GLOBALS: &[&str] = &[
     "dofile", "loadfile", "load", "loadstring", "require", "module",
-    "getfenv", "setfenv", "collectgarbage", "gcinfo", "newproxy",
+    "getfenv", "setfenv", "collectgarbage", "gcinfo", "newproxy", "jit",
 ];
 
 impl Script {
@@ -103,7 +105,10 @@ impl Script {
     }
 
     pub fn from_source(src: &str, chunk_name: &str, output: &str, seed: u64, width: u32, height: u32) -> Result<Self, String> {
-        let lua = Lua::new_with(StdLib::MATH | StdLib::STRING | StdLib::TABLE | StdLib::BIT, LuaOptions::default())
+        // LuaJIT は jit ライブラリを開いたときに JIT コンパイラーを有効にするので、JIT も読み込む。
+        // スクリプトから jit.off() などを呼べないよう、読み込んだ後にグローバルから外す。
+        let libs = StdLib::MATH | StdLib::STRING | StdLib::TABLE | StdLib::BIT | StdLib::JIT;
+        let lua = Lua::new_with(libs, LuaOptions::default())
             .map_err(|e| e.to_string())?;
         let script = Self::setup(lua, output, seed, width, height).map_err(|e| e.to_string())?;
         script.lua.set_app_data(Deadline(Instant::now() + LOAD_BUDGET));
@@ -120,6 +125,11 @@ impl Script {
 
     fn setup(lua: Lua, output: &str, seed: u64, width: u32, height: u32) -> mlua::Result<Self> {
         let g = lua.globals();
+        let jit: Table = g.get("jit")?;
+        let jit_enabled: bool = jit.get::<Function>("status")?.call(())?;
+        if !jit_enabled {
+            eprintln!("kagegami: warning: LuaJIT JIT compiler is disabled");
+        }
         for name in REMOVED_GLOBALS {
             g.raw_set(*name, mlua::Nil)?;
         }
@@ -215,7 +225,7 @@ impl Script {
             }
         })?;
 
-        let s = Self { lua, screen, mouse };
+        let s = Self { lua, screen, mouse, jit_enabled };
         s.set_mouse(&MouseState::default()).map_err(mlua::Error::runtime)?;
         Ok(s)
     }
@@ -288,6 +298,11 @@ mod tests {
             assert(string.dump == nil, "string.dump should be nil")
         "#;
         s.lua.load(check).exec().unwrap();
+    }
+
+    #[test]
+    fn jit_compiler_is_enabled() {
+        assert!(run("").unwrap().jit_enabled);
     }
 
     #[test]
