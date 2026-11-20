@@ -190,13 +190,15 @@ impl App {
                     Err(e) => {
                         eprintln!("kagegami: {}: {e}", w.name);
                         failed = true;
-                        if w.presented {
-                            continue;
-                        }
                         renderer.clear(0.0, 0.0, 0.0);
                     }
                 },
                 _ => renderer.clear(0.0, 0.0, 0.0),
+            }
+            if failed && w.presented {
+                // 直前のフレームを表示したまま止める。
+                self.wallpapers[i].failed = true;
+                continue;
             }
             #[cfg(debug_assertions)]
             if let Ok(dir) = std::env::var("KAGEGAMI_DUMP_DIR") {
