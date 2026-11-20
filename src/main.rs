@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::{
-    compositor::CompositorState, output::OutputState, registry::RegistryState,
+    compositor::CompositorState, output::OutputState, registry::RegistryState, seat::SeatState,
     shell::wlr_layer::LayerShell,
 };
 use wayland_client::{Connection, globals::registry_queue_init};
@@ -47,6 +47,8 @@ fn run(args: cli::Args) -> Result<(), String> {
     let mut app = app::App {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
+        pointer: None,
         compositor,
         layer_shell,
         egl,

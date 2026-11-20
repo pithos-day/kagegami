@@ -8,6 +8,10 @@ use smithay_client_toolkit::{
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        Capability, SeatHandler, SeatState,
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+    },
     shell::{
         WaylandSurface,
         wlr_layer::{
@@ -18,13 +22,18 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     Connection, QueueHandle,
-    protocol::{wl_output, wl_surface},
+    protocol::{wl_output, wl_pointer, wl_seat, wl_surface},
 };
 
 use crate::cli::{Args, LayerName};
 use crate::egl::{EglContext, EglSurface};
 use crate::render::Renderer;
-use crate::script::Script;
+use crate::script::{Button, MouseEvent, MouseState, Script};
+
+// linux/input-event-codes.h
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 
 /// 出力ごとに違う乱数の種を作る。
 fn seed_for(index: &usize) -> u64 {
@@ -54,6 +63,7 @@ pub struct Wallpaper {
     failed: bool,
     last_frame: Option<Instant>,
     seed: u64,
+    mouse: MouseState,
 }
 
 impl Wallpaper {
@@ -65,6 +75,8 @@ impl Wallpaper {
 pub struct App {
     pub registry_state: RegistryState,
     pub output_state: OutputState,
+    pub seat_state: SeatState,
+    pub pointer: Option<wl_pointer::WlPointer>,
     pub compositor: CompositorState,
     pub layer_shell: LayerShell,
     pub egl: EglContext,
@@ -118,6 +130,7 @@ impl App {
             failed: false,
             last_frame: None,
             seed: seed_for(&self.wallpapers.len()),
+            mouse: MouseState::default(),
         });
     }
 
@@ -144,6 +157,11 @@ impl App {
             w.next_due = (w.next_due + self.frame_period).max(now);
             if w.failed && w.presented {
                 continue;
+            }
+            if let Some(script) = &w.script {
+                if let Err(e) = script.set_mouse(&w.mouse) {
+                    eprintln!("kagegami: {}: {e}", w.name);
+                }
             }
             let dt = w.last_frame.map_or(0.0, |t| now.duration_since(t).as_secs_f64()).min(0.25);
             w.last_frame = Some(now);
@@ -294,8 +312,81 @@ impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 delegate_dispatch2!(App);
 delegate_registry!(App);
+
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(p) => self.pointer = Some(p),
+                Err(e) => eprintln!("kagegami: pointer: {e}"),
+            }
+        }
+    }
+    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, capability: Capability) {
+        if capability == Capability::Pointer {
+            if let Some(p) = self.pointer.take() {
+                p.release();
+            }
+        }
+    }
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl PointerHandler for App {
+    fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+        for event in events {
+            let Some(w) = self.find(&event.surface) else { continue };
+            // Wayland の座標は論理ピクセルなので、バッファーのピクセルに直す。
+            let x = (event.position.0 * w.scale as f64) as f32;
+            let y = (event.position.1 * w.scale as f64) as f32;
+            let mut click = None;
+            match event.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    w.mouse.inside = true;
+                }
+                PointerEventKind::Leave { .. } => {
+                    // カーソルが外に出たら、押していたボタンの状態も分からなくなる。
+                    w.mouse = MouseState { x: w.mouse.x, y: w.mouse.y, ..Default::default() };
+                    continue;
+                }
+                PointerEventKind::Press { button, .. } | PointerEventKind::Release { button, .. } => {
+                    let pressed = matches!(event.kind, PointerEventKind::Press { .. });
+                    let b = match button {
+                        BTN_LEFT => Button::Left,
+                        BTN_RIGHT => Button::Right,
+                        BTN_MIDDLE => Button::Middle,
+                        _ => continue,
+                    };
+                    *match b {
+                        Button::Left => &mut w.mouse.left,
+                        Button::Right => &mut w.mouse.right,
+                        Button::Middle => &mut w.mouse.middle,
+                    } = pressed;
+                    click = Some(if pressed { MouseEvent::Pressed(x, y, b) } else { MouseEvent::Released(x, y, b) });
+                }
+                PointerEventKind::Axis { .. } => continue,
+            }
+            w.mouse.x = x;
+            w.mouse.y = y;
+            if let (Some(ev), Some(script)) = (click, &w.script) {
+                if w.failed {
+                    continue;
+                }
+                let r = script.set_mouse(&w.mouse).and_then(|_| script.mouse_event(ev));
+                if let Err(e) = r {
+                    eprintln!("kagegami: {}: {e}", w.name);
+                    w.failed = true;
+                }
+            }
+        }
+    }
+}
