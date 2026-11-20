@@ -36,10 +36,10 @@ const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
 
 /// 出力ごとに違う乱数の種を作る。
-fn seed_for(index: &usize) -> u64 {
+fn seed_for<T: std::hash::Hash>(salt: &T) -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_usize(*index);
+    salt.hash(&mut h);
     h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
     h.finish()
 }
@@ -136,6 +136,25 @@ impl App {
 
     fn find(&mut self, surface: &wl_surface::WlSurface) -> Option<&mut Wallpaper> {
         self.wallpapers.iter_mut().find(|w| w.surface() == surface)
+    }
+
+    /// スクリプトのファイルを読み直す。読み込めた出力だけ新しいスクリプトに切り替える。
+    pub fn reload(&mut self) {
+        eprintln!("kagegami: reloading {}", self.args.script.display());
+        for w in &mut self.wallpapers {
+            if w.width == 0 {
+                continue;
+            }
+            match Script::load(&self.args.script, &w.name, seed_for(&w.seed), w.width, w.height) {
+                Ok(s) => {
+                    w.script = Some(s);
+                    w.failed = false;
+                    w.last_frame = None;
+                    w.next_due = Instant::now();
+                }
+                Err(e) => eprintln!("kagegami: {}: {e}", w.name),
+            }
+        }
     }
 
     /// 次に描画すべき時刻までの待ち時間。描画できる出力がなければ None。

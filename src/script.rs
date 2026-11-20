@@ -4,6 +4,8 @@
 //! ファイルや OS には触れられないようにしている。
 
 use std::path::Path;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, VmState};
@@ -84,6 +86,47 @@ pub enum MouseEvent {
 
 struct Deadline(Instant);
 
+/// スクリプトを実行し始めた時刻（プロセス起動からのミリ秒 + 1）。実行していなければ 0。
+static BUSY_SINCE: AtomicU64 = AtomicU64::new(0);
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+fn now_ms() -> u64 {
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// スクリプトの実行中であることを watchdog に知らせる。
+struct BusyGuard;
+
+impl BusyGuard {
+    fn new() -> Self {
+        BUSY_SINCE.store(now_ms(), Ordering::Relaxed);
+        BusyGuard
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        BUSY_SINCE.store(0, Ordering::Relaxed);
+    }
+}
+
+/// スクリプトが `limit` 以上戻ってこなければプロセスを終了させる見張りスレッドを起動する。
+///
+/// JIT コンパイルされたループは hook では止まらないため、これが最後の歯止めになる。
+/// Lua を外から安全に止める手段はないので、終了して再起動（systemd の Restart= など）に任せる。
+pub fn spawn_watchdog(limit: Duration) {
+    now_ms();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let since = BUSY_SINCE.load(Ordering::Relaxed);
+        if since != 0 && now_ms().saturating_sub(since) > limit.as_millis() as u64 {
+            eprintln!("kagegami: wallpaper script did not return for {}s, exiting", limit.as_secs());
+            // メインスレッドは Lua の中で止まっているので、後始末をせずに終了する。
+            unsafe { libc::_exit(1) };
+        }
+    });
+}
+
 pub struct Script {
     lua: Lua,
     screen: Table,
@@ -110,6 +153,7 @@ impl Script {
         let libs = StdLib::MATH | StdLib::STRING | StdLib::TABLE | StdLib::BIT | StdLib::JIT;
         let lua = Lua::new_with(libs, LuaOptions::default())
             .map_err(|e| e.to_string())?;
+        let _busy = BusyGuard::new();
         let script = Self::setup(lua, output, seed, width, height).map_err(|e| e.to_string())?;
         script.lua.set_app_data(Deadline(Instant::now() + LOAD_BUDGET));
         script
@@ -259,6 +303,7 @@ impl Script {
 
     /// マウスのボタン操作をコールバックに渡す。
     pub fn mouse_event(&self, ev: MouseEvent) -> Result<(), String> {
+        let _busy = BusyGuard::new();
         self.lua.set_app_data(Deadline(Instant::now() + FRAME_BUDGET));
         match ev {
             MouseEvent::Pressed(x, y, b) => self.call("mousepressed", (x, y, b.name())),
@@ -269,6 +314,7 @@ impl Script {
 
     /// update と draw を呼び、積まれた描画命令を返す。
     pub fn frame(&self, dt: f64) -> Result<mlua::AppDataRef<'_, DrawList>, String> {
+        let _busy = BusyGuard::new();
         self.lua.set_app_data(Deadline(Instant::now() + FRAME_BUDGET));
         self.lua.app_data_mut::<DrawList>().unwrap().reset();
         self.call("update", dt).map_err(|e| e.to_string())?;
@@ -398,6 +444,10 @@ mod bench {
         let plain = Lua::new();
         let hooked = Lua::new();
         hooked.set_hook(HookTriggers::new().every_nth_instruction(10_000), |_, _| Ok(VmState::Continue)).unwrap();
+        let sandboxed = Lua::new_with(mlua::StdLib::MATH, mlua::LuaOptions::default()).unwrap();
+        eprintln!("no jit lib: {:.3}s", time(&sandboxed));
+        let with_jit = Lua::new_with(mlua::StdLib::MATH | mlua::StdLib::JIT, mlua::LuaOptions::default()).unwrap();
+        eprintln!("jit lib  : {:.3}s", time(&with_jit));
         let jit_off = Lua::new();
         jit_off.load("jit.off()").exec().unwrap();
         let st: String = plain.load("local t = {jit.status()} local o = {} for i, v in ipairs(t) do o[#o+1] = tostring(v) end return jit.version .. ' ' .. table.concat(o, ' ')").eval().unwrap();
