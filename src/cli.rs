@@ -41,7 +41,7 @@ pub enum ParseResult {
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, String> {
-    let mut fps = 30.0;
+    let mut fps = 60.0;
     let mut layer = LayerName::Background;
     let mut output = OutputSelector::All;
     let mut positional = Vec::new();
@@ -113,7 +113,7 @@ mod tests {
         assert_eq!(
             run(&["a.lua"]),
             Args {
-                fps: 30.0,
+                fps: 60.0,
                 layer: LayerName::Background,
                 output: OutputSelector::All,
                 script: "a.lua".into()
