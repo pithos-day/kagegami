@@ -17,18 +17,19 @@ cp target/release/kagegami ~/.local/bin/
 ## 使い方
 
 ```sh
-kagegami [--fps N] [--layer background|bottom|top|overlay] <output-name|*> <wallpaper.lua>
+kagegami [-o OUTPUT] [--fps N] [--layer background|bottom|top|overlay] <wallpaper.lua>
 ```
 
+- `-o`, `--output`: 描画する出力の名前（`niri msg outputs` などで出る `DP-1` など）。省略すると全出力
 - `--fps`: フレームレートの上限（既定 30）
 - `--layer`: 描画するレイヤー（既定 `background`）
-- `<output-name>`: `niri msg outputs` などで出る出力名（`DP-1` など）。`*` で全出力
 - 壁紙のファイルを保存すると、自動で読み直す
 
 例:
 
 ```sh
-kagegami --fps 30 '*' examples/geometry.lua
+kagegami examples/geometry.lua          # 全出力に描画する
+kagegami -o DP-1 examples/geometry.lua  # DP-1 だけに描画する
 ```
 
 ### 自動起動
@@ -40,7 +41,7 @@ niri の `spawn-at-startup` は終了したプロセスを再起動しないの�
 `~/.config/niri/config.kdl`:
 
 ```kdl
-spawn-at-startup "sh" "-c" "while :; do kagegami --fps 30 '*' ~/.config/kagegami/geometry.lua; [ $? -eq 3 ] || break; sleep 2; done"
+spawn-at-startup "sh" "-c" "while :; do kagegami ~/.config/kagegami/geometry.lua; [ $? -eq 3 ] || break; sleep 2; done"
 ```
 
 systemd を使っている環境なら、ユーザーユニットに `Restart=on-failure` を付けて動かしてもよい。
@@ -122,7 +123,7 @@ end
 ```sh
 cargo test
 # GPU 時間の計測（KAGEGAMI_BENCH_GLSL に Shadertoy 形式のシェーダーを渡すと比較できる）
-cargo run --release --features gpu-bench -- --fps 1000 DP-1 examples/geometry.lua
+cargo run --release --features gpu-bench -- --fps 1000 -o DP-1 examples/geometry.lua
 ```
 
 ## ライセンス
