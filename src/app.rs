@@ -163,7 +163,8 @@ impl App {
     pub fn next_timeout(&self, now: Instant) -> Option<Duration> {
         self.wallpapers
             .iter()
-            .filter(|w| w.egl_surface.is_some() && !w.frame_pending)
+            // エラーで止まっている出力は描き直さないので、待つ必要もない。
+            .filter(|w| w.egl_surface.is_some() && !w.frame_pending && !(w.failed && w.presented))
             .map(|w| w.next_due.saturating_duration_since(now))
             .min()
     }
