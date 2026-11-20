@@ -31,31 +31,19 @@ kagegami [--fps N] [--layer background|bottom|top|overlay] <output-name|*> <wall
 kagegami --fps 30 '*' examples/geometry.lua
 ```
 
-### 自動起動（systemd）
+### 自動起動
 
-スクリプトが戻ってこなくなった場合（後述）、kagegami は終了コード 1 で終了する。
-niri の `spawn-at-startup` は終了したプロセスを再起動しないので、systemd のユーザーユニットで動かすのがおすすめ。
+スクリプトが戻ってこなくなった場合（後述）、kagegami は終了コード 3 で終了する。
+niri の `spawn-at-startup` は終了したプロセスを再起動しないので、終了コードが 3 のときだけ起動し直すループで包むとよい。
+ほかの理由（Wayland への接続失敗など）で終了したときは、ループを抜ける。
 
-`~/.config/systemd/user/kagegami.service`:
+`~/.config/niri/config.kdl`:
 
-```ini
-[Unit]
-Description=kagegami live wallpaper
-PartOf=graphical-session.target
-After=graphical-session.target
-
-[Service]
-ExecStart=%h/.local/bin/kagegami --fps 30 * %h/.config/kagegami/geometry.lua
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=graphical-session.target
+```kdl
+spawn-at-startup "sh" "-c" "while :; do kagegami --fps 30 '*' ~/.config/kagegami/geometry.lua; [ $? -eq 3 ] || break; sleep 2; done"
 ```
 
-```sh
-systemctl --user enable --now kagegami.service
-```
+systemd を使っている環境なら、ユーザーユニットに `Restart=on-failure` を付けて動かしてもよい。
 
 ## 壁紙の書き方
 
@@ -121,7 +109,7 @@ end
 
 - 読み込み時や実行時にエラーが起きたら、標準エラー出力に出して、直前のフレームを表示したまま止まる。ファイルを直して保存すれば再開する
 - 1 回の呼び出しが長すぎる場合（読み込み 2 秒、毎フレーム 0.25 秒）はエラーとして止める
-- ただし、JIT コンパイルされたループはこの仕組みでは止められない。スクリプトが 5 秒戻ってこなければ、kagegami は終了コード 1 で終了する
+- ただし、JIT コンパイルされたループはこの仕組みでは止められない。スクリプトが 5 秒戻ってこなければ、kagegami は終了コード 3 で終了する（上の「自動起動」を参照）
 
 ## 開発
 

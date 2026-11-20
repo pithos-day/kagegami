@@ -110,6 +110,9 @@ impl Drop for BusyGuard {
     }
 }
 
+/// watchdog が終了させたときの終了コード。再起動するかどうかの判断に使う。
+pub const WATCHDOG_EXIT_CODE: i32 = 3;
+
 /// スクリプトが `limit` 以上戻ってこなければプロセスを終了させる見張りスレッドを起動する。
 ///
 /// JIT コンパイルされたループは hook では止まらないため、これが最後の歯止めになる。
@@ -122,7 +125,7 @@ pub fn spawn_watchdog(limit: Duration) {
         if since != 0 && now_ms().saturating_sub(since) > limit.as_millis() as u64 {
             eprintln!("kagegami: wallpaper script did not return for {}s, exiting", limit.as_secs());
             // メインスレッドは Lua の中で止まっているので、後始末をせずに終了する。
-            unsafe { libc::_exit(1) };
+            unsafe { libc::_exit(WATCHDOG_EXIT_CODE) };
         }
     });
 }
