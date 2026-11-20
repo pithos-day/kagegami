@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod egl;
 mod render;
+mod script;
 
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
@@ -53,7 +54,6 @@ fn run(args: cli::Args) -> Result<(), String> {
         frame_period: Duration::from_secs_f64(1.0 / args.fps),
         args,
         wallpapers: Vec::new(),
-        started: Instant::now(),
     };
 
     loop {

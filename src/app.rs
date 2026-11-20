@@ -24,6 +24,16 @@ use wayland_client::{
 use crate::cli::{Args, LayerName};
 use crate::egl::{EglContext, EglSurface};
 use crate::render::Renderer;
+use crate::script::Script;
+
+/// 出力ごとに違う乱数の種を作る。
+fn seed_for(index: &usize) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_usize(*index);
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    h.finish()
+}
 
 pub struct Wallpaper {
     output: wl_output::WlOutput,
@@ -37,6 +47,13 @@ pub struct Wallpaper {
     /// frame callback を待っている間は描画しない（隠れている出力は自然に止まる）。
     frame_pending: bool,
     next_due: Instant,
+    /// 一度でもバッファーを提示したか（layer surface は提示するまで表示されない）。
+    presented: bool,
+    script: Option<Script>,
+    /// スクリプトがエラーで止まっている。直前のフレームを表示したままにする。
+    failed: bool,
+    last_frame: Option<Instant>,
+    seed: u64,
 }
 
 impl Wallpaper {
@@ -55,29 +72,8 @@ pub struct App {
     pub args: Args,
     pub frame_period: Duration,
     pub wallpapers: Vec<Wallpaper>,
-    pub started: Instant,
 }
 
-/// 描画の確認用。Lua を組み込むまでの仮の場面。
-fn test_scene(r: &mut Renderer, w: f32, h: f32, t: f32) {
-    use crate::render::{Blend, color_u8};
-    r.clear(0.039, 0.039, 0.039);
-    r.set_blend(Blend::Add);
-    r.batch.color = color_u8(0.773, 0.784, 0.776, 0.5);
-    let n = 40;
-    for i in 0..n {
-        let a = i as f32 / n as f32 * std::f32::consts::TAU + t * 0.2;
-        let (cx, cy) = (w * 0.5, h * 0.5);
-        r.reserve();
-        r.batch.line(cx, cy, cx + a.cos() * h * 0.4, cy + a.sin() * h * 0.4, 1.2);
-        r.reserve();
-        r.batch.circle(cx + a.cos() * h * 0.4, cy + a.sin() * h * 0.4, 3.0);
-    }
-    r.set_blend(Blend::Alpha);
-    r.batch.color = color_u8(0.3, 0.5, 0.9, 0.8);
-    r.reserve();
-    r.batch.rect(20.0, 20.0, 120.0, 60.0);
-}
 
 impl App {
     fn add_output(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
@@ -117,6 +113,11 @@ impl App {
             egl_surface: None,
             frame_pending: false,
             next_due: Instant::now(),
+            presented: false,
+            script: None,
+            failed: false,
+            last_frame: None,
+            seed: seed_for(&self.wallpapers.len()),
         });
     }
 
@@ -135,11 +136,20 @@ impl App {
 
     pub fn render_due(&mut self, qh: &QueueHandle<Self>, now: Instant) {
         for i in 0..self.wallpapers.len() {
-            let w = &self.wallpapers[i];
-            if w.frame_pending || now < w.next_due {
+            let w = &mut self.wallpapers[i];
+            if w.frame_pending || now < w.next_due || w.egl_surface.is_none() {
                 continue;
             }
-            let Some(es) = w.egl_surface.as_ref() else { continue };
+            // 遅れた場合は追いつこうとせず、今から 1 周期後にする。
+            w.next_due = (w.next_due + self.frame_period).max(now);
+            if w.failed && w.presented {
+                continue;
+            }
+            let dt = w.last_frame.map_or(0.0, |t| now.duration_since(t).as_secs_f64()).min(0.25);
+            w.last_frame = Some(now);
+
+            let w = &self.wallpapers[i];
+            let es = w.egl_surface.as_ref().unwrap();
             if let Err(e) = self.egl.make_current(es) {
                 eprintln!("kagegami: {}: {e}", w.name);
                 continue;
@@ -155,8 +165,21 @@ impl App {
             }
             let renderer = self.renderer.as_mut().unwrap();
             renderer.begin(w.width, w.height);
-            test_scene(renderer, w.width as f32, w.height as f32, self.started.elapsed().as_secs_f32());
-            renderer.end();
+            let mut failed = false;
+            match &w.script {
+                Some(script) if !w.failed => match script.frame(dt) {
+                    Ok(dl) => renderer.submit(&dl),
+                    Err(e) => {
+                        eprintln!("kagegami: {}: {e}", w.name);
+                        failed = true;
+                        if w.presented {
+                            continue;
+                        }
+                        renderer.clear(0.0, 0.0, 0.0);
+                    }
+                },
+                _ => renderer.clear(0.0, 0.0, 0.0),
+            }
             #[cfg(debug_assertions)]
             if let Ok(dir) = std::env::var("KAGEGAMI_DUMP_DIR") {
                 let path = format!("{dir}/{}.ppm", w.name);
@@ -172,8 +195,8 @@ impl App {
             }
             let w = &mut self.wallpapers[i];
             w.frame_pending = true;
-            // 遅れた場合は追いつこうとせず、今から 1 周期後にする。
-            w.next_due = (w.next_due + self.frame_period).max(now);
+            w.presented = true;
+            w.failed |= failed;
         }
     }
 }
@@ -245,6 +268,21 @@ impl LayerShellHandler for App {
                 Ok(s) => w.egl_surface = Some(s),
                 Err(e) => eprintln!("kagegami: {}: {e}", w.name),
             },
+        }
+        match &w.script {
+            Some(script) => {
+                if let Err(e) = script.set_screen(w.width, w.height) {
+                    eprintln!("kagegami: {}: {e}", w.name);
+                }
+            }
+            None if !w.failed => match Script::load(&self.args.script, &w.name, w.seed, w.width, w.height) {
+                Ok(s) => w.script = Some(s),
+                Err(e) => {
+                    eprintln!("kagegami: {}: {e}", w.name);
+                    w.failed = true;
+                }
+            },
+            None => {}
         }
         // 設定が変わったらすぐに描き直す。
         w.frame_pending = false;

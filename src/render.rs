@@ -23,8 +23,9 @@ pub struct Vertex {
     pub color: [u8; 4],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Blend {
+    #[default]
     Alpha,
     Add,
 }
@@ -134,7 +135,6 @@ pub struct Renderer {
     program: glow::Program,
     u_res: glow::UniformLocation,
     vbo: glow::Buffer,
-    pub batch: Batch,
     blend: Blend,
 }
 
@@ -193,7 +193,6 @@ impl Renderer {
                 program,
                 u_res,
                 vbo,
-                batch: Batch { vertices: Vec::with_capacity(MAX_QUADS * 4), color: [255; 4] },
                 blend: Blend::Alpha,
             };
             r.apply_blend();
@@ -218,51 +217,48 @@ impl Renderer {
             self.gl.uniform_2_f32(Some(&self.u_res), width as f32, height as f32);
             self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
         }
-        self.batch.vertices.clear();
-        self.batch.color = [255; 4];
         self.blend = Blend::Alpha;
         self.apply_blend();
     }
 
     pub fn clear(&mut self, r: f32, g: f32, b: f32) {
-        // clear より前に積んだ図形は消えるので捨てる。
-        self.batch.vertices.clear();
         unsafe {
             self.gl.clear_color(r, g, b, 1.0);
             self.gl.clear(glow::COLOR_BUFFER_BIT);
         }
     }
 
-    pub fn set_blend(&mut self, blend: Blend) {
+    fn set_blend(&mut self, blend: Blend) {
         if blend != self.blend {
-            self.flush();
             self.blend = blend;
             self.apply_blend();
         }
     }
 
-    /// 上限に達していたら先に GPU へ送る。図形を積む前に呼ぶ。
-    pub fn reserve(&mut self) {
-        if self.batch.quads() >= MAX_QUADS {
-            self.flush();
+    /// スクリプトが積んだ描画命令を描く。
+    pub fn submit(&mut self, dl: &crate::script::DrawList) {
+        let [r, g, b] = dl.clear.unwrap_or([0.0; 3]);
+        self.clear(r, g, b);
+        let total = dl.batch.quads();
+        for (i, &(blend, start)) in dl.segments.iter().enumerate() {
+            let end = dl.segments.get(i + 1).map_or(total, |s| s.1);
+            self.set_blend(blend);
+            let mut q = start;
+            while q < end {
+                let n = (end - q).min(MAX_QUADS);
+                self.draw_quads(&dl.batch.vertices[q * 4..(q + n) * 4]);
+                q += n;
+            }
         }
     }
 
-    pub fn flush(&mut self) {
-        if self.batch.vertices.is_empty() {
-            return;
-        }
-        let quads = self.batch.quads() as i32;
+    fn draw_quads(&self, vertices: &[Vertex]) {
         unsafe {
-            self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&self.batch.vertices), glow::STREAM_DRAW);
-            self.gl.draw_elements(glow::TRIANGLES, quads * 6, glow::UNSIGNED_SHORT, 0);
+            self.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(vertices), glow::STREAM_DRAW);
+            self.gl.draw_elements(glow::TRIANGLES, (vertices.len() / 4 * 6) as i32, glow::UNSIGNED_SHORT, 0);
         }
-        self.batch.vertices.clear();
     }
 
-    pub fn end(&mut self) {
-        self.flush();
-    }
 
     /// 開発用: 現在のフレームバッファーを PPM で書き出す。
     #[cfg(debug_assertions)]
