@@ -16,3 +16,8 @@ wayland-egl = "0.32.11"
 [features]
 # 開発用: 1 フレームあたりの GPU 時間を測る
 gpu-bench = []
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
