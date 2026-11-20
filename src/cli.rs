@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-pub const USAGE: &str = "usage: kagegami [-h|--help] [--fps N] <output-name|*> <wallpaper.lua>";
+pub const USAGE: &str = "usage: kagegami [-h|--help] [--fps N] [--layer background|bottom|top|overlay] <output-name|*> <wallpaper.lua>";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputSelector {
@@ -17,9 +17,18 @@ impl OutputSelector {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LayerName {
+    Background,
+    Bottom,
+    Top,
+    Overlay,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Args {
     pub fps: f64,
+    pub layer: LayerName,
     pub output: OutputSelector,
     pub script: PathBuf,
 }
@@ -32,6 +41,7 @@ pub enum ParseResult {
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, String> {
     let mut fps = 30.0;
+    let mut layer = LayerName::Background;
     let mut positional = Vec::new();
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -44,6 +54,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, Str
                     .ok()
                     .filter(|f| f.is_finite() && *f > 0.0)
                     .ok_or_else(|| format!("invalid --fps value: {v}"))?;
+            }
+            "--layer" => {
+                let v = iter.next().ok_or("--layer requires a value")?;
+                layer = match v.as_str() {
+                    "background" => LayerName::Background,
+                    "bottom" => LayerName::Bottom,
+                    "top" => LayerName::Top,
+                    "overlay" => LayerName::Overlay,
+                    _ => return Err(format!("invalid --layer value: {v}")),
+                };
             }
             s if s.starts_with("--") => return Err(format!("unknown option: {s}")),
             _ => positional.push(arg),
@@ -59,6 +79,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, Str
     };
     Ok(ParseResult::Run(Args {
         fps,
+        layer,
         output,
         script: PathBuf::from(script),
     }))
@@ -78,6 +99,7 @@ mod tests {
             p(&["--fps", "24", "DP-1", "a.lua"]),
             Ok(ParseResult::Run(Args {
                 fps: 24.0,
+                layer: LayerName::Background,
                 output: OutputSelector::Name("DP-1".into()),
                 script: "a.lua".into()
             }))
@@ -89,6 +111,8 @@ mod tests {
         let Ok(ParseResult::Run(a)) = p(&["*", "a.lua"]) else { panic!() };
         assert_eq!(a.output, OutputSelector::All);
         assert_eq!(a.fps, 30.0);
+        let Ok(ParseResult::Run(a)) = p(&["--layer", "overlay", "*", "a.lua"]) else { panic!() };
+        assert_eq!(a.layer, LayerName::Overlay);
     }
 
     #[test]
@@ -97,6 +121,7 @@ mod tests {
         assert!(p(&["--fps"]).is_err());
         assert!(p(&["*"]).is_err());
         assert!(p(&["--bogus", "*", "a.lua"]).is_err());
+        assert!(p(&["--layer", "middle", "*", "a.lua"]).is_err());
         assert_eq!(p(&["-h"]), Ok(ParseResult::Help));
     }
 }

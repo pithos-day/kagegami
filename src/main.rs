@@ -53,6 +53,7 @@ fn run(args: cli::Args) -> Result<(), String> {
         frame_period: Duration::from_secs_f64(1.0 / args.fps),
         args,
         wallpapers: Vec::new(),
+        started: Instant::now(),
     };
 
     loop {

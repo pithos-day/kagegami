@@ -21,7 +21,7 @@ use wayland_client::{
     protocol::{wl_output, wl_surface},
 };
 
-use crate::cli::Args;
+use crate::cli::{Args, LayerName};
 use crate::egl::{EglContext, EglSurface};
 use crate::render::Renderer;
 
@@ -55,6 +55,28 @@ pub struct App {
     pub args: Args,
     pub frame_period: Duration,
     pub wallpapers: Vec<Wallpaper>,
+    pub started: Instant,
+}
+
+/// 描画の確認用。Lua を組み込むまでの仮の場面。
+fn test_scene(r: &mut Renderer, w: f32, h: f32, t: f32) {
+    use crate::render::{Blend, color_u8};
+    r.clear(0.039, 0.039, 0.039);
+    r.set_blend(Blend::Add);
+    r.batch.color = color_u8(0.773, 0.784, 0.776, 0.5);
+    let n = 40;
+    for i in 0..n {
+        let a = i as f32 / n as f32 * std::f32::consts::TAU + t * 0.2;
+        let (cx, cy) = (w * 0.5, h * 0.5);
+        r.reserve();
+        r.batch.line(cx, cy, cx + a.cos() * h * 0.4, cy + a.sin() * h * 0.4, 1.2);
+        r.reserve();
+        r.batch.circle(cx + a.cos() * h * 0.4, cy + a.sin() * h * 0.4, 3.0);
+    }
+    r.set_blend(Blend::Alpha);
+    r.batch.color = color_u8(0.3, 0.5, 0.9, 0.8);
+    r.reserve();
+    r.batch.rect(20.0, 20.0, 120.0, 60.0);
 }
 
 impl App {
@@ -68,7 +90,12 @@ impl App {
         let layer = self.layer_shell.create_layer_surface(
             qh,
             surface,
-            Layer::Background,
+            match self.args.layer {
+                LayerName::Background => Layer::Background,
+                LayerName::Bottom => Layer::Bottom,
+                LayerName::Top => Layer::Top,
+                LayerName::Overlay => Layer::Overlay,
+            },
             Some("kagegami"),
             Some(&output),
         );
@@ -117,10 +144,26 @@ impl App {
                 eprintln!("kagegami: {}: {e}", w.name);
                 continue;
             }
-            let renderer = self.renderer.get_or_insert_with(|| Renderer::new(&self.egl));
+            if self.renderer.is_none() {
+                match Renderer::new(&self.egl) {
+                    Ok(r) => self.renderer = Some(r),
+                    Err(e) => {
+                        eprintln!("kagegami: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let renderer = self.renderer.as_mut().unwrap();
             renderer.begin(w.width, w.height);
-            renderer.clear(0.039, 0.039, 0.039);
+            test_scene(renderer, w.width as f32, w.height as f32, self.started.elapsed().as_secs_f32());
             renderer.end();
+            #[cfg(debug_assertions)]
+            if let Ok(dir) = std::env::var("KAGEGAMI_DUMP_DIR") {
+                let path = format!("{dir}/{}.ppm", w.name);
+                if !std::path::Path::new(&path).exists() {
+                    let _ = renderer.dump_ppm(w.width, w.height, &path);
+                }
+            }
 
             let surface = w.surface().clone();
             surface.frame(qh, FrameCallbackData(surface.clone()));
