@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-pub const USAGE: &str = "usage: kagegami [-h|--help] [--fps N] [--layer background|bottom|top|overlay] <output-name|*> <wallpaper.lua>";
+pub const USAGE: &str =
+    "usage: kagegami [-o OUTPUT] [-f FPS] [-l background|bottom|top|overlay] <wallpaper.lua>";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputSelector {
@@ -40,42 +41,49 @@ pub enum ParseResult {
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, String> {
-    let mut fps = 30.0;
+    let mut fps = 60.0;
     let mut layer = LayerName::Background;
+    let mut output = OutputSelector::All;
     let mut positional = Vec::new();
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(ParseResult::Help),
-            "--fps" => {
-                let v = iter.next().ok_or("--fps requires a value")?;
+            "-o" | "--output" => {
+                let v = iter.next().ok_or(format!("{arg} requires a value"))?;
+                output = OutputSelector::Name(v);
+            }
+            "-f" | "--fps" => {
+                let v = iter.next().ok_or(format!("{arg} requires a value"))?;
                 fps = v
                     .parse::<f64>()
                     .ok()
                     .filter(|f| f.is_finite() && *f > 0.0)
-                    .ok_or_else(|| format!("invalid --fps value: {v}"))?;
+                    .ok_or_else(|| format!("invalid {arg} value: {v}"))?;
             }
-            "--layer" => {
-                let v = iter.next().ok_or("--layer requires a value")?;
+            "-l" | "--layer" => {
+                let v = iter.next().ok_or(format!("{arg} requires a value"))?;
                 layer = match v.as_str() {
                     "background" => LayerName::Background,
                     "bottom" => LayerName::Bottom,
                     "top" => LayerName::Top,
                     "overlay" => LayerName::Overlay,
-                    _ => return Err(format!("invalid --layer value: {v}")),
+                    _ => return Err(format!("invalid {arg} value: {v}")),
                 };
             }
-            s if s.starts_with("--") => return Err(format!("unknown option: {s}")),
+            s if s.starts_with('-') && s != "-" => return Err(format!("unknown option: {s}")),
             _ => positional.push(arg),
         }
     }
-    let [output, script]: [String; 2] = positional
-        .try_into()
-        .map_err(|_| "expected <output-name|*> and <wallpaper.lua>".to_string())?;
-    let output = if output == "*" {
-        OutputSelector::All
-    } else {
-        OutputSelector::Name(output)
+    let script = match <[String; 1]>::try_from(positional) {
+        Ok([script]) => script,
+        Err(p) if p.is_empty() => return Err("missing <wallpaper.lua>".into()),
+        Err(_) => {
+            return Err(
+                "expected only <wallpaper.lua> (choose an output with -o NAME; all outputs by default)"
+                    .into(),
+            );
+        }
     };
     Ok(ParseResult::Run(Args {
         fps,
@@ -93,39 +101,51 @@ mod tests {
         parse(args.iter().map(|s| s.to_string()))
     }
 
+    fn run(args: &[&str]) -> Args {
+        match p(args) {
+            Ok(ParseResult::Run(a)) => a,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
-    fn parses_full() {
+    fn defaults_to_all_outputs() {
         assert_eq!(
-            p(&["--fps", "24", "DP-1", "a.lua"]),
-            Ok(ParseResult::Run(Args {
-                fps: 24.0,
+            run(&["a.lua"]),
+            Args {
+                fps: 60.0,
                 layer: LayerName::Background,
-                output: OutputSelector::Name("DP-1".into()),
+                output: OutputSelector::All,
                 script: "a.lua".into()
-            }))
+            }
         );
     }
 
     #[test]
-    fn star_means_all_and_default_fps() {
-        let Ok(ParseResult::Run(a)) = p(&["*", "a.lua"]) else {
-            panic!()
-        };
-        assert_eq!(a.output, OutputSelector::All);
-        assert_eq!(a.fps, 30.0);
-        let Ok(ParseResult::Run(a)) = p(&["--layer", "overlay", "*", "a.lua"]) else {
-            panic!()
-        };
+    fn parses_options() {
+        let a = run(&["-o", "DP-1", "--fps", "24", "--layer", "overlay", "a.lua"]);
+        assert_eq!(a.output, OutputSelector::Name("DP-1".into()));
+        assert_eq!(a.fps, 24.0);
         assert_eq!(a.layer, LayerName::Overlay);
+        let a = run(&["a.lua", "--output", "HDMI-A-1"]);
+        assert_eq!(a.output, OutputSelector::Name("HDMI-A-1".into()));
+        let a = run(&["-f", "120", "-l", "top", "a.lua"]);
+        assert_eq!(a.fps, 120.0);
+        assert_eq!(a.layer, LayerName::Top);
     }
 
     #[test]
     fn rejects_bad_input() {
-        assert!(p(&["--fps", "0", "*", "a.lua"]).is_err());
+        assert!(p(&[]).is_err());
+        assert!(p(&["--fps", "0", "a.lua"]).is_err());
         assert!(p(&["--fps"]).is_err());
-        assert!(p(&["*"]).is_err());
-        assert!(p(&["--bogus", "*", "a.lua"]).is_err());
-        assert!(p(&["--layer", "middle", "*", "a.lua"]).is_err());
+        assert!(p(&["-o"]).is_err());
+        assert!(p(&["-f"]).is_err());
+        assert!(p(&["-l", "middle", "a.lua"]).is_err());
+        assert!(p(&["*", "a.lua"]).is_err());
+        assert!(p(&["--bogus", "a.lua"]).is_err());
+        assert!(p(&["-x", "a.lua"]).is_err());
+        assert!(p(&["--layer", "middle", "a.lua"]).is_err());
         assert_eq!(p(&["-h"]), Ok(ParseResult::Help));
     }
 }
