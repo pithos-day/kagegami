@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 pub const USAGE: &str =
-    "usage: kagegami [-o OUTPUT] [--fps N] [--layer background|bottom|top|overlay] <wallpaper.lua>";
+    "usage: kagegami [-o OUTPUT] [-f FPS] [-l background|bottom|top|overlay] <wallpaper.lua>";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputSelector {
@@ -53,22 +53,22 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, Str
                 let v = iter.next().ok_or(format!("{arg} requires a value"))?;
                 output = OutputSelector::Name(v);
             }
-            "--fps" => {
-                let v = iter.next().ok_or("--fps requires a value")?;
+            "-f" | "--fps" => {
+                let v = iter.next().ok_or(format!("{arg} requires a value"))?;
                 fps = v
                     .parse::<f64>()
                     .ok()
                     .filter(|f| f.is_finite() && *f > 0.0)
-                    .ok_or_else(|| format!("invalid --fps value: {v}"))?;
+                    .ok_or_else(|| format!("invalid {arg} value: {v}"))?;
             }
-            "--layer" => {
-                let v = iter.next().ok_or("--layer requires a value")?;
+            "-l" | "--layer" => {
+                let v = iter.next().ok_or(format!("{arg} requires a value"))?;
                 layer = match v.as_str() {
                     "background" => LayerName::Background,
                     "bottom" => LayerName::Bottom,
                     "top" => LayerName::Top,
                     "overlay" => LayerName::Overlay,
-                    _ => return Err(format!("invalid --layer value: {v}")),
+                    _ => return Err(format!("invalid {arg} value: {v}")),
                 };
             }
             s if s.starts_with('-') && s != "-" => return Err(format!("unknown option: {s}")),
@@ -129,6 +129,9 @@ mod tests {
         assert_eq!(a.layer, LayerName::Overlay);
         let a = run(&["a.lua", "--output", "HDMI-A-1"]);
         assert_eq!(a.output, OutputSelector::Name("HDMI-A-1".into()));
+        let a = run(&["-f", "120", "-l", "top", "a.lua"]);
+        assert_eq!(a.fps, 120.0);
+        assert_eq!(a.layer, LayerName::Top);
     }
 
     #[test]
@@ -137,6 +140,8 @@ mod tests {
         assert!(p(&["--fps", "0", "a.lua"]).is_err());
         assert!(p(&["--fps"]).is_err());
         assert!(p(&["-o"]).is_err());
+        assert!(p(&["-f"]).is_err());
+        assert!(p(&["-l", "middle", "a.lua"]).is_err());
         assert!(p(&["*", "a.lua"]).is_err());
         assert!(p(&["--bogus", "a.lua"]).is_err());
         assert!(p(&["-x", "a.lua"]).is_err());

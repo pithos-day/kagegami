@@ -17,12 +17,12 @@ cp target/release/kagegami ~/.local/bin/
 ## 使い方
 
 ```sh
-kagegami [-o OUTPUT] [--fps N] [--layer background|bottom|top|overlay] <wallpaper.lua>
+kagegami [-o OUTPUT] [-f FPS] [-l background|bottom|top|overlay] <wallpaper.lua>
 ```
 
 - `-o`, `--output`: 描画する出力の名前（`niri msg outputs` などで出る `DP-1` など）。省略すると全出力
-- `--fps`: フレームレートの上限（既定 60）
-- `--layer`: 描画するレイヤー（既定 `background`）
+- `-f`, `--fps`: フレームレートの上限（既定 60）
+- `-l`, `--layer`: 描画するレイヤー（既定 `background`）
 - 壁紙のファイルを保存すると、自動で読み直す
 
 例:
