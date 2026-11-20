@@ -1,0 +1,23 @@
+[package]
+name = "kagegami"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glow = "0.18.0"
+khronos-egl = { version = "6.0.0", features = ["static"] }
+libc = "0.2.191"
+mlua = { version = "0.12.2", features = ["luajit", "vendored"] }
+smithay-client-toolkit = { version = "0.21.1", default-features = false }
+wayland-backend = { version = "0.3.17", features = ["client_system"] }
+wayland-client = "0.31.15"
+wayland-egl = "0.32.11"
+
+[features]
+# 開発用: 1 フレームあたりの GPU 時間を測る
+gpu-bench = []
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
