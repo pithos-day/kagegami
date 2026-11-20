@@ -202,10 +202,13 @@ impl Renderer {
 
     fn apply_blend(&self) {
         unsafe {
-            match self.blend {
-                Blend::Alpha => self.gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA),
-                Blend::Add => self.gl.blend_func(glow::SRC_ALPHA, glow::ONE),
-            }
+            // フレームバッファーのアルファは 1 のまま保つ。アルファが減ると、コンポジターが
+            // その部分を半透明として扱い、背面が透けてしまう。
+            let dst = match self.blend {
+                Blend::Alpha => glow::ONE_MINUS_SRC_ALPHA,
+                Blend::Add => glow::ONE,
+            };
+            self.gl.blend_func_separate(glow::SRC_ALPHA, dst, glow::ZERO, glow::ONE);
         }
     }
 
@@ -282,7 +285,10 @@ impl Renderer {
                 out.extend_from_slice(&px[i..i + 3]);
             }
         }
-        std::fs::write(path, out)
+        std::fs::write(path, out)?;
+        // アルファの確認用に、不透明でない画素の数を書き出す。
+        let translucent = px.chunks_exact(4).filter(|p| p[3] != 255).count();
+        std::fs::write(format!("{path}.alpha"), format!("{translucent}\n"))
     }
 }
 
