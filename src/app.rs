@@ -84,6 +84,8 @@ pub struct App {
     pub args: Args,
     pub frame_period: Duration,
     pub wallpapers: Vec<Wallpaper>,
+    #[cfg(feature = "gpu-bench")]
+    pub bench: Option<crate::bench::Bench>,
 }
 
 
@@ -201,9 +203,17 @@ impl App {
                 }
             }
             let renderer = self.renderer.as_mut().unwrap();
+            #[cfg(feature = "gpu-bench")]
+            let bench_t0 = self.bench.as_ref().map(|b| b.start(renderer.gl()));
             renderer.begin(w.width, w.height);
             let mut failed = false;
+            #[cfg(feature = "gpu-bench")]
+            let glsl = self.bench.as_ref().is_some_and(|b| b.uses_glsl());
+            #[cfg(not(feature = "gpu-bench"))]
+            let glsl = false;
             match &w.script {
+                #[cfg(feature = "gpu-bench")]
+                _ if glsl => self.bench.as_mut().unwrap().draw_glsl(renderer.gl(), w.width, w.height),
                 Some(script) if !w.failed => match script.frame(dt) {
                     Ok(dl) => renderer.submit(&dl),
                     Err(e) => {
@@ -214,6 +224,11 @@ impl App {
                 },
                 _ => renderer.clear(0.0, 0.0, 0.0),
             }
+            #[cfg(feature = "gpu-bench")]
+            if let (Some(b), Some(t0)) = (self.bench.as_mut(), bench_t0) {
+                b.end(renderer.gl(), t0, if glsl { "glsl" } else { "lua" });
+            }
+            let _ = glsl;
             if failed && w.presented {
                 // 直前のフレームを表示したまま止める。
                 self.wallpapers[i].failed = true;

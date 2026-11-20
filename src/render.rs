@@ -209,6 +209,11 @@ impl Renderer {
         }
     }
 
+    #[cfg(feature = "gpu-bench")]
+    pub fn gl(&self) -> &glow::Context {
+        &self.gl
+    }
+
     /// 1 フレームの描画を始める。GL の状態は出力間で共有されるので毎回設定し直す。
     pub fn begin(&mut self, width: u32, height: u32) {
         unsafe {

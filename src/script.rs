@@ -457,3 +457,46 @@ mod bench {
         eprintln!("jit off: {:.3}s", time(&jit_off));
     }
 }
+
+#[cfg(test)]
+mod frame_bench {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn geometry_frame_cost() {
+        let src = std::fs::read_to_string("examples/geometry.lua").unwrap();
+        let s = Script::from_source(&src, "geometry", "B", 1, 1920, 1080).unwrap();
+        s.set_mouse(&MouseState { x: 900.0, y: 500.0, inside: true, ..Default::default() }).unwrap();
+        for _ in 0..200 {
+            drop(s.frame(1.0 / 60.0).unwrap());
+        }
+        let n = 20_000;
+        let t = Instant::now();
+        let mut quads = 0;
+        for _ in 0..n {
+            quads = s.frame(1.0 / 60.0).unwrap().batch.quads();
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        eprintln!("geometry.lua: {us:.1} us/frame, {quads} quads");
+    }
+
+    #[test]
+    #[ignore]
+    fn per_call_cost() {
+        let s = Script::from_source(
+            "function draw() for i = 1, 10000 do color(1, 1, 1, 0.5) line(i, 0, i, 100, 1) end end",
+            "calls", "B", 1, 1920, 1080,
+        ).unwrap();
+        for _ in 0..20 {
+            drop(s.frame(0.0).unwrap());
+        }
+        let n = 200;
+        let t = Instant::now();
+        for _ in 0..n {
+            drop(s.frame(0.0).unwrap());
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / (n as f64 * 10000.0);
+        eprintln!("color+line: {ns:.0} ns per shape");
+    }
+}

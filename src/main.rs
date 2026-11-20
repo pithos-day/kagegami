@@ -1,4 +1,6 @@
 mod app;
+#[cfg(feature = "gpu-bench")]
+mod bench;
 mod cli;
 mod egl;
 mod render;
@@ -99,6 +101,8 @@ fn run(args: cli::Args) -> Result<(), String> {
         frame_period: Duration::from_secs_f64(1.0 / args.fps),
         args,
         wallpapers: Vec::new(),
+        #[cfg(feature = "gpu-bench")]
+        bench: bench::Bench::from_env(),
     };
 
     script::spawn_watchdog(WATCHDOG_LIMIT);
