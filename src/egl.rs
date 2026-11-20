@@ -28,7 +28,7 @@ impl EglContext {
             egl::SURFACE_TYPE,
             egl::WINDOW_BIT,
             egl::RENDERABLE_TYPE,
-            egl::OPENGL_ES2_BIT,
+            egl::OPENGL_ES3_BIT,
             egl::RED_SIZE,
             8,
             egl::GREEN_SIZE,
@@ -40,11 +40,17 @@ impl EglContext {
         let config = egl
             .choose_first_config(display, &attrs)
             .map_err(|e| format!("eglChooseConfig: {e}"))?
-            .ok_or("no suitable EGL config")?;
-        let ctx_attrs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
+            .ok_or(
+                "no EGL config supports OpenGL ES 3 (kagegami requires OpenGL ES 3.0 or later)",
+            )?;
+        let ctx_attrs = [egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE];
         let context = egl
             .create_context(display, config, None, &ctx_attrs)
-            .map_err(|e| format!("eglCreateContext: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "eglCreateContext (OpenGL ES 3): {e} (kagegami requires OpenGL ES 3.0 or later)"
+                )
+            })?;
         Ok(Self {
             egl,
             display,

@@ -7,7 +7,9 @@ Lua で書けるライブ壁紙。Wayland（wlr-layer-shell）の背景レイヤ
 
 ## ビルド
 
-必要なもの: Rust、`wayland-client` / `wayland-egl` / EGL / GLES2 の開発ファイル、C コンパイラー（LuaJIT を同梱してビルドするため）。
+必要なもの: Rust、`wayland-client` / `wayland-egl` / EGL / GLES の開発ファイル、C コンパイラー（LuaJIT を同梱してビルドするため）。
+
+実行には OpenGL ES 3.0 以上を使える GPU とドライバーが要る。GLES3 のコンテキストを作れない環境では、エラーを出して起動しない。
 
 ```sh
 cargo build --release
