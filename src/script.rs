@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, VmState};
 
-use crate::render::{Batch, Blend, color_u8};
+use crate::render::{Batch, Blend, Vertex};
 
 /// スクリプトの 1 回の呼び出しに許す時間。超えたらエラーにして止める。
 const LOAD_BUDGET: Duration = Duration::from_secs(2);
@@ -131,18 +131,83 @@ pub fn spawn_watchdog(limit: Duration) {
 }
 
 pub struct Script {
+    // lua を先に drop する（prelude が _buf を指しているため、宣言順を変えないこと）。
     lua: Lua,
     screen: Table,
     mouse: Table,
     #[allow(dead_code)]
     jit_enabled: bool,
+    begin: Function,
+    finish: Function,
+    /// prelude が ffi で直接書き込む頂点バッファー。確保した後は動かさない。
+    _buf: Box<[Vertex]>,
 }
 
 /// 壁紙スクリプトに見せないグローバル。ファイル読み込みや別環境への抜け道になるもの。
 const REMOVED_GLOBALS: &[&str] = &[
     "dofile", "loadfile", "load", "loadstring", "require", "module",
-    "getfenv", "setfenv", "collectgarbage", "gcinfo", "newproxy", "jit",
+    "getfenv", "setfenv", "collectgarbage", "gcinfo", "newproxy", "jit", "ffi",
 ];
+
+/// prelude の頂点バッファーの容量（頂点数、4 の倍数）。満杯になるたびに DrawList へ移す。
+const PRELUDE_CAP: usize = 4096;
+
+/// 描画関数（color, line など）を prelude.lua で作り、グローバルに置く。
+///
+/// prelude は ffi で `buf` に直接頂点を書き、満杯になったときやフレームの終わりに
+/// `take(n)` で DrawList へ移す。ffi は prelude の upvalue にしか残らない。
+fn install_prelude(lua: &Lua, buf: *mut Vertex) -> mlua::Result<(Function, Function)> {
+    let base = buf as usize;
+    let take = lua.create_function(move |lua, n: i64| {
+        if n < 0 || n as usize > PRELUDE_CAP || n % 4 != 0 {
+            return Err(mlua::Error::runtime(format!("internal: bad vertex count {n}")));
+        }
+        // 安全性: buf は PRELUDE_CAP 個の Vertex を持つ Box で、Script が生きている間は動かない。
+        let src = unsafe { std::slice::from_raw_parts(base as *const Vertex, n as usize) };
+        lua.app_data_mut::<DrawList>().unwrap().batch.vertices.extend_from_slice(src);
+        Ok(())
+    })?;
+    let clear = lua.create_function(|lua, (r, g, b): (f32, f32, f32)| {
+        let mut dl = lua.app_data_mut::<DrawList>().unwrap();
+        dl.batch.vertices.clear();
+        let blend = dl.blend;
+        dl.segments.clear();
+        dl.segments.push((blend, 0));
+        dl.clear = Some([r, g, b]);
+        Ok(())
+    })?;
+    let blend = lua.create_function(|lua, mode: mlua::Value| {
+        let blend = match mode.as_string().map(|s| s.as_bytes().to_vec()).as_deref() {
+            Some(b"alpha") => Blend::Alpha,
+            Some(b"add") => Blend::Add,
+            _ => return Err(mlua::Error::runtime("blend: expected \"alpha\" or \"add\"")),
+        };
+        lua.app_data_mut::<DrawList>().unwrap().set_blend(blend);
+        Ok(())
+    })?;
+    let g = lua.globals();
+    let ffi: Table = g.get("ffi")?;
+    let math: Table = g.get("math")?;
+    let (api, host): (Table, Table) = lua
+        .load(include_str!("prelude.lua"))
+        .set_name("=kagegami")
+        .set_environment(lua.create_table()?)
+        .call((
+            ffi,
+            mlua::LightUserData(buf.cast()),
+            PRELUDE_CAP,
+            take,
+            clear,
+            blend,
+            math.get::<Function>("sqrt")?,
+            g.get::<Function>("error")?,
+            g.get::<Function>("type")?,
+        ))?;
+    for name in ["color", "circle", "line", "rect", "clear", "blend"] {
+        g.set(name, api.get::<Function>(name)?)?;
+    }
+    Ok((host.get("begin")?, host.get("finish")?))
+}
 
 impl Script {
     pub fn load(path: &Path, output: &str, seed: u64, width: u32, height: u32) -> Result<Self, String> {
@@ -153,11 +218,13 @@ impl Script {
     pub fn from_source(src: &str, chunk_name: &str, output: &str, seed: u64, width: u32, height: u32) -> Result<Self, String> {
         // LuaJIT は jit ライブラリを開いたときに JIT コンパイラーを有効にするので、JIT も読み込む。
         // スクリプトから jit.off() などを呼べないよう、読み込んだ後にグローバルから外す。
-        let libs = StdLib::MATH | StdLib::STRING | StdLib::TABLE | StdLib::BIT | StdLib::JIT;
-        let lua = Lua::new_with(libs, LuaOptions::default())
-            .map_err(|e| e.to_string())?;
+        // ffi は描画関数（prelude）の中だけで使い、読み込んだ後にグローバルから外す。
+        // ffi を開くには mlua の safe モードを外す必要がある。
+        let libs = StdLib::MATH | StdLib::STRING | StdLib::TABLE | StdLib::BIT | StdLib::JIT | StdLib::FFI;
+        let lua = unsafe { Lua::unsafe_new_with(libs, LuaOptions::default()) };
         let _busy = BusyGuard::new();
-        let script = Self::setup(lua, output, seed, width, height).map_err(|e| e.to_string())?;
+        let buf = vec![Vertex::default(); PRELUDE_CAP].into_boxed_slice();
+        let script = Self::setup(lua, buf, output, seed, width, height).map_err(|e| e.to_string())?;
         script.lua.set_app_data(Deadline(Instant::now() + LOAD_BUDGET));
         script
             .lua
@@ -170,15 +237,13 @@ impl Script {
         Ok(script)
     }
 
-    fn setup(lua: Lua, output: &str, seed: u64, width: u32, height: u32) -> mlua::Result<Self> {
+    fn setup(lua: Lua, buf: Box<[Vertex]>, output: &str, seed: u64, width: u32, height: u32) -> mlua::Result<Self> {
+        let buf_ptr = buf.as_ptr() as *mut Vertex;
         let g = lua.globals();
         let jit: Table = g.get("jit")?;
         let jit_enabled: bool = jit.get::<Function>("status")?.call(())?;
         if !jit_enabled {
             eprintln!("kagegami: warning: LuaJIT JIT compiler is disabled");
-        }
-        for name in REMOVED_GLOBALS {
-            g.raw_set(*name, mlua::Nil)?;
         }
         let string: Table = g.get("string")?;
         string.raw_set("dump", mlua::Nil)?;
@@ -201,59 +266,10 @@ impl Script {
         lua.set_app_data(DrawList::default());
         lua.app_data_mut::<DrawList>().unwrap().reset();
 
-        g.set(
-            "clear",
-            lua.create_function(|lua, (r, gr, b): (f32, f32, f32)| {
-                let mut dl = lua.app_data_mut::<DrawList>().unwrap();
-                // clear より前の図形は見えなくなるので捨てる。
-                dl.batch.vertices.clear();
-                let blend = dl.blend;
-                dl.segments.clear();
-                dl.segments.push((blend, 0));
-                dl.clear = Some([r, gr, b]);
-                Ok(())
-            })?,
-        )?;
-        g.set(
-            "color",
-            lua.create_function(|lua, (r, gr, b, a): (f32, f32, f32, Option<f32>)| {
-                lua.app_data_mut::<DrawList>().unwrap().batch.color = color_u8(r, gr, b, a.unwrap_or(1.0));
-                Ok(())
-            })?,
-        )?;
-        g.set(
-            "blend",
-            lua.create_function(|lua, mode: mlua::LuaString| {
-                let blend = match mode.as_bytes().as_ref() {
-                    b"alpha" => Blend::Alpha,
-                    b"add" => Blend::Add,
-                    _ => return Err(mlua::Error::runtime("blend: expected \"alpha\" or \"add\"")),
-                };
-                lua.app_data_mut::<DrawList>().unwrap().set_blend(blend);
-                Ok(())
-            })?,
-        )?;
-        g.set(
-            "line",
-            lua.create_function(|lua, (x1, y1, x2, y2, w): (f32, f32, f32, f32, Option<f32>)| {
-                lua.app_data_mut::<DrawList>().unwrap().batch.line(x1, y1, x2, y2, w.unwrap_or(1.0));
-                Ok(())
-            })?,
-        )?;
-        g.set(
-            "circle",
-            lua.create_function(|lua, (x, y, r): (f32, f32, f32)| {
-                lua.app_data_mut::<DrawList>().unwrap().batch.circle(x, y, r);
-                Ok(())
-            })?,
-        )?;
-        g.set(
-            "rect",
-            lua.create_function(|lua, (x, y, w, h): (f32, f32, f32, f32)| {
-                lua.app_data_mut::<DrawList>().unwrap().batch.rect(x, y, w, h);
-                Ok(())
-            })?,
-        )?;
+        let (begin, finish) = install_prelude(&lua, buf_ptr)?;
+        for name in REMOVED_GLOBALS {
+            g.raw_set(*name, mlua::Nil)?;
+        }
 
         let screen = lua.create_table()?;
         screen.set("w", width)?;
@@ -272,7 +288,7 @@ impl Script {
             }
         })?;
 
-        let s = Self { lua, screen, mouse, jit_enabled };
+        let s = Self { lua, screen, mouse, jit_enabled, begin, finish, _buf: buf };
         s.set_mouse(&MouseState::default()).map_err(mlua::Error::runtime)?;
         Ok(s)
     }
@@ -320,8 +336,10 @@ impl Script {
         let _busy = BusyGuard::new();
         self.lua.set_app_data(Deadline(Instant::now() + FRAME_BUDGET));
         self.lua.app_data_mut::<DrawList>().unwrap().reset();
+        self.begin.call::<()>(()).map_err(|e| e.to_string())?;
         self.call("update", dt).map_err(|e| e.to_string())?;
         self.call("draw", ()).map_err(|e| e.to_string())?;
+        self.finish.call::<()>(()).map_err(|e| e.to_string())?;
         Ok(self.lua.app_data_ref::<DrawList>().unwrap())
     }
 }
@@ -409,6 +427,110 @@ mod tests {
         let err = s.frame(0.0).err().unwrap();
         assert!(err.contains("time limit exceeded"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn prelude_matches_rust_reference_geometry() {
+        let s = run(r#"
+            function draw()
+                color(0.2, 0.4, 0.6, 0.8)
+                line(10.5, 20, 300, 140.25, 3)
+                circle(50, 60, 7.5)
+                rect(1, 2, 30, 40)
+                line(5, 5, 5, 5, 4)
+            end
+        "#)
+        .unwrap();
+        let dl = s.frame(0.0).unwrap();
+        let mut reference = Batch { vertices: Vec::new(), color: crate::render::color_u8(0.2, 0.4, 0.6, 0.8) };
+        reference.line(10.5, 20.0, 300.0, 140.25, 3.0);
+        reference.circle(50.0, 60.0, 7.5);
+        reference.rect(1.0, 2.0, 30.0, 40.0);
+        reference.line(5.0, 5.0, 5.0, 5.0, 4.0);
+        assert_eq!(dl.batch.vertices.len(), reference.vertices.len());
+        for (a, b) in dl.batch.vertices.iter().zip(&reference.vertices) {
+            let close = |x: [f32; 2], y: [f32; 2]| (x[0] - y[0]).abs() < 1e-3 && (x[1] - y[1]).abs() < 1e-3;
+            assert!(close(a.pos, b.pos) && close(a.local, b.local) && close(a.shape, b.shape), "{a:?} != {b:?}");
+            assert_eq!(a.color, b.color);
+        }
+    }
+
+    #[test]
+    fn ffi_is_unreachable_and_draw_functions_return_nothing() {
+        let s = run("").unwrap();
+        s.lua.load(r#"
+            assert(ffi == nil and jit == nil)
+            assert(select('#', line(0, 0, 1, 1)) == 0)
+            assert(select('#', circle(0, 0, 1)) == 0)
+            assert(select('#', rect(0, 0, 1, 1)) == 0)
+            assert(select('#', color(1, 1, 1)) == 0)
+            -- 描画関数は C 関数ではなく Lua 関数だが、upvalue を覗く手段がない
+            assert(debug == nil and getfenv == nil and string.dump == nil)
+        "#).exec().unwrap();
+    }
+
+    #[test]
+    fn many_shapes_overflow_the_ffi_buffer_safely() {
+        // バッファー（PRELUDE_CAP 頂点）を何度も溢れさせ、途中でブレンドも切り替える。
+        let s = run(r#"
+            function draw()
+                for i = 1, 5000 do line(i, 0, i, 10, 1) end
+                blend("add")
+                for i = 1, 3000 do circle(i, 5, 2) end
+            end
+        "#)
+        .unwrap();
+        for _ in 0..3 {
+            let dl = s.frame(0.0).unwrap();
+            assert_eq!(dl.batch.quads(), 8000);
+            assert_eq!(dl.segments, vec![(Blend::Alpha, 0), (Blend::Add, 5000)]);
+        }
+    }
+
+    #[test]
+    fn clear_discards_shapes_even_after_flushes() {
+        let s = run(r#"
+            function draw()
+                for i = 1, 3000 do circle(i, 5, 2) end
+                clear(0, 0, 0)
+                circle(1, 1, 1)
+            end
+        "#)
+        .unwrap();
+        assert_eq!(s.frame(0.0).unwrap().batch.quads(), 1);
+    }
+
+    #[test]
+    fn odd_values_are_handled() {
+        let s = run(r#"
+            function draw()
+                color(0/0, 2, -1, 1e300)
+                line(0, 0, 1e30, -1e30, 0/0)
+                circle(0/0, 0, -5)
+            end
+        "#)
+        .unwrap();
+        let dl = s.frame(0.0).unwrap();
+        assert_eq!(dl.batch.vertices[0].color, [0, 255, 0, 255]);
+        assert_eq!(dl.batch.quads(), 2);
+        drop(dl);
+        assert!(run("function draw() line('a', 0, 1, 1) end").unwrap().frame(0.0).err().unwrap().contains("number expected"));
+        assert!(run("function draw() blend('multiply') end").unwrap().frame(0.0).is_err());
+    }
+
+    #[test]
+    fn errors_mid_draw_do_not_leak_into_next_frame() {
+        let s = run(r#"
+            n = 0
+            function draw()
+                n = n + 1
+                circle(0, 0, 1)
+                if n == 1 then error("boom") end
+            end
+        "#)
+        .unwrap();
+        assert!(s.frame(0.0).is_err());
+        assert_eq!(s.frame(0.0).unwrap().batch.quads(), 1);
     }
 
     #[test]

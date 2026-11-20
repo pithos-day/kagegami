@@ -37,16 +37,22 @@ pub struct Batch {
     pub color: [u8; 4],
 }
 
-/// 矩形を内側扱いにするための大きな半径（mediump の範囲に収まる値）。
+/// 矩形を内側扱いにするための大きな半径（mediump の範囲に収まる値）。prelude.lua と揃える。
+#[cfg(test)]
 const FILL_RADIUS: f32 = 8192.0;
-/// アンチエイリアスのために図形の外側へ広げる量（ピクセル）。
+/// アンチエイリアスのために図形の外側へ広げる量（ピクセル）。prelude.lua と揃える。
+#[cfg(test)]
 const AA_PAD: f32 = 1.0;
 
 impl Batch {
     pub fn quads(&self) -> usize {
         self.vertices.len() / 4
     }
+}
 
+/// 図形の頂点の参照実装。本番では prelude.lua が同じ計算をする（テストで両者を比べる）。
+#[cfg(test)]
+impl Batch {
     fn quad(&mut self, corners: [[f32; 2]; 4], locals: [[f32; 2]; 4], shape: [f32; 2]) {
         let color = self.color;
         for i in 0..4 {
@@ -90,6 +96,7 @@ impl Batch {
     }
 }
 
+#[cfg(test)]
 pub fn color_u8(r: f32, g: f32, b: f32, a: f32) -> [u8; 4] {
     let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     [c(r), c(g), c(b), c(a)]
