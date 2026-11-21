@@ -19,11 +19,12 @@ cp target/release/kagegami ~/.local/bin/
 ## 使い方
 
 ```sh
-kagegami [-o OUTPUT] [-f FPS] [-l background|bottom|top|overlay] <wallpaper.lua>
+kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] <wallpaper.lua>
 ```
 
 - `-o`, `--output`: 描画する出力の名前（`niri msg outputs` などで出る `DP-1` など）。省略すると全出力
 - `-f`, `--fps`: フレームレートの上限（既定 60）
+- `-s`, `--scale`: 出力の解像度に対する、描画する解像度の倍率（0.25〜2、既定 1）。後述の「解像度を下げて描く」を参照
 - `-l`, `--layer`: 描画するレイヤー（既定 `background`）
 - 壁紙のファイルを保存すると、自動で読み直す
 
@@ -32,6 +33,22 @@ kagegami [-o OUTPUT] [-f FPS] [-l background|bottom|top|overlay] <wallpaper.lua>
 ```sh
 kagegami examples/geometry.lua          # 全出力に描画する
 kagegami -o DP-1 examples/geometry.lua  # DP-1 だけに描画する
+```
+
+### 解像度を下げて描く
+
+`-s 0.5` のように 1 より小さい倍率を指定すると、縦横それぞれその倍率の解像度で描画し、コンポジターが出力いっぱいに拡大して表示する。
+GPU の負荷はおおよそピクセル数に比例するので、0.5 なら約 1/4 になる。1 より大きい倍率（最大 2）では大きく描いてから縮小するので、アンチエイリアスの代わりになる。
+
+- 壁紙スクリプトから見える `screen.w`・`screen.h` とマウスの座標は、倍率に関係なく出力のピクセルサイズのまま。同じスクリプトが同じ見た目で描かれる
+- 解像度を下げると、幅 1 ピクセルの線など細い図形が 1 ピクセルに満たなくなり、かすれたり途切れたりする
+- 拡大・縮小のフィルターはコンポジターが決める
+- 1 以外の倍率には、コンポジターが `wp_viewporter` に対応している必要がある。対応していなければエラーで終了する
+- 倍率は起動 1 回につき 1 つで、描画するすべての出力に適用する。出力ごとに変えたいときは、`-o` で出力を指定して出力ごとに起動する
+
+```sh
+kagegami -o DP-1 -s 0.5 examples/geometry.lua &
+kagegami -o HDMI-A-1 examples/geometry.lua &
 ```
 
 ### 自動起動

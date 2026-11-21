@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
-pub const USAGE: &str =
-    "usage: kagegami [-o OUTPUT] [-f FPS] [-l background|bottom|top|overlay] <wallpaper.lua>";
+pub const USAGE: &str = "usage: kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] <wallpaper.lua>";
+
+/// `--scale` で受け付ける範囲。
+pub const SCALE_MIN: f64 = 0.25;
+pub const SCALE_MAX: f64 = 2.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputSelector {
@@ -29,6 +32,8 @@ pub enum LayerName {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Args {
     pub fps: f64,
+    /// 出力の解像度に対する、描画する解像度の倍率。
+    pub scale: f64,
     pub layer: LayerName,
     pub output: OutputSelector,
     pub script: PathBuf,
@@ -42,6 +47,7 @@ pub enum ParseResult {
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, String> {
     let mut fps = 60.0;
+    let mut scale = 1.0;
     let mut layer = LayerName::Background;
     let mut output = OutputSelector::All;
     let mut positional = Vec::new();
@@ -60,6 +66,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, Str
                     .ok()
                     .filter(|f| f.is_finite() && *f > 0.0)
                     .ok_or_else(|| format!("invalid {arg} value: {v}"))?;
+            }
+            "-s" | "--scale" => {
+                let v = iter.next().ok_or(format!("{arg} requires a value"))?;
+                scale = v
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|s| (SCALE_MIN..=SCALE_MAX).contains(s))
+                    .ok_or_else(|| {
+                        format!("invalid {arg} value: {v} (must be {SCALE_MIN} to {SCALE_MAX})")
+                    })?;
             }
             "-l" | "--layer" => {
                 let v = iter.next().ok_or(format!("{arg} requires a value"))?;
@@ -87,6 +103,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, Str
     };
     Ok(ParseResult::Run(Args {
         fps,
+        scale,
         layer,
         output,
         script: PathBuf::from(script),
@@ -114,6 +131,7 @@ mod tests {
             run(&["a.lua"]),
             Args {
                 fps: 60.0,
+                scale: 1.0,
                 layer: LayerName::Background,
                 output: OutputSelector::All,
                 script: "a.lua".into()
@@ -132,6 +150,25 @@ mod tests {
         let a = run(&["-f", "120", "-l", "top", "a.lua"]);
         assert_eq!(a.fps, 120.0);
         assert_eq!(a.layer, LayerName::Top);
+    }
+
+    #[test]
+    fn parses_scale_within_range() {
+        assert_eq!(run(&["-s", "0.5", "a.lua"]).scale, 0.5);
+        assert_eq!(run(&["--scale", "0.25", "a.lua"]).scale, 0.25);
+        assert_eq!(run(&["-s", "2", "a.lua"]).scale, 2.0);
+    }
+
+    #[test]
+    fn rejects_scale_out_of_range() {
+        assert!(p(&["-s", "0.24", "a.lua"]).is_err());
+        assert!(p(&["-s", "2.01", "a.lua"]).is_err());
+        assert!(p(&["-s", "0", "a.lua"]).is_err());
+        assert!(p(&["-s", "-1", "a.lua"]).is_err());
+        assert!(p(&["-s", "NaN", "a.lua"]).is_err());
+        assert!(p(&["-s", "inf", "a.lua"]).is_err());
+        assert!(p(&["-s", "half", "a.lua"]).is_err());
+        assert!(p(&["-s"]).is_err());
     }
 
     #[test]

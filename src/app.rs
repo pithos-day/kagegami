@@ -21,8 +21,11 @@ use smithay_client_toolkit::{
     },
 };
 use wayland_client::{
-    Connection, QueueHandle,
+    Connection, QueueHandle, delegate_noop,
     protocol::{wl_output, wl_pointer, wl_seat, wl_surface},
+};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
 
 use crate::cli::{Args, LayerName};
@@ -48,14 +51,25 @@ fn seed_for<T: std::hash::Hash>(salt: &T) -> u64 {
     h.finish()
 }
 
+/// 出力のピクセルサイズに `--scale` の倍率を掛けた、描画するバッファーのサイズ。
+fn scaled(px: u32, scale: f64) -> u32 {
+    ((px as f64 * scale).round() as u32).max(1)
+}
+
 pub struct Wallpaper {
     output: wl_output::WlOutput,
     pub name: String,
     layer: LayerSurface,
     scale: i32,
-    /// バッファーのピクセルサイズ（論理サイズ × scale）。
+    /// `--scale` が 1 でないときだけ使う。バッファーを論理サイズへ拡大・縮小して表示する。
+    viewport: Option<WpViewport>,
+    /// layer surface の論理サイズ。
+    logical: (u32, u32),
+    /// 出力のピクセルサイズ（論理サイズ × scale）。スクリプトの座標系はこのサイズ。
     width: u32,
     height: u32,
+    /// 描画するバッファーのピクセルサイズ（出力のピクセルサイズ × `--scale`）。
+    buffer: (u32, u32),
     egl_surface: Option<EglSurface>,
     /// frame callback を待っている間は描画しない（隠れている出力は自然に止まる）。
     frame_pending: bool,
@@ -83,6 +97,7 @@ pub struct App {
     pub pointer: Option<wl_pointer::WlPointer>,
     pub compositor: CompositorState,
     pub layer_shell: LayerShell,
+    pub viewporter: Option<WpViewporter>,
     pub egl: EglContext,
     pub renderer: Option<Renderer>,
     pub args: Args,
@@ -121,7 +136,14 @@ impl App {
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_size(0, 0);
         let scale = info.scale_factor.max(1);
-        layer.wl_surface().set_buffer_scale(scale);
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|v| v.get_viewport(layer.wl_surface(), qh, ()));
+        // viewport を使うときは、表示するサイズを set_destination で決める。
+        if viewport.is_none() {
+            layer.wl_surface().set_buffer_scale(scale);
+        }
         layer.commit();
         eprintln!("kagegami: attached to output {name}");
         self.wallpapers.push(Wallpaper {
@@ -129,8 +151,11 @@ impl App {
             name,
             layer,
             scale,
+            viewport,
+            logical: (0, 0),
             width: 0,
             height: 0,
+            buffer: (0, 0),
             egl_surface: None,
             frame_pending: false,
             next_due: Instant::now(),
@@ -222,7 +247,7 @@ impl App {
             let renderer = self.renderer.as_mut().unwrap();
             #[cfg(feature = "gpu-bench")]
             let bench_t0 = self.bench.as_ref().map(|b| b.start(renderer.gl()));
-            renderer.begin(w.width, w.height);
+            renderer.begin(w.buffer, (w.width, w.height));
             let mut failed = false;
             #[cfg(feature = "gpu-bench")]
             let glsl = self.bench.as_ref().is_some_and(|b| b.uses_glsl());
@@ -234,7 +259,7 @@ impl App {
                     self.bench
                         .as_mut()
                         .unwrap()
-                        .draw_glsl(renderer.gl(), w.width, w.height)
+                        .draw_glsl(renderer.gl(), w.buffer.0, w.buffer.1)
                 }
                 Some(script) if !w.failed => match script.frame(dt) {
                     Ok(dl) => renderer.submit(&dl),
@@ -260,7 +285,7 @@ impl App {
             if let Ok(dir) = std::env::var("KAGEGAMI_DUMP_DIR") {
                 let path = format!("{dir}/{}.ppm", w.name);
                 if !std::path::Path::new(&path).exists() {
-                    let _ = renderer.dump_ppm(w.width, w.height, &path);
+                    let _ = renderer.dump_ppm(w.buffer.0, w.buffer.1, &path);
                 }
             }
 
@@ -342,11 +367,17 @@ impl OutputHandler for App {
             .output_state
             .info(&output)
             .map_or(1, |i| i.scale_factor.max(1));
-        if let Some(w) = self.wallpapers.iter_mut().find(|w| w.output == output) {
+        if let Some(i) = self.wallpapers.iter().position(|w| w.output == output) {
+            let w = &mut self.wallpapers[i];
             if w.scale != scale {
                 w.scale = scale;
-                w.layer.wl_surface().set_buffer_scale(scale);
-                w.layer.commit();
+                if w.viewport.is_none() {
+                    w.layer.wl_surface().set_buffer_scale(scale);
+                    w.layer.commit();
+                } else if w.logical != (0, 0) {
+                    // viewport を使うときは論理サイズが変わらないので configure が来ない。
+                    self.apply_size(i);
+                }
             }
         }
     }
@@ -387,24 +418,39 @@ impl LayerShellHandler for App {
         let Some(i) = self.wallpapers.iter().position(|w| &w.layer == layer) else {
             return;
         };
-        let w = &mut self.wallpapers[i];
         let (lw, lh) = configure.new_size;
         if lw == 0 || lh == 0 {
             return;
         }
+        self.wallpapers[i].logical = (lw, lh);
+        self.apply_size(i);
+    }
+}
+
+impl App {
+    /// 論理サイズと出力の scale から各サイズを決め直し、EGL surface とスクリプトに反映する。
+    fn apply_size(&mut self, i: usize) {
+        let w = &mut self.wallpapers[i];
+        let (lw, lh) = w.logical;
         w.width = lw * w.scale as u32;
         w.height = lh * w.scale as u32;
-        match &w.egl_surface {
-            Some(s) => s.resize(w.width as i32, w.height as i32),
-            None => {
-                match self
-                    .egl
-                    .create_surface(layer.wl_surface(), w.width as i32, w.height as i32)
-                {
-                    Ok(s) => w.egl_surface = Some(s),
-                    Err(e) => eprintln!("kagegami: {}: {e}", w.name),
-                }
+        w.buffer = match &w.viewport {
+            Some(vp) => {
+                vp.set_destination(lw as i32, lh as i32);
+                (
+                    scaled(w.width, self.args.scale),
+                    scaled(w.height, self.args.scale),
+                )
             }
+            None => (w.width, w.height),
+        };
+        let (bw, bh) = (w.buffer.0 as i32, w.buffer.1 as i32);
+        match &w.egl_surface {
+            Some(s) => s.resize(bw, bh),
+            None => match self.egl.create_surface(w.layer.wl_surface(), bw, bh) {
+                Ok(s) => w.egl_surface = Some(s),
+                Err(e) => eprintln!("kagegami: {}: {e}", w.name),
+            },
         }
         match &w.script {
             Some(script) => {
@@ -438,6 +484,9 @@ impl ProvidesRegistryState for App {
 
 delegate_dispatch2!(App);
 delegate_registry!(App);
+// wp_viewporter と wp_viewport にはイベントがない。
+delegate_noop!(App: WpViewporter);
+delegate_noop!(App: WpViewport);
 
 impl SeatHandler for App {
     fn seat_state(&mut self) -> &mut SeatState {
@@ -540,5 +589,21 @@ impl PointerHandler for App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scaled;
+
+    #[test]
+    fn scales_buffer_size() {
+        assert_eq!(scaled(3840, 1.0), 3840);
+        assert_eq!(scaled(3840, 0.5), 1920);
+        assert_eq!(scaled(3840, 0.25), 960);
+        assert_eq!(scaled(2160, 2.0), 4320);
+        // 割り切れないときは四捨五入する。
+        assert_eq!(scaled(1366, 0.25), 342);
+        assert_eq!(scaled(1, 0.25), 1);
     }
 }

@@ -94,6 +94,16 @@ fn run(args: cli::Args) -> Result<(), String> {
         CompositorState::bind(&globals, &qh).map_err(|e| format!("wl_compositor: {e}"))?;
     let layer_shell =
         LayerShell::bind(&globals, &qh).map_err(|e| format!("wlr-layer-shell: {e}"))?;
+    // 縮小・拡大した描画を出力いっぱいに表示するには wp_viewporter が要る。
+    let viewporter = if args.scale != 1.0 {
+        Some(
+            globals
+                .bind(&qh, 1..=1, ())
+                .map_err(|e| format!("--scale requires wp_viewporter: {e}"))?,
+        )
+    } else {
+        None
+    };
     let egl = egl::EglContext::new(conn.backend().display_ptr().cast())?;
 
     let mut app = app::App {
@@ -103,6 +113,7 @@ fn run(args: cli::Args) -> Result<(), String> {
         pointer: None,
         compositor,
         layer_shell,
+        viewporter,
         egl,
         renderer: None,
         frame_period: Duration::from_secs_f64(1.0 / args.fps),

@@ -250,12 +250,14 @@ impl Renderer {
     }
 
     /// 1 フレームの描画を始める。GL の状態は出力間で共有されるので毎回設定し直す。
-    pub fn begin(&mut self, width: u32, height: u32) {
+    /// `buffer` は描画するバッファーのピクセルサイズ、`screen` はスクリプトの座標系のサイズ。
+    /// 両者が違うときは、座標が `screen` から `buffer` へ縮尺される。
+    pub fn begin(&mut self, buffer: (u32, u32), screen: (u32, u32)) {
         unsafe {
-            self.gl.viewport(0, 0, width as i32, height as i32);
+            self.gl.viewport(0, 0, buffer.0 as i32, buffer.1 as i32);
             self.gl.use_program(Some(self.program));
             self.gl
-                .uniform_2_f32(Some(&self.u_res), width as f32, height as f32);
+                .uniform_2_f32(Some(&self.u_res), screen.0 as f32, screen.1 as f32);
             self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
         }
         self.blend = Blend::Alpha;
