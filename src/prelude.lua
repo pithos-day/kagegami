@@ -85,18 +85,23 @@ end
 
 local api = {}
 
-function api.color(r, g, b, a)
+-- どの描画関数も、決まった数より多い引数はエラーにする（後ろに付いた nil は数えない）。
+
+function api.color(r, g, b, a, ...)
+  if select("#", ...) > 0 then too_many("color", 4, ...) end
   cr = to_u8(num(r, "color"))
   cg = to_u8(num(g, "color"))
   cb = to_u8(num(b, "color"))
   ca = a == nil and 255 or to_u8(num(a, "color"))
 end
 
-function api.circle(x, y, r)
+function api.circle(x, y, r, ...)
+  if select("#", ...) > 0 then too_many("circle", 3, ...) end
   circle_at(num(x, "circle"), num(y, "circle"), num(r, "circle"))
 end
 
-function api.line(x1, y1, x2, y2, w)
+function api.line(x1, y1, x2, y2, w, ...)
+  if select("#", ...) > 0 then too_many("line", 5, ...) end
   num(x1, "line"); num(y1, "line"); num(x2, "line"); num(y2, "line")
   local hw = (w == nil and 1 or num(w, "line")) * 0.5
   if not (hw > 0) then hw = 0 end
@@ -146,13 +151,15 @@ function api.rect(x, y, w, h, angle, ...)
   put(x + w, y + h, 0, 0, 0, FILL_RADIUS)
 end
 
-function api.clear(r, g, b)
+function api.clear(r, g, b, ...)
+  if select("#", ...) > 0 then too_many("clear", 3, ...) end
   -- clear より前の図形は見えなくなるので捨てる。
   n = 0
   rust_clear(num(r, "clear"), num(g, "clear"), num(b, "clear"))
 end
 
-function api.blend(mode)
+function api.blend(mode, ...)
+  if select("#", ...) > 0 then too_many("blend", 1, ...) end
   -- 切り替える前に、それまでの図形を前のモードの区間として渡す。
   flush()
   rust_blend(mode)

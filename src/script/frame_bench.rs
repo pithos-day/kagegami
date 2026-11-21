@@ -77,3 +77,37 @@ fn rect_call_cost() {
         eprintln!("color+{label}: {ns:.1} ns per shape");
     }
 }
+
+/// 描画関数ごとの 1 回の呼び出しにかかる時間。
+#[test]
+#[ignore]
+fn draw_call_cost() {
+    for (label, call) in [
+        ("color", "color(i * 1e-4, 1, 1, 0.5)"),
+        ("circle", "circle(i, 0, 2)"),
+        ("line", "line(i, 0, i, 10, 1)"),
+        ("rect", "rect(i, 0, 10, 10)"),
+        ("rect+angle", "rect(i, 0, 10, 10, 0.5)"),
+        ("clear", "clear(0, 0, 0)"),
+        ("blend", "blend('alpha')"),
+    ] {
+        let s = Script::from_source(
+            &format!("function draw() for i = 1, 10000 do {call} end end"),
+            "calls",
+            "B",
+            1,
+            (1920, 1080),
+        )
+        .unwrap();
+        for _ in 0..20 {
+            drop(s.frame(0.0).unwrap());
+        }
+        let n = 500;
+        let t = Instant::now();
+        for _ in 0..n {
+            drop(s.frame(0.0).unwrap());
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / (n as f64 * 10000.0);
+        eprintln!("{label}: {ns:.2} ns per call");
+    }
+}
