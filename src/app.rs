@@ -49,6 +49,17 @@ fn seed_for<T: std::hash::Hash>(salt: &T) -> u64 {
     h.finish()
 }
 
+impl From<LayerName> for Layer {
+    fn from(name: LayerName) -> Self {
+        match name {
+            LayerName::Background => Layer::Background,
+            LayerName::Bottom => Layer::Bottom,
+            LayerName::Top => Layer::Top,
+            LayerName::Overlay => Layer::Overlay,
+        }
+    }
+}
+
 /// 出力ごとのエラーを、出力の名前を付けて出す。
 fn report(output: &str, e: impl std::fmt::Display) {
     eprintln!("kagegami: {output}: {e}");
@@ -155,12 +166,7 @@ impl App {
         let layer = self.layer_shell.create_layer_surface(
             qh,
             surface,
-            match self.args.layer {
-                LayerName::Background => Layer::Background,
-                LayerName::Bottom => Layer::Bottom,
-                LayerName::Top => Layer::Top,
-                LayerName::Overlay => Layer::Overlay,
-            },
+            self.args.layer.into(),
             Some("kagegami"),
             Some(&output),
         );
