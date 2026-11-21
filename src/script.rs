@@ -536,6 +536,23 @@ mod tests {
     }
 
     #[test]
+    fn every_lua_example_loads() {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir("examples").unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "lua") {
+                let src = std::fs::read_to_string(&path).unwrap();
+                let name = path.display().to_string();
+                if let Err(e) = Script::from_source(&src, &name, "A", 1, (1920, 1080)) {
+                    panic!("{name} を読み込めない: {e}");
+                }
+                names.push(name);
+            }
+        }
+        assert!(!names.is_empty(), "examples に .lua が無い");
+    }
+
+    #[test]
     fn slingshot_example_launches_on_release() {
         let src = std::fs::read_to_string("examples/slingshot.lua").unwrap();
         let s = Script::from_source(&src, "slingshot", "A", 1, (1920, 1080)).unwrap();
