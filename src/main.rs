@@ -5,6 +5,7 @@ mod cli;
 mod egl;
 mod render;
 mod script;
+mod shader;
 
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
@@ -105,6 +106,7 @@ fn run(args: cli::Args) -> Result<(), String> {
         layer_shell,
         egl,
         renderer: None,
+        timer_warned: false,
         frame_period: Duration::from_secs_f64(1.0 / args.fps),
         args,
         wallpapers: Vec::new(),

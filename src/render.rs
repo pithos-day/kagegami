@@ -244,7 +244,6 @@ impl Renderer {
         }
     }
 
-    #[cfg(feature = "gpu-bench")]
     pub fn gl(&self) -> &glow::Context {
         &self.gl
     }
