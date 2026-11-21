@@ -7,7 +7,7 @@
 -- * 頂点を書く前に必ず残り容量を確かめる。満杯なら Rust 側へ渡してから書く。
 -- * 返す関数は何も返さない（cdata を壁紙側に渡さない）。
 
-local ffi, ptr, CAP, take, rust_clear, rust_blend, sqrt, cos, sin, error, type = ...
+local ffi, ptr, CAP, take, rust_clear, rust_blend, sqrt, cos, sin, error, type, select = ...
 
 ffi.cdef [[
 typedef struct {
@@ -54,6 +54,16 @@ local function num(v, name)
     error(name .. ": number expected, got " .. type(v), 3)
   end
   return v
+end
+
+-- 決まった数より後ろの引数（...）が、すべて nil でなければエラーにする。
+-- 後ろに付いた nil は数えないので、変数が nil のまま渡しても省略と同じになる。
+local function too_many(name, max, ...)
+  for i = 1, select("#", ...) do
+    if select(i, ...) ~= nil then
+      error(name .. ": too many arguments (max " .. max .. ")", 3)
+    end
+  end
 end
 
 local function put(px, py, lx, ly, sl, sr)
@@ -123,7 +133,8 @@ local function rotated_rect(x, y, w, h, angle)
   put(cx + ex * c - ey * s, cy + ex * s + ey * c, ex, ey, -hx, hy)
 end
 
-function api.rect(x, y, w, h, angle)
+function api.rect(x, y, w, h, angle, ...)
+  if select("#", ...) > 0 then too_many("rect", 5, ...) end
   num(x, "rect"); num(y, "rect"); num(w, "rect"); num(h, "rect")
   if angle ~= nil then
     return rotated_rect(x, y, w, h, num(angle, "rect"))

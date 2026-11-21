@@ -246,6 +246,7 @@ fn install_prelude(lua: &Lua, buf: *mut Vertex) -> mlua::Result<(Function, Funct
             math.get::<Function>("sin")?,
             g.get::<Function>("error")?,
             g.get::<Function>("type")?,
+            g.get::<Function>("select")?,
         ))?;
     for name in ["color", "circle", "line", "rect", "clear", "blend"] {
         g.set(name, api.get::<Function>(name)?)?;
@@ -668,6 +669,31 @@ mod tests {
         assert!(draw("rect(0, 0, 5, 0/0, 1)").unwrap().is_empty());
         let err = draw("rect(0, 0, 1, 1, 'a')").err().unwrap();
         assert!(err.contains("rect: number expected"), "{err}");
+    }
+
+    #[test]
+    fn rect_rejects_too_many_arguments() {
+        let draw = |body: &str| {
+            run(&format!("function draw() {body} end"))
+                .unwrap()
+                .frame(0.0)
+                .map(|dl| dl.batch.quads())
+        };
+        // 後ろに付いた nil は数えない。
+        assert_eq!(draw("rect(1, 2, 3, 4, nil, nil)").unwrap(), 1);
+        assert_eq!(draw("rect(1, 2, 3, 4, 0.5, nil)").unwrap(), 1);
+        for body in [
+            "rect(1, 2, 3, 4, 0.5, 6)",
+            "rect(1, 2, 3, 4, nil, 6)",
+            "rect(1, 2, 3, 4, 0.5, nil, 7)",
+        ] {
+            let err = draw(body).err().unwrap();
+            // エラーの位置は、描画関数の中ではなく壁紙のスクリプトの行を指す。
+            assert!(
+                err.contains("test:1: rect: too many arguments (max 5)"),
+                "{body}: {err}"
+            );
+        }
     }
 
     #[test]
