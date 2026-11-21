@@ -381,13 +381,18 @@ impl App {
                         failed = true;
                         renderer.clear(0.0, 0.0, 0.0);
                     } else {
+                        let ((width, height), mouse) = shader::view(
+                            w.buffer,
+                            (w.width, w.height),
+                            w.drag.uniform(w.height as f32),
+                        );
                         let u = shader::Uniforms {
-                            width: w.width,
-                            height: w.height,
+                            width,
+                            height,
                             time: now.duration_since(sh.started).as_secs_f32(),
                             time_delta: raw_dt as f32,
                             frame: sh.frame,
-                            mouse: w.drag.uniform(w.height as f32),
+                            mouse,
                             date: shader::local_date(),
                         };
                         if let Some(t) = sh.timer.as_mut() {
