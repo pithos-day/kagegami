@@ -2,8 +2,9 @@
 
 Lua で書けるライブ壁紙。Wayland（wlr-layer-shell）の背景レイヤーに描画する。
 
-点や線などの図形を「1 フレームに一度だけ計算して、図形として GPU に送る」ので、
+Lua の壁紙は、点や線などの図形を「1 フレームに一度だけ計算して、図形として GPU に送る」ので、
 全ピクセルで同じ計算を繰り返すシェーダー方式の壁紙より GPU の負荷が小さい。
+Shadertoy 形式の GLSL のシェーダーも、そのまま壁紙にできる（「シェーダーの壁紙」を参照）。
 
 ## ビルド
 
@@ -19,8 +20,10 @@ cp target/release/kagegami ~/.local/bin/
 ## 使い方
 
 ```sh
-kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] <wallpaper.lua>
+kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] <wallpaper.lua|wallpaper.glsl>
 ```
+
+- 拡張子が `.glsl` か `.frag` のファイルはシェーダーの壁紙、それ以外は Lua の壁紙として読む
 
 - `-o`, `--output`: 描画する出力の名前（`niri msg outputs` などで出る `DP-1` など）。省略すると全出力
 - `-f`, `--fps`: フレームレートの上限（既定 60）
@@ -33,6 +36,7 @@ kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] <wal
 ```sh
 kagegami examples/geometry.lua          # 全出力に描画する
 kagegami -o DP-1 examples/geometry.lua  # DP-1 だけに描画する
+kagegami examples/waves.glsl            # シェーダーの壁紙
 ```
 
 ### 解像度を下げて描く
@@ -136,6 +140,46 @@ end
 - 1 回の呼び出しが長すぎる場合（読み込み 2 秒、毎フレーム 0.25 秒）はエラーとして止める
 - 1 フレームに描ける図形は 100 万個まで。超えたらエラーとして止める
 - ただし、JIT コンパイルされたループのうち、描画関数を呼ばないものはこの仕組みでは止められない。スクリプトが 5 秒戻ってこなければ、kagegami は終了コード 3 で終了する（上の「自動起動」を参照）
+
+## シェーダーの壁紙
+
+Shadertoy の「Image」タブと同じ形で書く。`mainImage` を定義したファイルを、そのまま渡せばよい。
+
+```glsl
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec2 uv = fragCoord / iResolution.xy;
+    fragColor = vec4(uv, 0.5 + 0.5 * sin(iTime), 1.0);
+}
+```
+
+GLSL ES 3.00（`#version 300 es`）として、出力ごとにコンパイルする。出力するアルファは無視して 1 にする。
+
+| uniform | 内容 |
+|---|---|
+| `vec3 iResolution` | 画面のピクセルサイズ（z は 1） |
+| `float iTime` | 読み込んでからの秒数 |
+| `float iTimeDelta` | 前のフレームからの秒数 |
+| `int iFrame` | 読み込んでからのフレーム数 |
+| `vec4 iMouse` | マウス（下を参照） |
+| `vec4 iDate` | (年, 月 - 1, 日, 0 時からの秒数)。ローカル時刻 |
+
+`iChannel0`〜`3`（テクスチャー・音声など）、マルチパス（Buffer A〜D）、Common タブは使えない。
+
+### iMouse
+
+Shadertoy と同じく、ボタンを押している間のドラッグを表す。座標は左下が原点のピクセル。
+
+- `xy`: ドラッグ中の今の位置。ボタンを離した後は、最後の位置のまま
+- `zw`: ドラッグを始めた位置。`z` はボタンを押している間だけ正、`w` は押した最初のフレームだけ正。それ以外は負になる（絶対値は始めた位置のまま）
+- どのボタン（左・右・中・サイドボタン）でも反応する。押すたびにその位置からドラッグを始め直し、どれかのボタンを離すとドラッグが切れる
+- コンポジターからカーソルが壁紙を離れたと知らされたら（Wayland の `Leave`）、ボタンを離した扱いにする。ドラッグ中に壁紙の外の座標が届いたときは、その座標をそのまま渡す
+- 一度も押していなければ、すべて 0
+
+### エラーと重すぎるシェーダー
+
+- コンパイルエラーは標準エラー出力に出して、直前のフレームを表示したまま止まる。ファイルを直して保存すれば再開する
+- 1 フレームの GPU 時間が 0.25 秒を超えたら、エラーとして同じように止める。GPU 時間は `GL_EXT_disjoint_timer_query` で測るので、止まるのは超えたフレームの数フレーム後になる。この拡張機能がない環境では、起動時に警告を出し、時間を見張らずに描く
+- 終わらないループ（`while (true)` など）は止められない。描画が戻らなくなり、最後は GPU ドライバーが GPU をリセットする。そのあいだ、画面全体が固まることがある
 
 ## 開発
 

@@ -1,5 +1,6 @@
 //! Wayland のイベント処理と、出力ごとの壁紙 surface の管理。
 
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::{
@@ -32,11 +33,14 @@ use crate::cli::{Args, LayerName};
 use crate::egl::{EglContext, EglSurface};
 use crate::render::Renderer;
 use crate::script::{Button, MouseEvent, MouseState, Script};
+use crate::shader::{self, DragMouse, GpuTimer, ShaderProgram};
 
 // linux/input-event-codes.h
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
+/// マウスのボタンの範囲（BTN_LEFT〜BTN_TASK）。シェーダーの `iMouse` はどのボタンでも反応する。
+const MOUSE_BUTTONS: std::ops::RangeInclusive<u32> = 0x110..=0x117;
 
 /// 出力ごとに違う乱数の種を作る。
 fn seed_for<T: std::hash::Hash>(salt: &T) -> u64 {
@@ -82,6 +86,19 @@ pub struct Wallpaper {
     last_frame: Option<Instant>,
     seed: u64,
     mouse: MouseState,
+    /// シェーダーの壁紙の状態。Lua の壁紙では None。描画中に書き換えるので RefCell に入れる。
+    shader: RefCell<Option<ShaderState>>,
+    /// シェーダーの `iMouse`。
+    drag: DragMouse,
+}
+
+/// コンパイル済みのシェーダーと、`iTime`・`iFrame` の基準。
+struct ShaderState {
+    program: ShaderProgram,
+    /// GPU 時間を測るタイマー。拡張機能がなければ None（見張らずに描く）。
+    timer: Option<GpuTimer>,
+    started: Instant,
+    frame: i32,
 }
 
 impl Wallpaper {
@@ -100,6 +117,8 @@ pub struct App {
     pub viewporter: Option<WpViewporter>,
     pub egl: EglContext,
     pub renderer: Option<Renderer>,
+    /// タイマーの拡張機能がないことを一度警告したか。
+    pub timer_warned: bool,
     pub args: Args,
     pub frame_period: Duration,
     pub wallpapers: Vec<Wallpaper>,
@@ -165,7 +184,71 @@ impl App {
             last_frame: None,
             seed: seed_for(&self.wallpapers.len()),
             mouse: MouseState::default(),
+            shader: RefCell::new(None),
+            drag: DragMouse::default(),
         });
+    }
+
+    fn is_shader(&self) -> bool {
+        shader::is_shader_path(&self.args.script)
+    }
+
+    /// 描画の準備ができていなければ作る。作れなければ続けられないので終了する。
+    fn ensure_renderer(&mut self) -> &mut Renderer {
+        if self.renderer.is_none() {
+            match Renderer::new(&self.egl) {
+                Ok(r) => self.renderer = Some(r),
+                Err(e) => {
+                    eprintln!("kagegami: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        self.renderer.as_mut().unwrap()
+    }
+
+    /// シェーダーのファイルを読んでコンパイルし、i 番目の出力の壁紙にする。
+    /// 失敗したら、それまでのシェーダーをそのまま残してエラーを返す（Lua の読み直しと同じ）。
+    fn load_shader(&mut self, i: usize) -> Result<(), String> {
+        let src = std::fs::read_to_string(&self.args.script)
+            .map_err(|e| format!("{}: {e}", self.args.script.display()))?;
+        let es = self.wallpapers[i]
+            .egl_surface
+            .as_ref()
+            .ok_or("no EGL surface")?;
+        self.egl.make_current(es)?;
+        self.ensure_renderer();
+        let gl = self.renderer.as_ref().unwrap().gl();
+        let program = ShaderProgram::new(gl, &src)?;
+        let old = self.wallpapers[i].shader.borrow_mut().take();
+        let timer = match old {
+            Some(old) => {
+                old.program.delete(gl);
+                old.timer.map(|mut t| {
+                    // 前のシェーダーの結果で、直したシェーダーを止めないようにする。
+                    t.reset();
+                    t
+                })
+            }
+            None => {
+                let t = GpuTimer::new(gl, |n| self.egl.proc_address(n));
+                if t.is_none() && !self.timer_warned {
+                    self.timer_warned = true;
+                    eprintln!(
+                        "kagegami: warning: GL_EXT_disjoint_timer_query is not available; \
+                         shaders that take too long on the GPU will not be stopped"
+                    );
+                }
+                t
+            }
+        };
+        *self.wallpapers[i].shader.borrow_mut() = Some(ShaderState {
+            program,
+            timer,
+            started: Instant::now(),
+            frame: 0,
+        });
+        Ok(())
     }
 
     fn find(&mut self, surface: &wl_surface::WlSurface) -> Option<&mut Wallpaper> {
@@ -175,6 +258,23 @@ impl App {
     /// スクリプトのファイルを読み直す。読み込めた出力だけ新しいスクリプトに切り替える。
     pub fn reload(&mut self) {
         eprintln!("kagegami: reloading {}", self.args.script.display());
+        if self.is_shader() {
+            for i in 0..self.wallpapers.len() {
+                if self.wallpapers[i].egl_surface.is_none() {
+                    continue;
+                }
+                match self.load_shader(i) {
+                    Ok(()) => {
+                        let w = &mut self.wallpapers[i];
+                        w.failed = false;
+                        w.last_frame = None;
+                        w.next_due = Instant::now();
+                    }
+                    Err(e) => eprintln!("kagegami: {}: {e}", self.wallpapers[i].name),
+                }
+            }
+            return;
+        }
         for w in &mut self.wallpapers {
             if w.width == 0 {
                 continue;
@@ -223,10 +323,10 @@ impl App {
                     eprintln!("kagegami: {}: {e}", w.name);
                 }
             }
-            let dt = w
+            let raw_dt = w
                 .last_frame
-                .map_or(0.0, |t| now.duration_since(t).as_secs_f64())
-                .min(0.25);
+                .map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+            let dt = raw_dt.min(0.25);
             w.last_frame = Some(now);
 
             let w = &self.wallpapers[i];
@@ -245,6 +345,7 @@ impl App {
                 }
             }
             let renderer = self.renderer.as_mut().unwrap();
+            let mut shader_state = w.shader.borrow_mut();
             #[cfg(feature = "gpu-bench")]
             let bench_t0 = self.bench.as_ref().map(|b| b.start(renderer.gl()));
             renderer.begin(w.buffer, (w.width, w.height));
@@ -261,6 +362,43 @@ impl App {
                         .unwrap()
                         .draw_glsl(renderer.gl(), w.buffer.0, w.buffer.1)
                 }
+                _ if shader_state.is_some() && !w.failed => {
+                    let sh = shader_state.as_mut().unwrap();
+                    let gl = renderer.gl();
+                    let slow = sh
+                        .timer
+                        .as_mut()
+                        .and_then(|t| t.poll(gl))
+                        .filter(|d| *d > shader::FRAME_GPU_LIMIT);
+                    if let Some(d) = slow {
+                        eprintln!(
+                            "kagegami: {}: shader took {} ms on the GPU in one frame (limit {} ms)",
+                            w.name,
+                            d.as_millis(),
+                            shader::FRAME_GPU_LIMIT.as_millis()
+                        );
+                        failed = true;
+                        renderer.clear(0.0, 0.0, 0.0);
+                    } else {
+                        let u = shader::Uniforms {
+                            width: w.width,
+                            height: w.height,
+                            time: now.duration_since(sh.started).as_secs_f32(),
+                            time_delta: raw_dt as f32,
+                            frame: sh.frame,
+                            mouse: w.drag.uniform(w.height as f32),
+                            date: shader::local_date(),
+                        };
+                        if let Some(t) = sh.timer.as_mut() {
+                            t.begin(gl);
+                        }
+                        sh.program.draw(gl, &u);
+                        if let Some(t) = sh.timer.as_mut() {
+                            t.end(gl);
+                        }
+                        sh.frame = sh.frame.wrapping_add(1);
+                    }
+                }
                 Some(script) if !w.failed => match script.frame(dt) {
                     Ok(dl) => renderer.submit(&dl),
                     Err(e) => {
@@ -273,9 +411,17 @@ impl App {
             }
             #[cfg(feature = "gpu-bench")]
             if let (Some(b), Some(t0)) = (self.bench.as_mut(), bench_t0) {
-                b.end(renderer.gl(), t0, if glsl { "glsl" } else { "lua" });
+                let label = if glsl {
+                    "glsl"
+                } else if shader_state.is_some() {
+                    "shader"
+                } else {
+                    "lua"
+                };
+                b.end(renderer.gl(), t0, label);
             }
             let _ = glsl;
+            drop(shader_state);
             if failed && w.presented {
                 // 直前のフレームを表示したまま止める。
                 self.wallpapers[i].failed = true;
@@ -298,6 +444,7 @@ impl App {
             w.frame_pending = true;
             w.presented = true;
             w.failed |= failed;
+            w.drag.frame_rendered();
         }
     }
 }
@@ -452,6 +599,20 @@ impl App {
                 Err(e) => eprintln!("kagegami: {}: {e}", w.name),
             },
         }
+        if self.is_shader() {
+            let w = &mut self.wallpapers[i];
+            w.frame_pending = false;
+            w.next_due = Instant::now();
+            if w.shader.borrow().is_none() && !w.failed && w.egl_surface.is_some() {
+                if let Err(e) = self.load_shader(i) {
+                    let w = &mut self.wallpapers[i];
+                    eprintln!("kagegami: {}: {e}", w.name);
+                    w.failed = true;
+                }
+            }
+            return;
+        }
+        let w = &mut self.wallpapers[i];
         match &w.script {
             Some(script) => {
                 if let Err(e) = script.set_screen(w.width, w.height) {
@@ -539,6 +700,18 @@ impl PointerHandler for App {
             let x = (event.position.0 * w.scale as f64) as f32;
             let y = (event.position.1 * w.scale as f64) as f32;
             let mut click = None;
+            // シェーダーの iMouse（#11）。Lua の mouse とは別に、どのボタンでも反応する。
+            match event.kind {
+                PointerEventKind::Motion { .. } => w.drag.moved(x, y),
+                PointerEventKind::Press { button, .. } if MOUSE_BUTTONS.contains(&button) => {
+                    w.drag.pressed(x, y)
+                }
+                PointerEventKind::Release { button, .. } if MOUSE_BUTTONS.contains(&button) => {
+                    w.drag.released()
+                }
+                PointerEventKind::Leave { .. } => w.drag.released(),
+                _ => {}
+            }
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     w.mouse.inside = true;
