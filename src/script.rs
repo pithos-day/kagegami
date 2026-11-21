@@ -252,22 +252,15 @@ fn install_prelude(lua: &Lua, buf: *mut Vertex) -> mlua::Result<(Function, Funct
 }
 
 impl Script {
+    /// `output` は出力の名前、`screen_size` は `screen.w`・`screen.h`（出力のピクセルサイズ）。
     pub fn load(
         path: &Path,
         output: &str,
         seed: u64,
-        width: u32,
-        height: u32,
+        screen_size: (u32, u32),
     ) -> Result<Self, String> {
         let src = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Self::from_source(
-            &src,
-            &path.display().to_string(),
-            output,
-            seed,
-            width,
-            height,
-        )
+        Self::from_source(&src, &path.display().to_string(), output, seed, screen_size)
     }
 
     pub fn from_source(
@@ -275,8 +268,7 @@ impl Script {
         chunk_name: &str,
         output: &str,
         seed: u64,
-        width: u32,
-        height: u32,
+        screen_size: (u32, u32),
     ) -> Result<Self, String> {
         // LuaJIT は jit ライブラリを開いたときに JIT コンパイラーを有効にするので、JIT も読み込む。
         // スクリプトから jit.off() などを呼べないよう、読み込んだ後にグローバルから外す。
@@ -287,8 +279,7 @@ impl Script {
         let lua = unsafe { Lua::unsafe_new_with(libs, LuaOptions::default()) };
         let _busy = BusyGuard::new();
         let buf = vec![Vertex::default(); PRELUDE_CAP].into_boxed_slice();
-        let script =
-            Self::setup(lua, buf, output, seed, width, height).map_err(|e| e.to_string())?;
+        let script = Self::setup(lua, buf, output, seed, screen_size).map_err(|e| e.to_string())?;
         script
             .lua
             .set_app_data(Deadline(Instant::now() + LOAD_BUDGET));
@@ -308,8 +299,7 @@ impl Script {
         buf: Box<[Vertex]>,
         output: &str,
         seed: u64,
-        width: u32,
-        height: u32,
+        screen_size: (u32, u32),
     ) -> mlua::Result<Self> {
         let buf_ptr = buf.as_ptr() as *mut Vertex;
         let g = lua.globals();
@@ -349,8 +339,8 @@ impl Script {
         }
 
         let screen = lua.create_table()?;
-        screen.set("w", width)?;
-        screen.set("h", height)?;
+        screen.set("w", screen_size.0)?;
+        screen.set("h", screen_size.1)?;
         screen.set("output", output)?;
         g.set("screen", &screen)?;
         let mouse = lua.create_table()?;
@@ -388,10 +378,10 @@ impl Script {
         }
     }
 
-    pub fn set_screen(&self, width: u32, height: u32) -> Result<(), String> {
+    pub fn set_screen(&self, screen_size: (u32, u32)) -> Result<(), String> {
         (|| -> mlua::Result<()> {
-            self.screen.set("w", width)?;
-            self.screen.set("h", height)
+            self.screen.set("w", screen_size.0)?;
+            self.screen.set("h", screen_size.1)
         })()
         .map_err(|e| e.to_string())
     }
@@ -442,7 +432,7 @@ mod tests {
     use super::*;
 
     fn run(src: &str) -> Result<Script, String> {
-        Script::from_source(src, "test", "TEST-1", 1, 800, 600)
+        Script::from_source(src, "test", "TEST-1", 1, (800, 600))
     }
 
     #[test]
@@ -548,7 +538,7 @@ mod tests {
     #[test]
     fn slingshot_example_launches_on_release() {
         let src = std::fs::read_to_string("examples/slingshot.lua").unwrap();
-        let s = Script::from_source(&src, "slingshot", "A", 1, 1920, 1080).unwrap();
+        let s = Script::from_source(&src, "slingshot", "A", 1, (1920, 1080)).unwrap();
         let drag = |x, y, dragging| MouseState {
             x,
             y,
@@ -741,8 +731,8 @@ mod tests {
 
     #[test]
     fn seeds_differ_per_output() {
-        let a = Script::from_source("v = math.random()", "t", "A", 1, 1, 1).unwrap();
-        let b = Script::from_source("v = math.random()", "t", "B", 2, 1, 1).unwrap();
+        let a = Script::from_source("v = math.random()", "t", "A", 1, (1, 1)).unwrap();
+        let b = Script::from_source("v = math.random()", "t", "B", 2, (1, 1)).unwrap();
         let va: f64 = a.lua.globals().get("v").unwrap();
         let vb: f64 = b.lua.globals().get("v").unwrap();
         assert_ne!(va, vb);
@@ -756,97 +746,8 @@ mod tests {
     }
 }
 
+// 開発用の計測。`cargo test -- --ignored` で実行する。
 #[cfg(test)]
-mod bench {
-    use mlua::{HookTriggers, Lua, VmState};
-    use std::time::Instant;
-
-    const SRC: &str = "local s = 0 for i = 1, 3e7 do s = s + (i % 7) * 0.5 end return s";
-
-    fn time(lua: &Lua) -> f64 {
-        let t = Instant::now();
-        let _: f64 = lua.load(SRC).eval().unwrap();
-        t.elapsed().as_secs_f64()
-    }
-
-    #[test]
-    #[ignore]
-    fn hook_cost() {
-        let plain = Lua::new();
-        let hooked = Lua::new();
-        hooked
-            .set_hook(HookTriggers::new().every_nth_instruction(10_000), |_, _| {
-                Ok(VmState::Continue)
-            })
-            .unwrap();
-        let sandboxed = Lua::new_with(mlua::StdLib::MATH, mlua::LuaOptions::default()).unwrap();
-        eprintln!("no jit lib: {:.3}s", time(&sandboxed));
-        let with_jit = Lua::new_with(
-            mlua::StdLib::MATH | mlua::StdLib::JIT,
-            mlua::LuaOptions::default(),
-        )
-        .unwrap();
-        eprintln!("jit lib  : {:.3}s", time(&with_jit));
-        let jit_off = Lua::new();
-        jit_off.load("jit.off()").exec().unwrap();
-        let st: String = plain.load("local t = {jit.status()} local o = {} for i, v in ipairs(t) do o[#o+1] = tostring(v) end return jit.version .. ' ' .. table.concat(o, ' ')").eval().unwrap();
-        eprintln!("status : {st}");
-        eprintln!("plain  : {:.3}s", time(&plain));
-        eprintln!("hooked : {:.3}s", time(&hooked));
-        eprintln!("jit off: {:.3}s", time(&jit_off));
-    }
-}
-
+mod bench;
 #[cfg(test)]
-mod frame_bench {
-    use super::*;
-
-    #[test]
-    #[ignore]
-    fn geometry_frame_cost() {
-        let src = std::fs::read_to_string("examples/geometry.lua").unwrap();
-        let s = Script::from_source(&src, "geometry", "B", 1, 1920, 1080).unwrap();
-        s.set_mouse(&MouseState {
-            x: 900.0,
-            y: 500.0,
-            inside: true,
-            ..Default::default()
-        })
-        .unwrap();
-        for _ in 0..200 {
-            drop(s.frame(1.0 / 60.0).unwrap());
-        }
-        let n = 20_000;
-        let t = Instant::now();
-        let mut quads = 0;
-        for _ in 0..n {
-            quads = s.frame(1.0 / 60.0).unwrap().batch.quads();
-        }
-        let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
-        eprintln!("geometry.lua: {us:.1} us/frame, {quads} quads");
-    }
-
-    #[test]
-    #[ignore]
-    fn per_call_cost() {
-        let s = Script::from_source(
-            "function draw() for i = 1, 10000 do color(1, 1, 1, 0.5) line(i, 0, i, 100, 1) end end",
-            "calls",
-            "B",
-            1,
-            1920,
-            1080,
-        )
-        .unwrap();
-        for _ in 0..20 {
-            drop(s.frame(0.0).unwrap());
-        }
-        let n = 200;
-        let t = Instant::now();
-        for _ in 0..n {
-            drop(s.frame(0.0).unwrap());
-        }
-        let ns = t.elapsed().as_secs_f64() * 1e9 / (n as f64 * 10000.0);
-        eprintln!("color+line: {ns:.0} ns per shape");
-    }
-}
+mod frame_bench;
