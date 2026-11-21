@@ -76,6 +76,11 @@ pub struct MouseState {
     pub left: bool,
     pub right: bool,
     pub middle: bool,
+    /// 最後にドラッグを始めた位置（左上原点）。一度も押していなければ 0（#13）。
+    pub press_x: f32,
+    pub press_y: f32,
+    /// どれかのボタン（左・右・中・4・5 など）を押している間 true（#13）。
+    pub dragging: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -396,7 +401,10 @@ impl Script {
             self.mouse.set("inside", m.inside)?;
             self.mouse.set("left", m.left)?;
             self.mouse.set("right", m.right)?;
-            self.mouse.set("middle", m.middle)
+            self.mouse.set("middle", m.middle)?;
+            self.mouse.set("press_x", m.press_x)?;
+            self.mouse.set("press_y", m.press_y)?;
+            self.mouse.set("dragging", m.dragging)
         })()
         .map_err(|e| e.to_string())
     }
@@ -511,6 +519,49 @@ mod tests {
             )
             .exec()
             .unwrap();
+    }
+
+    #[test]
+    fn mouse_exposes_drag_fields() {
+        let s = run("").unwrap();
+        s.lua
+            .load("assert(mouse.press_x == 0 and mouse.press_y == 0 and mouse.dragging == false)")
+            .exec()
+            .unwrap();
+        s.set_mouse(&MouseState {
+            x: 30.0,
+            y: 40.0,
+            press_x: 10.0,
+            press_y: 20.0,
+            dragging: true,
+            ..Default::default()
+        })
+        .unwrap();
+        s.lua
+            .load("assert(mouse.press_x == 10 and mouse.press_y == 20 and mouse.dragging == true)")
+            .exec()
+            .unwrap();
+    }
+
+    #[test]
+    fn slingshot_example_launches_on_release() {
+        let src = std::fs::read_to_string("examples/slingshot.lua").unwrap();
+        let s = Script::from_source(&src, "slingshot", "A", 1, 1920, 1080).unwrap();
+        let drag = |x, y, dragging| MouseState {
+            x,
+            y,
+            inside: true,
+            press_x: 500.0,
+            press_y: 500.0,
+            dragging,
+            ..Default::default()
+        };
+        s.set_mouse(&drag(400.0, 600.0, true)).unwrap();
+        // ドラッグ中は玉がなく、ゴムの線と押した位置の円を描く。
+        assert_eq!(s.frame(1.0 / 60.0).unwrap().batch.quads(), 3);
+        s.set_mouse(&drag(400.0, 600.0, false)).unwrap();
+        // 離すと玉が 1 つ飛ぶ（光と本体の 2 つの円）。
+        assert_eq!(s.frame(1.0 / 60.0).unwrap().batch.quads(), 2);
     }
 
     /// hook で止まるのはインタープリターで動いている間だけ。JIT コンパイルされたループは

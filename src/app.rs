@@ -88,7 +88,7 @@ pub struct Wallpaper {
     mouse: MouseState,
     /// シェーダーの壁紙の状態。Lua の壁紙では None。描画中に書き換えるので RefCell に入れる。
     shader: RefCell<Option<ShaderState>>,
-    /// シェーダーの `iMouse`。
+    /// シェーダーの `iMouse` と、Lua の `mouse.press_x`・`press_y`・`dragging`。
     drag: DragMouse,
 }
 
@@ -712,6 +712,11 @@ impl PointerHandler for App {
                 PointerEventKind::Leave { .. } => w.drag.released(),
                 _ => {}
             }
+            // Lua の mouse.press_x・press_y・dragging（#13）。iMouse と同じくボタンを区別しない。
+            let ([press_x, press_y], dragging) = w.drag.lua();
+            w.mouse.press_x = press_x;
+            w.mouse.press_y = press_y;
+            w.mouse.dragging = dragging;
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     w.mouse.inside = true;
@@ -721,6 +726,8 @@ impl PointerHandler for App {
                     w.mouse = MouseState {
                         x: w.mouse.x,
                         y: w.mouse.y,
+                        press_x: w.mouse.press_x,
+                        press_y: w.mouse.press_y,
                         ..Default::default()
                     };
                     continue;

@@ -96,6 +96,12 @@ impl DragMouse {
         self.clicked = false;
     }
 
+    /// Lua の `mouse.press_x`・`press_y`・`dragging`（#13）。座標は左上原点のまま。
+    /// 一度も押していなければ `iMouse` と同じく位置は 0。
+    pub fn lua(&self) -> ([f32; 2], bool) {
+        (self.start, self.down)
+    }
+
     /// `iMouse` の値。y は `height - y` にして左下原点にする。
     pub fn uniform(&self, height: f32) -> [f32; 4] {
         if !self.touched {
@@ -360,6 +366,18 @@ mod tests {
     fn starts_at_zero() {
         // Shadertoy と同じく、一度も押していなければ全部 0（y を反転しない）。
         assert_eq!(DragMouse::default().uniform(H), [0.0; 4]);
+    }
+
+    #[test]
+    fn lua_fields_follow_drag() {
+        let mut m = DragMouse::default();
+        assert_eq!(m.lua(), ([0.0, 0.0], false));
+        m.pressed(100.0, 80.0);
+        m.moved(150.0, 90.0);
+        // 押し始めた位置は動かず、y も反転しない。
+        assert_eq!(m.lua(), ([100.0, 80.0], true));
+        m.released();
+        assert_eq!(m.lua(), ([100.0, 80.0], false));
     }
 
     #[test]
