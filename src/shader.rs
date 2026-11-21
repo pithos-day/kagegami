@@ -56,7 +56,8 @@ pub fn wrap(src: &str) -> String {
 }
 
 /// Shadertoy の `iMouse` の状態（#11 で決めた動き）。座標は Lua の `mouse` と同じ
-/// バッファーのピクセル（左上原点）で持ち、uniform にするときに y を反転する。
+/// 出力のピクセル（左上原点）で持ち、uniform にするときに y を反転する。
+/// シェーダーに渡すときは `view` でバッファーのピクセルに換算する。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DragMouse {
     pos: [f32; 2],
@@ -135,6 +136,16 @@ pub fn local_date() -> [f32; 4] {
         tm.tm_mday as f32,
         secs as f32,
     ]
+}
+
+/// シェーダーに渡す解像度と `iMouse` を決める（#25、#28）。どちらもバッファーのピクセルにする。
+/// `mouse` は `DragMouse::uniform` の値（出力のピクセル、左下原点）。
+/// バッファーのサイズは四捨五入しているので、縦横それぞれの比で換算する。
+pub fn view(buffer: (u32, u32), output: (u32, u32), mouse: [f32; 4]) -> ((u32, u32), [f32; 4]) {
+    let sx = |v: f32| v * buffer.0 as f32 / output.0 as f32;
+    let sy = |v: f32| v * buffer.1 as f32 / output.1 as f32;
+    let [x, y, z, w] = mouse;
+    (buffer, [sx(x), sy(y), sx(z), sy(w)])
 }
 
 pub struct Uniforms {
@@ -450,5 +461,30 @@ mod tests {
         assert!((0.0..12.0).contains(&m));
         assert!((1.0..=31.0).contains(&d));
         assert!((0.0..86401.0).contains(&s));
+    }
+
+    #[test]
+    fn view_uses_buffer_pixels() {
+        // 等倍では出力のサイズと同じ。
+        assert_eq!(
+            view((1920, 1080), (1920, 1080), [100.0, 80.0, 100.0, -80.0]),
+            ((1920, 1080), [100.0, 80.0, 100.0, -80.0])
+        );
+        // -s 0.5: 解像度も iMouse もバッファーのピクセルにする。符号は変えない。
+        assert_eq!(
+            view((960, 540), (1920, 1080), [100.0, 80.0, -100.0, -80.0]),
+            ((960, 540), [50.0, 40.0, -50.0, -40.0])
+        );
+        // -s 2
+        assert_eq!(
+            view((3840, 2160), (1920, 1080), [100.0, 80.0, 100.0, 80.0]),
+            ((3840, 2160), [200.0, 160.0, 200.0, 160.0])
+        );
+        // 四捨五入したバッファーでは、縦横それぞれの比で換算する（1366 * 0.25 = 341.5 -> 342）。
+        let (res, m) = view((342, 192), (1366, 768), [1366.0, 768.0, 0.0, 0.0]);
+        assert_eq!(res, (342, 192));
+        assert_eq!(m, [342.0, 192.0, 0.0, 0.0]);
+        // 一度も押していなければ全部 0 のまま。
+        assert_eq!(view((960, 540), (1920, 1080), [0.0; 4]).1, [0.0; 4]);
     }
 }
