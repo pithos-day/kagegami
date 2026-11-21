@@ -8,11 +8,14 @@ glow = "0.18.0"
 khronos-egl = { version = "6.0.0", features = ["static"] }
 libc = "0.2.191"
 mlua = { version = "0.12.2", features = ["luajit", "vendored"] }
+png = "0.18.1"
 smithay-client-toolkit = { version = "0.21.1", default-features = false }
 wayland-backend = { version = "0.3.17", features = ["client_system"] }
 wayland-client = "0.31.15"
 wayland-egl = "0.32.11"
 wayland-protocols = { version = "0.32.13", features = ["client"] }
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
 
 [features]
 # 開発用: 1 フレームあたりの GPU 時間を測る

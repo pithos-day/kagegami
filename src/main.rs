@@ -2,15 +2,18 @@ mod app;
 #[cfg(feature = "gpu-bench")]
 mod bench;
 mod cli;
+mod directive;
 mod egl;
 mod gl_program;
 mod gpu_usage;
+mod image;
 mod perf;
 mod pointer;
 mod render;
 mod script;
 mod shader;
 mod stderr;
+mod texture;
 mod watcher;
 
 use std::os::fd::AsRawFd;
@@ -59,6 +62,9 @@ fn run(args: cli::Args) -> Result<(), String> {
         queue
             .dispatch_pending(&mut app)
             .map_err(|e| e.to_string())?;
+        if let Some(paths) = app.take_watch_paths() {
+            watcher.set_paths(paths);
+        }
         if watcher.changed(Instant::now()) {
             app.reload();
         }

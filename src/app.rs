@@ -1,5 +1,7 @@
 //! Wayland のイベント処理と、出力ごとの壁紙 surface の管理。
 
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::{
@@ -30,12 +32,13 @@ use wayland_protocols::wp::viewporter::client::{
 };
 
 use crate::cli::{Args, LayerName};
+use crate::directive::{self, Syntax};
 use crate::egl::{EglContext, EglSurface};
 use crate::perf::{self, OutputStats};
 use crate::pointer::{self, Drag};
 use crate::render::Renderer;
 use crate::script::{self, MouseState, Script};
-use crate::shader::{self, GpuTimer, ShaderProgram};
+use crate::shader::{self, Channels, GpuTimer, ShaderProgram};
 use crate::stderr::elog;
 
 /// 出力ごとに違う乱数の種を作る。
@@ -142,6 +145,8 @@ enum Content {
 /// コンパイル済みのシェーダーと、`iTime`・`iFrame` の基準。
 struct ShaderState {
     program: ShaderProgram,
+    /// `iChannel0`〜`3`。読み直すまで、すべての出力で同じものを使う。
+    channels: Rc<Channels>,
     /// GPU 時間を測るタイマー。拡張機能がなければ None（見張らずに描く）。
     timer: Option<GpuTimer>,
     started: Instant,
@@ -180,7 +185,7 @@ impl ShaderState {
         if let Some(t) = self.timer.as_mut() {
             t.begin(gl);
         }
-        self.program.draw(gl, &u);
+        self.program.draw(gl, &u, &self.channels);
         if let Some(t) = self.timer.as_mut() {
             t.end(gl);
         }
@@ -253,6 +258,11 @@ pub struct App {
     renderer: Option<Renderer>,
     /// タイマーの拡張機能がないことを一度警告したか。
     timer_warned: bool,
+    /// シェーダーの壁紙の画像。読み直すたびに 1 回だけ作り、すべての出力で使う。
+    channels: ChannelCache,
+    /// 見張るファイル（壁紙のファイルと、指定された画像）。変わったら `watch_changed` を立てる。
+    watch: Vec<PathBuf>,
+    watch_changed: bool,
     args: Args,
     frame_period: Duration,
     wallpapers: Vec<Wallpaper>,
@@ -260,6 +270,31 @@ pub struct App {
     perf: Option<PerfState>,
     #[cfg(feature = "gpu-bench")]
     bench: Option<crate::bench::Bench>,
+}
+
+/// シェーダーの壁紙の画像の、読み直し 1 回分の結果。
+#[derive(Default)]
+struct ChannelCache {
+    /// 次に読み込むときに作り直す（読み直しを始めたとき）。
+    stale: bool,
+    /// 作ったときの壁紙のファイルの中身と、その結果（エラーも、同じ読み直しの間は使い回す）。
+    current: Option<(String, Result<Rc<Channels>, String>)>,
+    /// 新しいものに置き換えたが、まだどこかの出力が使っているもの。使われなくなったら消す。
+    retired: Vec<Rc<Channels>>,
+}
+
+impl ChannelCache {
+    /// 使われなくなった画像のテクスチャーを消す。
+    fn collect(&mut self, gl: &glow::Context) {
+        let mut keep = Vec::new();
+        for ch in self.retired.drain(..) {
+            match Rc::try_unwrap(ch) {
+                Ok(ch) => ch.delete(gl),
+                Err(ch) => keep.push(ch),
+            }
+        }
+        self.retired = keep;
+    }
 }
 
 /// `--perf` の表示の状態。
@@ -312,6 +347,9 @@ impl App {
             egl,
             renderer: None,
             timer_warned: false,
+            channels: ChannelCache::default(),
+            watch: vec![args.script.clone()],
+            watch_changed: false,
             frame_period: Duration::from_secs_f64(1.0 / args.fps),
             perf: args.perf.then(|| PerfState {
                 tty: std::io::IsTerminal::is_terminal(&std::io::stderr()),
@@ -390,14 +428,38 @@ impl App {
     /// シェーダーのファイルを読んでコンパイルし、i 番目の出力の壁紙にする。
     /// 失敗したら、それまでのシェーダーをそのまま残してエラーを返す（Lua の読み直しと同じ）。
     fn load_shader(&mut self, i: usize) -> Result<(), String> {
-        let src = std::fs::read_to_string(&self.args.script)
-            .map_err(|e| format!("{}: {e}", self.args.script.display()))?;
+        let script = &self.args.script;
+        let src =
+            std::fs::read_to_string(script).map_err(|e| format!("{}: {e}", script.display()))?;
+        let specs = directive::parse(&src, Syntax::Glsl)
+            .map_err(|e| format!("{}:{e}", script.display()))?;
+        // 画像が読めなくても見張る（直して保存したら読み直すため）。
+        let mut watch = vec![script.clone()];
+        watch.extend(specs.iter().map(|s| s.resolve(script)));
+        if watch != self.watch {
+            self.watch = watch;
+            self.watch_changed = true;
+        }
         let es = self.wallpapers[i]
             .egl_surface
             .as_ref()
             .ok_or("no EGL surface")?;
         self.egl.make_current(es)?;
         let gl = ensure_renderer(&mut self.renderer, &self.egl).gl();
+        let cache = &mut self.channels;
+        let reuse = !cache.stale && cache.current.as_ref().is_some_and(|(s, _)| *s == src);
+        if !reuse {
+            let loaded = Channels::load(gl, &specs, script).map(Rc::new);
+            if let Some((_, Ok(old))) = cache.current.replace((src.clone(), loaded)) {
+                cache.retired.push(old);
+            }
+            cache.stale = false;
+        }
+        let channels = match &cache.current {
+            Some((_, Ok(ch))) => Rc::clone(ch),
+            Some((_, Err(e))) => return Err(e.clone()),
+            None => unreachable!(),
+        };
         let program = ShaderProgram::new(gl, &src)?;
         let old = match self.wallpapers[i].content.take() {
             Some(Content::Shader(old)) => Some(old),
@@ -406,6 +468,8 @@ impl App {
         let timer = match old {
             Some(old) => {
                 old.program.delete(gl);
+                drop(old.channels);
+                self.channels.collect(gl);
                 old.timer.map(|mut t| {
                     // 前のシェーダーの結果で、直したシェーダーを止めないようにする。
                     t.reset();
@@ -426,6 +490,7 @@ impl App {
         };
         self.wallpapers[i].content = Some(Content::Shader(ShaderState {
             program,
+            channels,
             timer,
             started: Instant::now(),
             frame: 0,
@@ -463,6 +528,7 @@ impl App {
     /// 壁紙のファイルを読み直す。読み込めた出力だけ新しい壁紙に切り替える。
     pub fn reload(&mut self) {
         elog!("kagegami: reloading {}", self.args.script.display());
+        self.channels.stale = true;
         for i in 0..self.wallpapers.len() {
             if !self.can_load(i) {
                 continue;
@@ -484,6 +550,11 @@ impl App {
                 Err(e) => report(&self.wallpapers[i].name, e),
             }
         }
+    }
+
+    /// 見張るファイルが変わっていれば、その一覧を返す。
+    pub fn take_watch_paths(&mut self) -> Option<Vec<PathBuf>> {
+        std::mem::take(&mut self.watch_changed).then(|| self.watch.clone())
     }
 
     /// 次に描画すべき時刻までの待ち時間。描画できる出力がなければ None。
