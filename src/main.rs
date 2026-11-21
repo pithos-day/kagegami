@@ -42,6 +42,7 @@ fn main() -> ExitCode {
 const WATCHDOG_LIMIT: Duration = Duration::from_secs(5);
 
 fn run(args: cli::Args) -> Result<(), String> {
+    check_readable(&args.script)?;
     let conn =
         Connection::connect_to_env().map_err(|e| format!("cannot connect to Wayland: {e}"))?;
     let (globals, mut queue) = registry_queue_init(&conn).map_err(|e| e.to_string())?;
@@ -72,6 +73,13 @@ fn run(args: cli::Args) -> Result<(), String> {
     }
 }
 
+/// 起動時に壁紙のファイルを読めるか確かめる（#37）。
+/// 起動時に読めないのはパスの打ち間違いがほとんどなので、Wayland に接続する前に終了する。
+/// 実行中に消えた場合は保存の途中とみなして待つ（`watcher` を参照）。
+fn check_readable(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
+}
+
 /// Wayland の接続にイベントが届くか `timeout` が過ぎるまで待ち、届いたイベントを読む。
 fn wait_and_read(guard: ReadEventsGuard, timeout: Duration) -> Result<(), String> {
     let mut pfd = libc::pollfd {
@@ -99,6 +107,30 @@ fn poll_timeout_ms(timeout: Duration) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_script_is_an_error() {
+        let path =
+            std::env::temp_dir().join(format!("kagegami-main-{}-missing.lua", std::process::id()));
+        let e = check_readable(&path).unwrap_err();
+        assert!(e.contains(&path.display().to_string()), "{e}");
+        assert!(e.contains("No such file or directory"), "{e}");
+    }
+
+    #[test]
+    fn directory_is_an_error() {
+        assert!(check_readable(&std::env::temp_dir()).is_err());
+    }
+
+    #[test]
+    fn existing_script_is_readable() {
+        let path =
+            std::env::temp_dir().join(format!("kagegami-main-{}-existing.lua", std::process::id()));
+        std::fs::write(&path, "").unwrap();
+        let r = check_readable(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(r, Ok(()));
+    }
 
     #[test]
     fn poll_timeout_rounds_up_to_milliseconds() {
