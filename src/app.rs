@@ -279,6 +279,7 @@ impl App {
             if w.width == 0 {
                 continue;
             }
+            // 読み直すたびに新しい種を使う（#26）。README の「壁紙の書き方」と合わせて変える。
             match Script::load(
                 &self.args.script,
                 &w.name,
