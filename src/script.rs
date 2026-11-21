@@ -14,7 +14,7 @@ use crate::render::{Batch, Blend, Vertex};
 
 /// スクリプトの 1 回の呼び出しに許す時間。超えたらエラーにして止める。
 const LOAD_BUDGET: Duration = Duration::from_secs(2);
-const FRAME_BUDGET: Duration = Duration::from_millis(250);
+pub const FRAME_BUDGET: Duration = Duration::from_millis(250);
 /// 時間切れを確認する間隔（命令数）。
 const HOOK_INTERVAL: u32 = 10_000;
 
@@ -129,7 +129,7 @@ pub fn spawn_watchdog(limit: Duration) {
             std::thread::sleep(Duration::from_millis(500));
             let since = BUSY_SINCE.load(Ordering::Relaxed);
             if since != 0 && now_ms().saturating_sub(since) > limit.as_millis() as u64 {
-                eprintln!(
+                crate::stderr::elog!(
                     "kagegami: wallpaper script did not return for {}s, exiting",
                     limit.as_secs()
                 );
@@ -174,7 +174,7 @@ const REMOVED_GLOBALS: &[&str] = &[
 ];
 
 /// 1 フレームに描ける図形の上限。暴走したループでメモリを使い尽くさないようにする。
-const MAX_FRAME_QUADS: usize = 1_000_000;
+pub const MAX_FRAME_QUADS: usize = 1_000_000;
 
 /// prelude の頂点バッファーの容量（頂点数、4 の倍数）。満杯になるたびに DrawList へ移す。
 const PRELUDE_CAP: usize = 4096;
@@ -306,7 +306,7 @@ impl Script {
         let jit: Table = g.get("jit")?;
         let jit_enabled: bool = jit.get::<Function>("status")?.call(())?;
         if !jit_enabled {
-            eprintln!("kagegami: warning: LuaJIT JIT compiler is disabled");
+            crate::stderr::elog!("kagegami: warning: LuaJIT JIT compiler is disabled");
         }
         let string: Table = g.get("string")?;
         string.raw_set("dump", mlua::Nil)?;
@@ -325,7 +325,7 @@ impl Script {
                     .iter()
                     .map(|v| v.to_string().unwrap_or_else(|_| "?".into()))
                     .collect();
-                eprintln!("{prefix} {}", parts.join("\t"));
+                crate::stderr::elog!("{prefix} {}", parts.join("\t"));
                 Ok(())
             })?,
         )?;
@@ -413,6 +413,11 @@ impl Script {
         .map_err(|e| e.to_string())
     }
 
+    /// Lua が使っているメモリ（バイト）。
+    pub fn used_memory(&self) -> usize {
+        self.lua.used_memory()
+    }
+
     /// update と draw を呼び、積まれた描画命令を返す。
     pub fn frame(&self, dt: f64) -> Result<mlua::AppDataRef<'_, DrawList>, String> {
         let _busy = BusyGuard::new();
@@ -448,6 +453,23 @@ mod tests {
             assert(string.dump == nil, "string.dump should be nil")
         "#;
         s.lua.load(check).exec().unwrap();
+    }
+
+    #[test]
+    fn used_memory_grows_with_lua_allocations() {
+        let s = run("t = {}").unwrap();
+        let before = s.used_memory();
+        assert!(before > 0);
+        s.lua
+            .load("for i = 1, 100000 do t[i] = tostring(i) end")
+            .exec()
+            .unwrap();
+        // 10 万個の文字列で、少なくとも 1 MiB は増える。
+        assert!(
+            s.used_memory() > before + 1024 * 1024,
+            "{before} -> {}",
+            s.used_memory()
+        );
     }
 
     #[test]

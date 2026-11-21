@@ -20,7 +20,7 @@ cp target/release/kagegami ~/.local/bin/
 ## 使い方
 
 ```sh
-kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] <wallpaper.lua|wallpaper.glsl>
+kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] [-p] <wallpaper.lua|wallpaper.glsl>
 ```
 
 - 拡張子が `.glsl` か `.frag` のファイルはシェーダーの壁紙、それ以外は Lua の壁紙として読む
@@ -29,6 +29,7 @@ kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] <wal
 - `-f`, `--fps`: フレームレートの上限（既定 60）
 - `-s`, `--scale`: 出力の解像度に対する、描画する解像度の倍率（0.25〜2、既定 1）。後述の「解像度を下げて描く」を参照
 - `-l`, `--layer`: 描画するレイヤー（既定 `background`）
+- `-p`, `--perf`: 壁紙の負荷を標準エラー出力に 1 秒ごとに出す。後述の「負荷を見る」を参照
 - 壁紙のファイルを保存すると、自動で読み直す
 
 例:
@@ -55,6 +56,38 @@ GPU の負荷はおおよそピクセル数に比例するので、0.5 なら約
 kagegami -o DP-1 -s 0.5 examples/geometry.lua &
 kagegami -o HDMI-A-1 examples/geometry.lua &
 ```
+
+### 負荷を見る
+
+`-p`（`--perf`）を付けると、壁紙の負荷を 1 秒ごとに標準エラー出力へ出す。壁紙を作りながら、どこまで重くすると止められるか（「エラーと無限ループ」「エラーと重すぎるシェーダー」の制限）を確かめるためのもの。
+
+```sh
+kagegami -p examples/geometry.lua
+```
+
+標準エラー出力が端末なら、出力ごとに 1 行と、プロセス全体の 1 行を、一番下で書き換え続ける。エラーや `print` のメッセージは、その上に流れる。
+
+```
+DP-1        59.9/60 fps  lua   3.20 ms (max   8.10 ms,   3%)  gpu   1.40 ms (max   2.00 ms)  quads    12,345 (  1%)
+HDMI-A-1    60.0/60 fps  lua   2.90 ms (max   4.00 ms,   2%)  gpu   1.10 ms (max   1.30 ms)  quads    12,345 (  1%)
+cpu  12%  rss   48.2 MiB  lua    2.1 MiB
+```
+
+- `fps`: 直前の 1 秒に描いたフレームの数と、`--fps` の値。出力が隠れていて描いていないときは 0 になる
+- `lua`: Lua の壁紙で `update` と `draw` にかかった時間。直前の 1 秒の平均と、読み込んでからの最大。% は最大を 1 フレームの制限（0.25 秒）で割ったもの
+- `gpu`: 1 フレームの描画にかかった GPU 時間。直前の 1 秒に結果が届いたフレームの平均と、読み込んでからの最大。シェーダーの壁紙では、最大を制限（0.25 秒）で割った % も出す。`GL_EXT_disjoint_timer_query` がない環境では出さない
+- `quads`: 直前の 1 秒で最も多かった、1 フレームの図形の数。% は上限（100 万）で割ったもの
+- `stopped (error)`: 壁紙がエラーで止まっている
+- 最後の行: プロセス全体の CPU 使用率（1 コアを 100%）、RSS、Lua の壁紙が使っているメモリ（全出力の合計）
+- 壁紙のファイルを保存して読み直すと、最大値も消して測り直す
+
+標準エラー出力が端末でなければ（ファイルにリダイレクトしたときなど）、同じ値を key=value の形で 1 秒ごとに 1 行ずつ出す。
+
+```
+out=DP-1 fps=59.9/60 lua_avg=3.20ms lua_max=8.10ms lua_limit=3% gpu_avg=1.40ms gpu_max=2.00ms quads=12345 quads_limit=1% out=HDMI-A-1 ... cpu=12% rss=48.2MiB lua_mem=2.1MiB
+```
+
+`--perf` は、描画を待たせる `glFinish` を使わずに測るので、付けても描画の進み方は変わらない。ただし、Lua の壁紙では GPU 時間を測るぶんの処理が増える。開発用の `--features gpu-bench`（「開発」を参照）とは違い、決まったフレーム数を測って終了することはない。
 
 ### 自動起動
 
