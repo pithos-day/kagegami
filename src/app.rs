@@ -22,6 +22,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     Connection, QueueHandle, delegate_noop,
+    globals::GlobalList,
     protocol::{wl_output, wl_pointer, wl_seat, wl_surface},
 };
 use wayland_protocols::wp::viewporter::client::{
@@ -212,25 +213,66 @@ impl Wallpaper {
 }
 
 pub struct App {
-    pub registry_state: RegistryState,
-    pub output_state: OutputState,
-    pub seat_state: SeatState,
-    pub pointer: Option<wl_pointer::WlPointer>,
-    pub compositor: CompositorState,
-    pub layer_shell: LayerShell,
-    pub viewporter: Option<WpViewporter>,
-    pub egl: EglContext,
-    pub renderer: Option<Renderer>,
+    registry_state: RegistryState,
+    output_state: OutputState,
+    seat_state: SeatState,
+    pointer: Option<wl_pointer::WlPointer>,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    viewporter: Option<WpViewporter>,
+    egl: EglContext,
+    renderer: Option<Renderer>,
     /// タイマーの拡張機能がないことを一度警告したか。
-    pub timer_warned: bool,
-    pub args: Args,
-    pub frame_period: Duration,
-    pub wallpapers: Vec<Wallpaper>,
+    timer_warned: bool,
+    args: Args,
+    frame_period: Duration,
+    wallpapers: Vec<Wallpaper>,
     #[cfg(feature = "gpu-bench")]
-    pub bench: Option<crate::bench::Bench>,
+    bench: Option<crate::bench::Bench>,
 }
 
 impl App {
+    /// Wayland の global を bind し、EGL を初期化する。壁紙は出力が見つかったときに作る。
+    pub fn new(
+        conn: &Connection,
+        globals: &GlobalList,
+        qh: &QueueHandle<Self>,
+        args: Args,
+    ) -> Result<Self, String> {
+        let compositor =
+            CompositorState::bind(globals, qh).map_err(|e| format!("wl_compositor: {e}"))?;
+        let layer_shell =
+            LayerShell::bind(globals, qh).map_err(|e| format!("wlr-layer-shell: {e}"))?;
+        // 縮小・拡大した描画を出力いっぱいに表示するには wp_viewporter が要る。
+        let viewporter = if args.render_scale != 1.0 {
+            Some(
+                globals
+                    .bind(qh, 1..=1, ())
+                    .map_err(|e| format!("--scale requires wp_viewporter: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let egl = EglContext::new(conn.backend().display_ptr().cast())?;
+        Ok(Self {
+            registry_state: RegistryState::new(globals),
+            output_state: OutputState::new(globals, qh),
+            seat_state: SeatState::new(globals, qh),
+            pointer: None,
+            compositor,
+            layer_shell,
+            viewporter,
+            egl,
+            renderer: None,
+            timer_warned: false,
+            frame_period: Duration::from_secs_f64(1.0 / args.fps),
+            args,
+            wallpapers: Vec::new(),
+            #[cfg(feature = "gpu-bench")]
+            bench: crate::bench::Bench::from_env(),
+        })
+    }
+
     fn add_output(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         let Some(info) = self.output_state.info(&output) else {
             return;

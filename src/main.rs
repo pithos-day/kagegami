@@ -14,10 +14,7 @@ use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use smithay_client_toolkit::{
-    compositor::CompositorState, output::OutputState, registry::RegistryState, seat::SeatState,
-    shell::wlr_layer::LayerShell,
-};
+use wayland_client::backend::{ReadEventsGuard, WaylandError};
 use wayland_client::{Connection, globals::registry_queue_init};
 
 fn main() -> ExitCode {
@@ -43,48 +40,17 @@ fn main() -> ExitCode {
 
 /// スクリプトがこの時間戻ってこなければ終了する。
 const WATCHDOG_LIMIT: Duration = Duration::from_secs(5);
+
 fn run(args: cli::Args) -> Result<(), String> {
     let conn =
         Connection::connect_to_env().map_err(|e| format!("cannot connect to Wayland: {e}"))?;
     let (globals, mut queue) = registry_queue_init(&conn).map_err(|e| e.to_string())?;
     let qh = queue.handle();
-
-    let compositor =
-        CompositorState::bind(&globals, &qh).map_err(|e| format!("wl_compositor: {e}"))?;
-    let layer_shell =
-        LayerShell::bind(&globals, &qh).map_err(|e| format!("wlr-layer-shell: {e}"))?;
-    // 縮小・拡大した描画を出力いっぱいに表示するには wp_viewporter が要る。
-    let viewporter = if args.render_scale != 1.0 {
-        Some(
-            globals
-                .bind(&qh, 1..=1, ())
-                .map_err(|e| format!("--scale requires wp_viewporter: {e}"))?,
-        )
-    } else {
-        None
-    };
-    let egl = egl::EglContext::new(conn.backend().display_ptr().cast())?;
-
-    let mut app = app::App {
-        registry_state: RegistryState::new(&globals),
-        output_state: OutputState::new(&globals, &qh),
-        seat_state: SeatState::new(&globals, &qh),
-        pointer: None,
-        compositor,
-        layer_shell,
-        viewporter,
-        egl,
-        renderer: None,
-        timer_warned: false,
-        frame_period: Duration::from_secs_f64(1.0 / args.fps),
-        args,
-        wallpapers: Vec::new(),
-        #[cfg(feature = "gpu-bench")]
-        bench: bench::Bench::from_env(),
-    };
+    let script_path = args.script.clone();
+    let mut app = app::App::new(&conn, &globals, &qh, args)?;
 
     script::spawn_watchdog(WATCHDOG_LIMIT);
-    let mut watcher = watcher::FileWatcher::new(app.args.script.clone());
+    let mut watcher = watcher::FileWatcher::new(script_path);
     loop {
         queue
             .dispatch_pending(&mut app)
@@ -102,24 +68,44 @@ fn run(args: cli::Args) -> Result<(), String> {
         let timeout = app
             .next_timeout(now)
             .map_or(watcher.until_next(now), |t| t.min(watcher.until_next(now)));
-        let mut pfd = libc::pollfd {
-            fd: guard.connection_fd().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // 1 ミリ秒未満の端数は切り上げる（早く起きすぎて空回りしないように）。
-        let ms = timeout.as_millis().min(i32::MAX as u128) as i32
-            + i32::from(!timeout.subsec_micros().is_multiple_of(1000));
-        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
-        if n > 0 {
-            match guard.read() {
-                Ok(_) => {}
-                Err(wayland_client::backend::WaylandError::Io(e))
-                    if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(format!("Wayland connection: {e}")),
-            }
-        } else {
-            drop(guard);
-        }
+        wait_and_read(guard, timeout)?;
+    }
+}
+
+/// Wayland の接続にイベントが届くか `timeout` が過ぎるまで待ち、届いたイベントを読む。
+fn wait_and_read(guard: ReadEventsGuard, timeout: Duration) -> Result<(), String> {
+    let mut pfd = libc::pollfd {
+        fd: guard.connection_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let n = unsafe { libc::poll(&mut pfd, 1, poll_timeout_ms(timeout)) };
+    if n <= 0 {
+        return Ok(());
+    }
+    match guard.read() {
+        Ok(_) => Ok(()),
+        Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(e) => Err(format!("Wayland connection: {e}")),
+    }
+}
+
+/// `poll` に渡す待ち時間（ミリ秒）。1 ミリ秒未満の端数は切り上げる（早く起きすぎて空回りしないように）。
+fn poll_timeout_ms(timeout: Duration) -> i32 {
+    timeout.as_millis().min(i32::MAX as u128) as i32
+        + i32::from(!timeout.subsec_micros().is_multiple_of(1000))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_timeout_rounds_up_to_milliseconds() {
+        assert_eq!(poll_timeout_ms(Duration::ZERO), 0);
+        assert_eq!(poll_timeout_ms(Duration::from_millis(16)), 16);
+        assert_eq!(poll_timeout_ms(Duration::from_micros(1)), 1);
+        assert_eq!(poll_timeout_ms(Duration::from_micros(16_001)), 17);
+        assert_eq!(poll_timeout_ms(Duration::from_micros(16_999)), 17);
     }
 }
