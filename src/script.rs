@@ -697,6 +697,37 @@ mod tests {
     }
 
     #[test]
+    fn every_draw_function_rejects_too_many_arguments() {
+        let draw = |body: &str| {
+            run(&format!("function draw() {body} end"))
+                .unwrap()
+                .frame(0.0)
+                .map(|_| ())
+        };
+        // (関数名, 引数の上限, 上限ちょうどの引数)
+        for (name, max, args) in [
+            ("color", 4, "1, 1, 1, 1"),
+            ("circle", 3, "1, 2, 3"),
+            ("line", 5, "1, 2, 3, 4, 1"),
+            ("clear", 3, "0, 0, 0"),
+            ("blend", 1, "'add'"),
+        ] {
+            // 上限ちょうどと、後ろに nil が付いたものは通る。
+            draw(&format!("{name}({args})")).unwrap();
+            draw(&format!("{name}({args}, nil, nil)")).unwrap();
+            // 多すぎる引数と、途中の nil はエラー。
+            for extra in ["1", "nil, 1", "1, nil"] {
+                let body = format!("{name}({args}, {extra})");
+                let err = draw(&body).err().unwrap();
+                assert!(
+                    err.contains(&format!("test:1: {name}: too many arguments (max {max})")),
+                    "{body}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ffi_is_unreachable_and_draw_functions_return_nothing() {
         let s = run("").unwrap();
         s.lua
