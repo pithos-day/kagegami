@@ -242,6 +242,8 @@ fn install_prelude(lua: &Lua, buf: *mut Vertex) -> mlua::Result<(Function, Funct
             clear,
             blend,
             math.get::<Function>("sqrt")?,
+            math.get::<Function>("cos")?,
+            math.get::<Function>("sin")?,
             g.get::<Function>("error")?,
             g.get::<Function>("type")?,
         ))?;
@@ -618,6 +620,8 @@ mod tests {
                 circle(50, 60, 7.5)
                 rect(1, 2, 30, 40)
                 line(5, 5, 5, 5, 4)
+                rect(100, 50, 30, 10, 0.7)
+                rect(100, 50, -20, 10, -1.2)
             end
         "#)
         .unwrap();
@@ -630,6 +634,8 @@ mod tests {
         reference.circle(50.0, 60.0, 7.5);
         reference.rect(1.0, 2.0, 30.0, 40.0);
         reference.line(5.0, 5.0, 5.0, 5.0, 4.0);
+        reference.rotated_rect(100.0, 50.0, 30.0, 10.0, 0.7);
+        reference.rotated_rect(100.0, 50.0, -20.0, 10.0, -1.2);
         assert_eq!(dl.batch.vertices.len(), reference.vertices.len());
         for (a, b) in dl.batch.vertices.iter().zip(&reference.vertices) {
             let close =
@@ -643,6 +649,28 @@ mod tests {
     }
 
     #[test]
+    fn rect_angle_is_optional_and_checked() {
+        let draw = |body: &str| {
+            let s = run(&format!("function draw() {body} end")).unwrap();
+            s.frame(0.0).map(|dl| dl.batch.vertices.clone())
+        };
+        // angle を省くのと nil を渡すのは同じ（今までの描き方）。
+        assert_eq!(
+            draw("rect(1, 2, 3, 4, nil)").unwrap(),
+            draw("rect(1, 2, 3, 4)").unwrap()
+        );
+        // angle を渡したときは、0 でもアンチエイリアス付きの描き方（shape.x が負）になる。
+        let v = draw("rect(1, 2, 3, 4, 0)").unwrap();
+        assert_eq!(v.len(), 4);
+        assert!(v.iter().all(|v| v.shape[0] < 0.0), "{v:?}");
+        // 大きさが 0 や NaN の回転した矩形は描かない。
+        assert!(draw("rect(0, 0, 0, 5, 1)").unwrap().is_empty());
+        assert!(draw("rect(0, 0, 5, 0/0, 1)").unwrap().is_empty());
+        let err = draw("rect(0, 0, 1, 1, 'a')").err().unwrap();
+        assert!(err.contains("rect: number expected"), "{err}");
+    }
+
+    #[test]
     fn ffi_is_unreachable_and_draw_functions_return_nothing() {
         let s = run("").unwrap();
         s.lua
@@ -652,6 +680,7 @@ mod tests {
             assert(select('#', line(0, 0, 1, 1)) == 0)
             assert(select('#', circle(0, 0, 1)) == 0)
             assert(select('#', rect(0, 0, 1, 1)) == 0)
+            assert(select('#', rect(0, 0, 1, 1, 0.5)) == 0)
             assert(select('#', color(1, 1, 1)) == 0)
             -- 描画関数は C 関数ではなく Lua 関数だが、upvalue を覗く手段がない
             assert(debug == nil and getfenv == nil and string.dump == nil)
