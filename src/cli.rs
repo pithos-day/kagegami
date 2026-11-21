@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
-pub const USAGE: &str =
-    "usage: kagegami [-o OUTPUT] [-f FPS] [-l background|bottom|top|overlay] <wallpaper.lua>";
+pub const USAGE: &str = "usage: kagegami [-o OUTPUT] [-f FPS] [-l background|bottom|top|overlay] <wallpaper.lua|wallpaper.glsl>";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputSelector {
@@ -77,10 +76,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, Str
     }
     let script = match <[String; 1]>::try_from(positional) {
         Ok([script]) => script,
-        Err(p) if p.is_empty() => return Err("missing <wallpaper.lua>".into()),
+        Err(p) if p.is_empty() => return Err("missing <wallpaper.lua|wallpaper.glsl>".into()),
         Err(_) => {
             return Err(
-                "expected only <wallpaper.lua> (choose an output with -o NAME; all outputs by default)"
+                "expected only one wallpaper file (choose an output with -o NAME; all outputs by default)"
                     .into(),
             );
         }
