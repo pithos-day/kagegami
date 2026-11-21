@@ -3,6 +3,7 @@ mod app;
 mod bench;
 mod cli;
 mod egl;
+mod pointer;
 mod render;
 mod script;
 mod shader;
@@ -96,7 +97,7 @@ fn run(args: cli::Args) -> Result<(), String> {
     let layer_shell =
         LayerShell::bind(&globals, &qh).map_err(|e| format!("wlr-layer-shell: {e}"))?;
     // 縮小・拡大した描画を出力いっぱいに表示するには wp_viewporter が要る。
-    let viewporter = if args.scale != 1.0 {
+    let viewporter = if args.render_scale != 1.0 {
         Some(
             globals
                 .bind(&qh, 1..=1, ())
