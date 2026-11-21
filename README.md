@@ -70,7 +70,7 @@ kagegami -p examples/geometry.lua
 ```
 DP-1        59.9/60 fps  lua   3.20 ms (max   8.10 ms,   3%)  gpu   1.40 ms (max   2.00 ms)  quads    12,345 (  1%)
 HDMI-A-1    60.0/60 fps  lua   2.90 ms (max   4.00 ms,   2%)  gpu   1.10 ms (max   1.30 ms)  quads    12,345 (  1%)
-cpu  12%  rss   48.2 MiB  lua    2.1 MiB
+cpu  12%  gpu gfx   8%  rss   48.2 MiB  lua    2.1 MiB
 ```
 
 - `fps`: 直前の 1 秒に描いたフレームの数と、`--fps` の値。出力が隠れていて描いていないときは 0 になる
@@ -78,13 +78,16 @@ cpu  12%  rss   48.2 MiB  lua    2.1 MiB
 - `gpu`: 1 フレームの描画にかかった GPU 時間。直前の 1 秒に結果が届いたフレームの平均と、読み込んでからの最大。シェーダーの壁紙では、最大を制限（0.25 秒）で割った % も出す。`GL_EXT_disjoint_timer_query` がない環境では出さない
 - `quads`: 直前の 1 秒で最も多かった、1 フレームの図形の数。% は上限（100 万）で割ったもの
 - `stopped (error)`: 壁紙がエラーで止まっている
-- 最後の行: プロセス全体の CPU 使用率（1 コアを 100%）、RSS、Lua の壁紙が使っているメモリ（全出力の合計）
+- 最後の行: プロセス全体の CPU 使用率（1 コアを 100%）、GPU 使用率、RSS、Lua の壁紙が使っているメモリ（全出力の合計）
+- `gpu gfx 8%` のような最後の行の GPU 使用率: 直前の 1 秒に、kagegami が GPU のエンジンを使っていた時間の割合。エンジンごとに名前を付けて出し、使っていないエンジンは出さない。エンジンの名前はドライバーによって違う（amdgpu は `gfx` など）
+  - カーネルの DRM の fdinfo（`/proc/self/fdinfo`）から読む。使用時間を ns で出すドライバーでしか出ない。動くことを確かめたのは amdgpu だけ。NVIDIA のプロプライエタリドライバーや、サイクル数で出すドライバー（xe など）では出さない
+  - 出力ごとの `gpu`（1 フレームの描画を timer query で測った時間）とは別に、カーネルが数えたプロセス全体の値。起動して最初の 1 回は、比べる前の値がないので出さない
 - 壁紙のファイルを保存して読み直すと、最大値も消して測り直す
 
 標準エラー出力が端末でなければ（ファイルにリダイレクトしたときなど）、同じ値を key=value の形で 1 秒ごとに 1 行ずつ出す。
 
 ```
-out=DP-1 fps=59.9/60 lua_avg=3.20ms lua_max=8.10ms lua_limit=3% gpu_avg=1.40ms gpu_max=2.00ms quads=12345 quads_limit=1% out=HDMI-A-1 ... cpu=12% rss=48.2MiB lua_mem=2.1MiB
+out=DP-1 fps=59.9/60 lua_avg=3.20ms lua_max=8.10ms lua_limit=3% gpu_avg=1.40ms gpu_max=2.00ms quads=12345 quads_limit=1% out=HDMI-A-1 ... cpu=12% gpu_gfx=8% rss=48.2MiB lua_mem=2.1MiB
 ```
 
 `--perf` は、描画を待たせる `glFinish` を使わずに測るので、付けても描画の進み方は変わらない。ただし、Lua の壁紙では GPU 時間を測るぶんの処理が増える。開発用の `--features gpu-bench`（「開発」を参照）とは違い、決まったフレーム数を測って終了することはない。
