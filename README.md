@@ -122,6 +122,13 @@ end
 | `mouse.x`, `mouse.y` | カーソルの位置 |
 | `mouse.inside` | カーソルがこの壁紙の上にあるか（ウィンドウに隠れていない部分だけ） |
 | `mouse.left`, `mouse.right`, `mouse.middle` | ボタンを押しているか |
+| `mouse.press_x`, `mouse.press_y` | 最後にドラッグを始めた（ボタンを押した）位置。離した後も残る。一度も押していなければ 0 |
+| `mouse.dragging` | どれかのボタンを押している間 `true`。離すか、カーソルが壁紙の外に出ると `false` |
+
+`press_x`・`press_y`・`dragging` は、シェーダーの `iMouse` と同じくボタンを区別しない。
+左・右・中・4・5 のどれを押してもドラッグを始め直し、どれかを離すとドラッグが切れる。
+座標は `mouse.x`・`mouse.y` と同じく左上が原点（`iMouse` と違い y を反転しない）。
+例は `examples/slingshot.lua`。
 
 ### サンドボックス
 
