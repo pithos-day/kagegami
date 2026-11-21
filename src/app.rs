@@ -269,6 +269,7 @@ struct PerfState {
     /// 前に表示した時刻。
     last: Instant,
     meter: perf::ProcessMeter,
+    gpu_meter: crate::gpu_usage::GpuUsageMeter,
 }
 
 const PERF_LIMITS: perf::Limits = perf::Limits {
@@ -316,6 +317,7 @@ impl App {
                 tty: std::io::IsTerminal::is_terminal(&std::io::stderr()),
                 last: Instant::now(),
                 meter: perf::ProcessMeter::new(),
+                gpu_meter: crate::gpu_usage::GpuUsageMeter::new(),
             }),
             args,
             wallpapers: Vec::new(),
@@ -531,6 +533,7 @@ impl App {
         let (cpu_percent, rss_bytes) = p.meter.sample(now);
         let process = perf::ProcessRow {
             cpu_percent,
+            gpu_engines: p.gpu_meter.sample(now),
             rss_bytes,
             lua_bytes,
         };

@@ -4,6 +4,7 @@ mod bench;
 mod cli;
 mod egl;
 mod gl_program;
+mod gpu_usage;
 mod perf;
 mod pointer;
 mod render;

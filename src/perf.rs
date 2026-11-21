@@ -104,10 +104,12 @@ pub struct OutputRow {
 }
 
 /// プロセス全体の値。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProcessRow {
     /// 1 コアを 100% とした CPU 使用率。測れなければ None。
     pub cpu_percent: Option<f64>,
+    /// GPU のエンジンごとの使用率（%）。エンジンの名前の順。DRM の fdinfo から取れなければ None。
+    pub gpu_engines: Option<Vec<(String, f64)>>,
     pub rss_bytes: Option<u64>,
     /// Lua の壁紙がなければ None。
     pub lua_bytes: Option<usize>,
@@ -233,6 +235,13 @@ pub fn format_tty(
         }
         None => l.push_str("cpu   -%"),
     }
+    if let Some(engines) = process.gpu_engines.as_deref().filter(|e| !e.is_empty()) {
+        l.push_str("  gpu");
+        for (i, (name, p)) in engines.iter().enumerate() {
+            let sep = if i == 0 { " " } else { "  " };
+            let _ = write!(l, "{sep}{name} {p:>3.0}%");
+        }
+    }
     if let Some(b) = process.rss_bytes {
         let _ = write!(l, "  rss {:>6.1} MiB", mib(b));
     }
@@ -287,6 +296,9 @@ pub fn format_logfmt(
     }
     if let Some(c) = process.cpu_percent {
         parts.push(format!("cpu={c:.0}%"));
+    }
+    for (name, p) in process.gpu_engines.iter().flatten() {
+        parts.push(format!("gpu_{name}={p:.0}%"));
     }
     if let Some(b) = process.rss_bytes {
         parts.push(format!("rss={:.1}MiB", mib(b)));
@@ -382,6 +394,7 @@ mod tests {
 
     const PROCESS: ProcessRow = ProcessRow {
         cpu_percent: Some(12.4),
+        gpu_engines: None,
         rss_bytes: Some(48 * 1024 * 1024 + 200 * 1024),
         lua_bytes: Some(2 * 1024 * 1024 + 100 * 1024),
     };
@@ -496,6 +509,36 @@ mod tests {
             "out=DP-1 fps=3.0/60 lua_avg=3.00ms lua_max=4.00ms lua_limit=2% gpu_avg=1.50ms gpu_max=2.00ms \
              quads=12345 quads_limit=1% out=HDMI-A-1 fps=1.0/60 gpu_avg=25.00ms gpu_max=25.00ms gpu_limit=10% \
              out=eDP-1 status=stopped cpu=12% rss=48.2MiB lua_mem=2.1MiB"
+        );
+    }
+
+    #[test]
+    fn gpu_engines_follow_cpu() {
+        let process = ProcessRow {
+            gpu_engines: Some(vec![("compute".into(), 0.4), ("gfx".into(), 8.2)]),
+            ..PROCESS
+        };
+        let mut s = lua_stats();
+        let rows = [row("DP-1", Kind::Lua, &mut s)];
+        let lines = format_tty(&rows, &process, 60.0, &LIMITS);
+        assert_eq!(
+            lines.last().unwrap(),
+            "cpu  12%  gpu compute   0%  gfx   8%  rss   48.2 MiB  lua    2.1 MiB"
+        );
+        let l = format_logfmt(&rows, &process, 60.0, &LIMITS);
+        assert!(
+            l.ends_with("cpu=12% gpu_compute=0% gpu_gfx=8% rss=48.2MiB lua_mem=2.1MiB"),
+            "{l}"
+        );
+        // 取れた値が空（どのエンジンも使っていない）なら出さない。
+        let idle = ProcessRow {
+            gpu_engines: Some(Vec::new()),
+            ..PROCESS
+        };
+        let lines = format_tty(&rows, &idle, 60.0, &LIMITS);
+        assert_eq!(
+            lines.last().unwrap(),
+            "cpu  12%  rss   48.2 MiB  lua    2.1 MiB"
         );
     }
 
