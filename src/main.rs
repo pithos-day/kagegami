@@ -3,6 +3,7 @@ mod app;
 mod bench;
 mod cli;
 mod egl;
+mod gl_program;
 mod pointer;
 mod render;
 mod script;
