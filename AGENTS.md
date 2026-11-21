@@ -31,7 +31,7 @@
 
 ## kagegami
 
-Rust（edition 2024）+ LuaJIT（mlua）の Wayland ライブ壁紙。wlr-layer-shell の背景レイヤーに EGL / GLES2 で描画する。
+Rust（edition 2024）+ LuaJIT（mlua）の Wayland ライブ壁紙。wlr-layer-shell の背景レイヤーに EGL / GLES3 で描画する。
 
 - ロジックを変えたら `cargo test`、push の前に `cargo fmt --check` と `cargo test` を実行する
 - 壁紙スクリプトのサンドボックスを保つ。使えるのは `math`・`string`・`table`・`bit` と基本関数だけで、`io`・`os`・`require`・`load` 系・`debug`・`ffi`・`jit`・`coroutine`・`getfenv` / `setfenv`・`string.dump` とバイトコードの読み込みは使えない。`ffi` は描画関数の内側に閉じ込め、スクリプトから触れさせない
