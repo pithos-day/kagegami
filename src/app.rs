@@ -11,7 +11,7 @@ use smithay_client_toolkit::{
     registry_handlers,
     seat::{
         Capability, SeatHandler, SeatState,
-        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        pointer::{PointerEvent, PointerHandler},
     },
     shell::{
         WaylandSurface,
@@ -31,17 +31,10 @@ use wayland_protocols::wp::viewporter::client::{
 
 use crate::cli::{Args, LayerName};
 use crate::egl::{EglContext, EglSurface};
-use crate::pointer::Drag;
+use crate::pointer::{self, Drag};
 use crate::render::Renderer;
-use crate::script::{Button, MouseEvent, MouseState, Script};
+use crate::script::{MouseState, Script};
 use crate::shader::{self, GpuTimer, ShaderProgram};
-
-// linux/input-event-codes.h
-const BTN_LEFT: u32 = 0x110;
-const BTN_RIGHT: u32 = 0x111;
-const BTN_MIDDLE: u32 = 0x112;
-/// マウスのボタンの範囲（BTN_LEFT〜BTN_TASK）。シェーダーの `iMouse` はどのボタンでも反応する。
-const MOUSE_BUTTONS: std::ops::RangeInclusive<u32> = 0x110..=0x117;
 
 /// 出力ごとに違う乱数の種を作る。
 fn seed_for<T: std::hash::Hash>(salt: &T) -> u64 {
@@ -700,66 +693,11 @@ impl PointerHandler for App {
             let Some(w) = self.find(&event.surface) else {
                 continue;
             };
-            // Wayland の座標は論理ピクセルなので、バッファーのピクセルに直す。
+            // Wayland の座標は論理ピクセルなので、出力のピクセルに直す。
             let x = (event.position.0 * w.output_scale as f64) as f32;
             let y = (event.position.1 * w.output_scale as f64) as f32;
-            let mut click = None;
-            // シェーダーの iMouse（#11）。Lua の mouse とは別に、どのボタンでも反応する。
-            match event.kind {
-                PointerEventKind::Motion { .. } => w.drag.moved(x, y),
-                PointerEventKind::Press { button, .. } if MOUSE_BUTTONS.contains(&button) => {
-                    w.drag.pressed(x, y)
-                }
-                PointerEventKind::Release { button, .. } if MOUSE_BUTTONS.contains(&button) => {
-                    w.drag.released()
-                }
-                PointerEventKind::Leave { .. } => w.drag.released(),
-                _ => {}
-            }
-            // Lua の mouse.press_x・press_y・dragging（#13）。iMouse と同じくボタンを区別しない。
-            let ([press_x, press_y], dragging) = w.drag.lua_press();
-            w.mouse.press_x = press_x;
-            w.mouse.press_y = press_y;
-            w.mouse.dragging = dragging;
-            match event.kind {
-                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
-                    w.mouse.inside = true;
-                }
-                PointerEventKind::Leave { .. } => {
-                    // カーソルが外に出たら、押していたボタンの状態も分からなくなる。
-                    w.mouse = MouseState {
-                        x: w.mouse.x,
-                        y: w.mouse.y,
-                        press_x: w.mouse.press_x,
-                        press_y: w.mouse.press_y,
-                        ..Default::default()
-                    };
-                    continue;
-                }
-                PointerEventKind::Press { button, .. }
-                | PointerEventKind::Release { button, .. } => {
-                    let pressed = matches!(event.kind, PointerEventKind::Press { .. });
-                    let b = match button {
-                        BTN_LEFT => Button::Left,
-                        BTN_RIGHT => Button::Right,
-                        BTN_MIDDLE => Button::Middle,
-                        _ => continue,
-                    };
-                    *match b {
-                        Button::Left => &mut w.mouse.left,
-                        Button::Right => &mut w.mouse.right,
-                        Button::Middle => &mut w.mouse.middle,
-                    } = pressed;
-                    click = Some(if pressed {
-                        MouseEvent::Pressed(x, y, b)
-                    } else {
-                        MouseEvent::Released(x, y, b)
-                    });
-                }
-                PointerEventKind::Axis { .. } => continue,
-            }
-            w.mouse.x = x;
-            w.mouse.y = y;
+            w.drag.apply(&event.kind, x, y);
+            let click = pointer::apply_to_lua_mouse(&mut w.mouse, &w.drag, &event.kind, x, y);
             if let (Some(ev), Some(script)) = (click, &w.script) {
                 if w.failed {
                     continue;
