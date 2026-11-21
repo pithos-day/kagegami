@@ -56,7 +56,8 @@ pub fn wrap(src: &str) -> String {
 }
 
 /// Shadertoy の `iMouse` の状態（#11 で決めた動き）。座標は Lua の `mouse` と同じ
-/// バッファーのピクセル（左上原点）で持ち、uniform にするときに y を反転する。
+/// 出力のピクセル（左上原点）で持ち、uniform にするときに y を反転する。
+/// シェーダーに渡すときは `view` でバッファーのピクセルに換算する。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DragMouse {
     pos: [f32; 2],
@@ -137,11 +138,14 @@ pub fn local_date() -> [f32; 4] {
     ]
 }
 
-/// シェーダーに渡す解像度と `iMouse` を決める（#25）。
+/// シェーダーに渡す解像度と `iMouse` を決める（#25、#28）。どちらもバッファーのピクセルにする。
 /// `mouse` は `DragMouse::uniform` の値（出力のピクセル、左下原点）。
+/// バッファーのサイズは四捨五入しているので、縦横それぞれの比で換算する。
 pub fn view(buffer: (u32, u32), output: (u32, u32), mouse: [f32; 4]) -> ((u32, u32), [f32; 4]) {
-    let _ = buffer;
-    (output, mouse)
+    let sx = |v: f32| v * buffer.0 as f32 / output.0 as f32;
+    let sy = |v: f32| v * buffer.1 as f32 / output.1 as f32;
+    let [x, y, z, w] = mouse;
+    (buffer, [sx(x), sy(y), sx(z), sy(w)])
 }
 
 pub struct Uniforms {
