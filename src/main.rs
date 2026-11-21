@@ -144,15 +144,14 @@ fn run(args: cli::Args) -> Result<(), String> {
         let timeout = app
             .next_timeout(now)
             .map_or(watcher.until_next(now), |t| t.min(watcher.until_next(now)));
-        let timeout = Some(timeout);
         let mut pfd = libc::pollfd {
             fd: guard.connection_fd().as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
-        let ms = timeout.map_or(-1, |d| {
-            d.as_millis().min(i32::MAX as u128) as i32 + i32::from(d.subsec_micros() % 1000 != 0)
-        });
+        // 1 ミリ秒未満の端数は切り上げる（早く起きすぎて空回りしないように）。
+        let ms = timeout.as_millis().min(i32::MAX as u128) as i32
+            + i32::from(!timeout.subsec_micros().is_multiple_of(1000));
         let n = unsafe { libc::poll(&mut pfd, 1, ms) };
         if n > 0 {
             match guard.read() {

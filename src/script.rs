@@ -145,7 +145,8 @@ pub struct Script {
     lua: Lua,
     screen: Table,
     mouse: Table,
-    #[allow(dead_code)]
+    /// JIT コンパイラーが有効か。テストで確かめるためだけに持つ。
+    #[cfg(test)]
     jit_enabled: bool,
     begin: Function,
     finish: Function,
@@ -369,6 +370,7 @@ impl Script {
             lua,
             screen,
             mouse,
+            #[cfg(test)]
             jit_enabled,
             begin,
             finish,
