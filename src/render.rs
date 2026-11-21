@@ -1,7 +1,8 @@
 //! GLES3 のコンテキストでの 2D 描画（シェーダーは GLSL ES 1.00）。
 //!
-//! 図形はすべて「カプセル（線分を太らせた形）」の SDF として、1 図形 = 1 四角形で描く。
+//! 図形は SDF として、1 図形 = 1 四角形で描く。ほとんどは「カプセル（線分を太らせた形）」で、
 //! 円は長さ 0 のカプセル、線は丸い端のカプセル、矩形は判定を常に内側にした四角形。
+//! 回転した矩形（`rect` に angle を渡したとき）だけは箱の SDF で、縁にアンチエイリアスを付ける。
 //! 頂点はまとめて 1 回の draw call で送る。
 
 use glow::HasContext;
@@ -17,9 +18,11 @@ pub const MAX_QUADS: usize = 8192;
 pub struct Vertex {
     /// 画面上の位置（ピクセル、左上原点）。
     pub pos: [f32; 2],
-    /// 図形のローカル座標（ピクセル）。x は線分方向、y は法線方向。
+    /// 図形のローカル座標（ピクセル）。カプセルは x が線分方向、y が法線方向で、線分の始点が原点。
+    /// 回転した矩形は、矩形の中心が原点で、回す前の矩形の x・y 方向。
     pub local: [f32; 2],
-    /// (線分の長さ, 半径)。
+    /// カプセルは (線分の長さ, 半径)。回転した矩形は (-半分の幅, 半分の高さ)。
+    /// x が負なら回転した矩形（カプセルの長さは負にならない）。
     pub shape: [f32; 2],
     pub color: [u8; 4],
 }
@@ -44,6 +47,10 @@ const FILL_RADIUS: f32 = 8192.0;
 /// アンチエイリアスのために図形の外側へ広げる量（ピクセル）。prelude.lua と揃える。
 #[cfg(test)]
 const AA_PAD: f32 = 1.0;
+/// 回転した矩形の半分の幅・高さがこれより小さければ描かない。prelude.lua と揃える。
+/// shape.x を負にして回転した矩形の目印にしているので、0 に近い値（mediump で 0 に潰れる値）を避ける。
+#[cfg(test)]
+const MIN_HALF_SIZE: f32 = 1e-4;
 
 impl Batch {
     pub fn quads(&self) -> usize {
@@ -110,6 +117,23 @@ impl Batch {
             [0.0, FILL_RADIUS],
         );
     }
+
+    /// (x, y, w, h) の矩形を、その中心のまわりに angle ラジアン回す（y が下向きの画面で時計回り）。
+    pub fn rotated_rect(&mut self, x: f32, y: f32, w: f32, h: f32, angle: f32) {
+        let (hx, hy) = (w.abs() * 0.5, h.abs() * 0.5);
+        if !(hx >= MIN_HALF_SIZE && hy >= MIN_HALF_SIZE) {
+            return;
+        }
+        let (cx, cy) = (x + w * 0.5, y + h * 0.5);
+        let (s, c) = angle.sin_cos();
+        let (ex, ey) = (hx + AA_PAD, hy + AA_PAD);
+        let at = |lx: f32, ly: f32| [cx + lx * c - ly * s, cy + lx * s + ly * c];
+        self.quad(
+            [at(-ex, -ey), at(ex, -ey), at(-ex, ey), at(ex, ey)],
+            [[-ex, -ey], [ex, -ey], [-ex, ey], [ex, ey]],
+            [-hx, hy],
+        );
+    }
 }
 
 #[cfg(test)]
@@ -146,8 +170,15 @@ varying vec2 v_local;
 varying vec2 v_shape;
 varying vec4 v_color;
 void main() {
-    float dx = v_local.x - clamp(v_local.x, 0.0, v_shape.x);
-    float d = length(vec2(dx, v_local.y)) - v_shape.y;
+    float d;
+    if (v_shape.x < 0.0) {
+        // 回転した矩形: 中心が原点、半分の大きさは (-v_shape.x, v_shape.y) の箱の SDF。
+        vec2 q = abs(v_local) - vec2(-v_shape.x, v_shape.y);
+        d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+    } else {
+        float dx = v_local.x - clamp(v_local.x, 0.0, v_shape.x);
+        d = length(vec2(dx, v_local.y)) - v_shape.y;
+    }
     float a = clamp(0.5 - d, 0.0, 1.0);
     gl_FragColor = vec4(v_color.rgb, v_color.a * a);
 }
@@ -364,6 +395,48 @@ mod tests {
         let mut b = Batch::default();
         b.line(5.0, 5.0, 5.0, 5.0, 4.0);
         assert_eq!(b.vertices[0].shape, [0.0, 2.0]);
+    }
+
+    #[test]
+    fn rotated_rect_quad_covers_box() {
+        let mut b = Batch::default();
+        b.rotated_rect(10.0, 20.0, 40.0, 20.0, 0.0);
+        assert_eq!(b.quads(), 1);
+        let v = &b.vertices;
+        // 中心 (30, 30)、半分の大きさ (20, 10) に、AA の 1px を足して広げる。
+        assert_eq!(v[0].pos, [9.0, 19.0]);
+        assert_eq!(v[3].pos, [51.0, 41.0]);
+        assert_eq!(v[0].local, [-21.0, -11.0]);
+        assert_eq!(v[0].shape, [-20.0, 10.0]);
+    }
+
+    #[test]
+    fn rotated_rect_turns_clockwise_on_screen_around_its_center() {
+        let mut b = Batch::default();
+        b.rotated_rect(10.0, 20.0, 40.0, 20.0, std::f32::consts::FRAC_PI_2);
+        // 左上の角（ローカル (-21, -11)）は、y が下向きの画面で時計回りに 90 度回ると右上へ行く。
+        let p = b.vertices[0].pos;
+        assert!(
+            (p[0] - 41.0).abs() < 1e-4 && (p[1] - 9.0).abs() < 1e-4,
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn rotated_rect_with_negative_size_uses_the_same_box() {
+        let mut a = Batch::default();
+        a.rotated_rect(10.0, 20.0, 40.0, 20.0, 0.3);
+        let mut b = Batch::default();
+        b.rotated_rect(50.0, 40.0, -40.0, -20.0, 0.3);
+        assert_eq!(a.vertices, b.vertices);
+    }
+
+    #[test]
+    fn rotated_rect_with_empty_or_nan_size_draws_nothing() {
+        let mut b = Batch::default();
+        b.rotated_rect(0.0, 0.0, 0.0, 5.0, 1.0);
+        b.rotated_rect(0.0, 0.0, 5.0, f32::NAN, 1.0);
+        assert_eq!(b.quads(), 0);
     }
 
     #[test]

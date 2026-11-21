@@ -49,3 +49,31 @@ fn per_call_cost() {
     let ns = t.elapsed().as_secs_f64() * 1e9 / (n as f64 * 10000.0);
     eprintln!("color+line: {ns:.0} ns per shape");
 }
+
+#[test]
+#[ignore]
+fn rect_call_cost() {
+    for (label, call) in [
+        ("rect", "rect(i, 0, 10, 10)"),
+        ("rect+angle", "rect(i, 0, 10, 10, 0.5)"),
+    ] {
+        let s = Script::from_source(
+            &format!("function draw() for i = 1, 10000 do color(1, 1, 1, 0.5) {call} end end"),
+            "calls",
+            "B",
+            1,
+            (1920, 1080),
+        )
+        .unwrap();
+        for _ in 0..20 {
+            drop(s.frame(0.0).unwrap());
+        }
+        let n = 500;
+        let t = Instant::now();
+        for _ in 0..n {
+            drop(s.frame(0.0).unwrap());
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / (n as f64 * 10000.0);
+        eprintln!("color+{label}: {ns:.1} ns per shape");
+    }
+}

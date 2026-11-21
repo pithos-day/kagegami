@@ -7,7 +7,7 @@
 -- * 頂点を書く前に必ず残り容量を確かめる。満杯なら Rust 側へ渡してから書く。
 -- * 返す関数は何も返さない（cdata を壁紙側に渡さない）。
 
-local ffi, ptr, CAP, take, rust_clear, rust_blend, sqrt, error, type = ...
+local ffi, ptr, CAP, take, rust_clear, rust_blend, sqrt, cos, sin, error, type, select = ...
 
 ffi.cdef [[
 typedef struct {
@@ -21,9 +21,10 @@ typedef struct {
 local buf = ffi.cast("kagegami_vertex *", ptr)
 ptr = nil
 
--- render.rs の AA_PAD / FILL_RADIUS と同じ値。
+-- render.rs の AA_PAD / FILL_RADIUS / MIN_HALF_SIZE と同じ値。
 local AA_PAD = 1.0
 local FILL_RADIUS = 8192.0
+local MIN_HALF_SIZE = 1e-4
 
 local n = 0 -- 書き込み済みの頂点数
 local cr, cg, cb, ca = 255, 255, 255, 255
@@ -53,6 +54,16 @@ local function num(v, name)
     error(name .. ": number expected, got " .. type(v), 3)
   end
   return v
+end
+
+-- 決まった数より後ろの引数（...）が、すべて nil でなければエラーにする。
+-- 後ろに付いた nil は数えないので、変数が nil のまま渡しても省略と同じになる。
+local function too_many(name, max, ...)
+  for i = 1, select("#", ...) do
+    if select(i, ...) ~= nil then
+      error(name .. ": too many arguments (max " .. max .. ")", 3)
+    end
+  end
 end
 
 local function put(px, py, lx, ly, sl, sr)
@@ -104,8 +115,30 @@ function api.line(x1, y1, x2, y2, w)
   put(x2 + ux * e + nx * e, y2 + uy * e + ny * e, len + e, e, len, hw)
 end
 
-function api.rect(x, y, w, h)
+-- angle を渡したときは、値が 0 でも回転した矩形として描く（縁にアンチエイリアスが付く）。
+-- 0 をまたいで回したときに、0 の瞬間だけ縁の見た目が変わらないようにするため。
+local function rotated_rect(x, y, w, h, angle)
+  local hx = (w < 0 and -w or w) * 0.5
+  local hy = (h < 0 and -h or h) * 0.5
+  -- NaN もここで弾く。
+  if not (hx >= MIN_HALF_SIZE and hy >= MIN_HALF_SIZE) then return end
+  local cx, cy = x + w * 0.5, y + h * 0.5
+  local c, s = cos(angle), sin(angle)
+  local ex, ey = hx + AA_PAD, hy + AA_PAD
+  reserve()
+  -- ローカル座標 (lx, ly) を (cx + lx*c - ly*s, cy + lx*s + ly*c) に置く。
+  put(cx - ex * c + ey * s, cy - ex * s - ey * c, -ex, -ey, -hx, hy)
+  put(cx + ex * c + ey * s, cy + ex * s - ey * c, ex, -ey, -hx, hy)
+  put(cx - ex * c - ey * s, cy - ex * s + ey * c, -ex, ey, -hx, hy)
+  put(cx + ex * c - ey * s, cy + ex * s + ey * c, ex, ey, -hx, hy)
+end
+
+function api.rect(x, y, w, h, angle, ...)
+  if select("#", ...) > 0 then too_many("rect", 5, ...) end
   num(x, "rect"); num(y, "rect"); num(w, "rect"); num(h, "rect")
+  if angle ~= nil then
+    return rotated_rect(x, y, w, h, num(angle, "rect"))
+  end
   reserve()
   put(x, y, 0, 0, 0, FILL_RADIUS)
   put(x + w, y, 0, 0, 0, FILL_RADIUS)
