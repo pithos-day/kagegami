@@ -12,6 +12,7 @@ smithay-client-toolkit = { version = "0.21.1", default-features = false }
 wayland-backend = { version = "0.3.17", features = ["client_system"] }
 wayland-client = "0.31.15"
 wayland-egl = "0.32.11"
+wayland-protocols = { version = "0.32.13", features = ["client"] }
 
 [features]
 # 開発用: 1 フレームあたりの GPU 時間を測る

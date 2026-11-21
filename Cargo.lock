@@ -148,6 +148,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-egl",
+ "wayland-protocols",
 ]
 
 [[package]]
