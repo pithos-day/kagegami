@@ -319,10 +319,10 @@ impl App {
             if w.failed && w.presented {
                 continue;
             }
-            if let Some(script) = &w.script {
-                if let Err(e) = script.set_mouse(&w.mouse) {
-                    eprintln!("kagegami: {}: {e}", w.name);
-                }
+            if let Some(script) = &w.script
+                && let Err(e) = script.set_mouse(&w.mouse)
+            {
+                eprintln!("kagegami: {}: {e}", w.name);
             }
             let raw_dt = w
                 .last_frame
@@ -609,12 +609,12 @@ impl App {
             let w = &mut self.wallpapers[i];
             w.frame_pending = false;
             w.next_due = Instant::now();
-            if w.shader.borrow().is_none() && !w.failed && w.egl_surface.is_some() {
-                if let Err(e) = self.load_shader(i) {
-                    let w = &mut self.wallpapers[i];
-                    eprintln!("kagegami: {}: {e}", w.name);
-                    w.failed = true;
-                }
+            // load_shader は shader を borrow_mut するので、borrow() は先に評価して手放しておく。
+            let needs_load = w.shader.borrow().is_none() && !w.failed && w.egl_surface.is_some();
+            if needs_load && let Err(e) = self.load_shader(i) {
+                let w = &mut self.wallpapers[i];
+                eprintln!("kagegami: {}: {e}", w.name);
+                w.failed = true;
             }
             return;
         }
@@ -681,10 +681,10 @@ impl SeatHandler for App {
         _: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Pointer {
-            if let Some(p) = self.pointer.take() {
-                p.release();
-            }
+        if capability == Capability::Pointer
+            && let Some(p) = self.pointer.take()
+        {
+            p.release();
         }
     }
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
