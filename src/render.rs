@@ -328,7 +328,7 @@ impl Renderer {
         }
         std::fs::write(path, out)?;
         // アルファの確認用に、不透明でない画素の数を書き出す。
-        let translucent = px.chunks_exact(4).filter(|p| p[3] != 255).count();
+        let translucent = px.as_chunks::<4>().0.iter().filter(|p| p[3] != 255).count();
         std::fs::write(format!("{path}.alpha"), format!("{translucent}\n"))
     }
 }
