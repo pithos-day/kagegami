@@ -1,7 +1,8 @@
 // Shadertoy 形式のシェーダーの壁紙の例。ドラッグすると波の中心が動く。
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec2 uv = fragCoord / iResolution.y;
-    vec2 center = iMouse.z > 0.0 || iMouse.x > 0.0
+    // 一度も押していなければ iMouse は全部 0。押した後は、画面外（負の座標）でもその位置を使う。
+    vec2 center = iMouse != vec4(0.0)
         ? iMouse.xy / iResolution.y
         : vec2(0.5 * iResolution.x / iResolution.y, 0.5);
     float d = length(uv - center);
