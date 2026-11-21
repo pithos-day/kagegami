@@ -7,6 +7,7 @@
 use glow::HasContext;
 
 use crate::egl::EglContext;
+use crate::gl_program::{self, ProgramError};
 
 /// 1 回の draw call に詰める四角形の上限（u16 インデックスに収まる数）。
 pub const MAX_QUADS: usize = 8192;
@@ -164,27 +165,23 @@ impl Renderer {
     pub fn new(egl: &EglContext) -> Result<Self, String> {
         let gl = unsafe { glow::Context::from_loader_function(|s| egl.proc_address(s)) };
         unsafe {
-            let program = gl.create_program()?;
-            for (ty, src) in [(glow::VERTEX_SHADER, VERT), (glow::FRAGMENT_SHADER, FRAG)] {
-                let sh = gl.create_shader(ty)?;
-                gl.shader_source(sh, src);
-                gl.compile_shader(sh);
-                if !gl.get_shader_compile_status(sh) {
-                    return Err(format!("shader compile: {}", gl.get_shader_info_log(sh)));
-                }
-                gl.attach_shader(program, sh);
-                gl.delete_shader(sh);
-            }
-            for (i, name) in ["a_pos", "a_local", "a_shape", "a_color"]
-                .iter()
-                .enumerate()
-            {
-                gl.bind_attrib_location(program, i as u32, name);
-            }
-            gl.link_program(program);
-            if !gl.get_program_link_status(program) {
-                return Err(format!("shader link: {}", gl.get_program_info_log(program)));
-            }
+            let program = gl_program::build(
+                &gl,
+                &[(glow::VERTEX_SHADER, VERT), (glow::FRAGMENT_SHADER, FRAG)],
+                |program| {
+                    for (i, name) in ["a_pos", "a_local", "a_shape", "a_color"]
+                        .iter()
+                        .enumerate()
+                    {
+                        gl.bind_attrib_location(program, i as u32, name);
+                    }
+                },
+            )
+            .map_err(|e| match e {
+                ProgramError::Create(e) => e,
+                ProgramError::Compile { log, .. } => format!("shader compile: {log}"),
+                ProgramError::Link(log) => format!("shader link: {log}"),
+            })?;
             let u_res = gl
                 .get_uniform_location(program, "u_res")
                 .ok_or("u_res not found")?;

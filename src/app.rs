@@ -56,6 +56,26 @@ fn seed_for<T: std::hash::Hash>(salt: &T) -> u64 {
     h.finish()
 }
 
+/// 出力ごとのエラーを、出力の名前を付けて出す。
+fn report(output: &str, e: impl std::fmt::Display) {
+    eprintln!("kagegami: {output}: {e}");
+}
+
+/// 描画の準備ができていなければ作る。作れなければ続けられないので終了する。
+/// `App` のほかのフィールドを借りたまま呼べるように、`App` のメソッドにしない。
+fn ensure_renderer<'a>(renderer: &'a mut Option<Renderer>, egl: &EglContext) -> &'a mut Renderer {
+    if renderer.is_none() {
+        match Renderer::new(egl) {
+            Ok(r) => *renderer = Some(r),
+            Err(e) => {
+                eprintln!("kagegami: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    renderer.as_mut().unwrap()
+}
+
 /// 出力のピクセル数に `--scale` の倍率を掛けた、描画するバッファーのピクセル数。
 fn buffer_px(output_px: u32, render_scale: f64) -> u32 {
     ((output_px as f64 * render_scale).round() as u32).max(1)
@@ -193,20 +213,6 @@ impl App {
         shader::is_shader_path(&self.args.script)
     }
 
-    /// 描画の準備ができていなければ作る。作れなければ続けられないので終了する。
-    fn ensure_renderer(&mut self) -> &mut Renderer {
-        if self.renderer.is_none() {
-            match Renderer::new(&self.egl) {
-                Ok(r) => self.renderer = Some(r),
-                Err(e) => {
-                    eprintln!("kagegami: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        self.renderer.as_mut().unwrap()
-    }
-
     /// シェーダーのファイルを読んでコンパイルし、i 番目の出力の壁紙にする。
     /// 失敗したら、それまでのシェーダーをそのまま残してエラーを返す（Lua の読み直しと同じ）。
     fn load_shader(&mut self, i: usize) -> Result<(), String> {
@@ -217,8 +223,7 @@ impl App {
             .as_ref()
             .ok_or("no EGL surface")?;
         self.egl.make_current(es)?;
-        self.ensure_renderer();
-        let gl = self.renderer.as_ref().unwrap().gl();
+        let gl = ensure_renderer(&mut self.renderer, &self.egl).gl();
         let program = ShaderProgram::new(gl, &src)?;
         let old = self.wallpapers[i].shader.borrow_mut().take();
         let timer = match old {
@@ -270,7 +275,7 @@ impl App {
                         w.last_frame = None;
                         w.next_due = Instant::now();
                     }
-                    Err(e) => eprintln!("kagegami: {}: {e}", self.wallpapers[i].name),
+                    Err(e) => report(&self.wallpapers[i].name, e),
                 }
             }
             return;
@@ -293,7 +298,7 @@ impl App {
                     w.last_frame = None;
                     w.next_due = Instant::now();
                 }
-                Err(e) => eprintln!("kagegami: {}: {e}", w.name),
+                Err(e) => report(&w.name, e),
             }
         }
     }
@@ -322,7 +327,7 @@ impl App {
             if let Some(script) = &w.script
                 && let Err(e) = script.set_mouse(&w.mouse)
             {
-                eprintln!("kagegami: {}: {e}", w.name);
+                report(&w.name, e);
             }
             let raw_dt = w
                 .last_frame
@@ -333,19 +338,10 @@ impl App {
             let w = &self.wallpapers[i];
             let es = w.egl_surface.as_ref().unwrap();
             if let Err(e) = self.egl.make_current(es) {
-                eprintln!("kagegami: {}: {e}", w.name);
+                report(&w.name, e);
                 continue;
             }
-            if self.renderer.is_none() {
-                match Renderer::new(&self.egl) {
-                    Ok(r) => self.renderer = Some(r),
-                    Err(e) => {
-                        eprintln!("kagegami: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            let renderer = self.renderer.as_mut().unwrap();
+            let renderer = ensure_renderer(&mut self.renderer, &self.egl);
             let mut shader_state = w.shader.borrow_mut();
             #[cfg(feature = "gpu-bench")]
             let bench_t0 = self.bench.as_ref().map(|b| b.start(renderer.gl()));
@@ -406,7 +402,7 @@ impl App {
                 Some(script) if !w.failed => match script.frame(dt) {
                     Ok(dl) => renderer.submit(&dl),
                     Err(e) => {
-                        eprintln!("kagegami: {}: {e}", w.name);
+                        report(&w.name, e);
                         failed = true;
                         renderer.clear(0.0, 0.0, 0.0);
                     }
@@ -442,7 +438,7 @@ impl App {
             let surface = w.surface().clone();
             surface.frame(qh, FrameCallbackData(surface.clone()));
             if let Err(e) = self.egl.swap(es) {
-                eprintln!("kagegami: {}: {e}", w.name);
+                report(&w.name, e);
             }
             let w = &mut self.wallpapers[i];
             w.frame_pending = true;
@@ -598,7 +594,7 @@ impl App {
             Some(s) => s.resize(bw, bh),
             None => match self.egl.create_surface(w.layer.wl_surface(), bw, bh) {
                 Ok(s) => w.egl_surface = Some(s),
-                Err(e) => eprintln!("kagegami: {}: {e}", w.name),
+                Err(e) => report(&w.name, e),
             },
         }
         if self.is_shader() {
@@ -609,7 +605,7 @@ impl App {
             let needs_load = w.shader.borrow().is_none() && !w.failed && w.egl_surface.is_some();
             if needs_load && let Err(e) = self.load_shader(i) {
                 let w = &mut self.wallpapers[i];
-                eprintln!("kagegami: {}: {e}", w.name);
+                report(&w.name, e);
                 w.failed = true;
             }
             return;
@@ -618,7 +614,7 @@ impl App {
         match &w.script {
             Some(script) => {
                 if let Err(e) = script.set_screen(w.output_size.0, w.output_size.1) {
-                    eprintln!("kagegami: {}: {e}", w.name);
+                    report(&w.name, e);
                 }
             }
             None if !w.failed => {
@@ -631,7 +627,7 @@ impl App {
                 ) {
                     Ok(s) => w.script = Some(s),
                     Err(e) => {
-                        eprintln!("kagegami: {}: {e}", w.name);
+                        report(&w.name, e);
                         w.failed = true;
                     }
                 }
@@ -772,7 +768,7 @@ impl PointerHandler for App {
                     .set_mouse(&w.mouse)
                     .and_then(|_| script.mouse_event(ev));
                 if let Err(e) = r {
-                    eprintln!("kagegami: {}: {e}", w.name);
+                    report(&w.name, e);
                     w.failed = true;
                 }
             }

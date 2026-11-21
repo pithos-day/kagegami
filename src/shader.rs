@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use glow::HasContext;
 
+use crate::gl_program::{self, ProgramError};
+
 /// 1 フレームの GPU 時間の上限。Lua の毎フレームの制限と同じ値。
 pub const FRAME_GPU_LIMIT: Duration = Duration::from_millis(250);
 
@@ -109,43 +111,27 @@ impl ShaderProgram {
     /// コンパイルしてリンクする。エラーはドライバーのメッセージをそのまま返す。
     pub fn new(gl: &glow::Context, src: &str) -> Result<Self, String> {
         let frag = wrap(src);
+        let program = gl_program::build(
+            gl,
+            &[
+                (glow::VERTEX_SHADER, VERT),
+                (glow::FRAGMENT_SHADER, frag.as_str()),
+            ],
+            |_| {},
+        )
+        .map_err(|e| match e {
+            ProgramError::Create(e) => e,
+            ProgramError::Compile { shader_type, log } => {
+                let what = if shader_type == glow::VERTEX_SHADER {
+                    "vertex shader"
+                } else {
+                    "shader"
+                };
+                format!("{what} compile error:\n{}", log.trim_end())
+            }
+            ProgramError::Link(log) => format!("shader link error:\n{}", log.trim_end()),
+        })?;
         unsafe {
-            let program = gl.create_program()?;
-            let mut shaders = Vec::new();
-            let mut result = Ok(());
-            for (ty, s, what) in [
-                (glow::VERTEX_SHADER, VERT, "vertex shader"),
-                (glow::FRAGMENT_SHADER, frag.as_str(), "shader"),
-            ] {
-                let sh = gl.create_shader(ty)?;
-                gl.shader_source(sh, s);
-                gl.compile_shader(sh);
-                shaders.push(sh);
-                if !gl.get_shader_compile_status(sh) {
-                    result = Err(format!(
-                        "{what} compile error:\n{}",
-                        gl.get_shader_info_log(sh).trim_end()
-                    ));
-                    break;
-                }
-                gl.attach_shader(program, sh);
-            }
-            if result.is_ok() {
-                gl.link_program(program);
-                if !gl.get_program_link_status(program) {
-                    result = Err(format!(
-                        "shader link error:\n{}",
-                        gl.get_program_info_log(program).trim_end()
-                    ));
-                }
-            }
-            for sh in shaders {
-                gl.delete_shader(sh);
-            }
-            if let Err(e) = result {
-                gl.delete_program(program);
-                return Err(e);
-            }
             let vao = gl.create_vertex_array()?;
             let loc = [
                 "iResolution",
