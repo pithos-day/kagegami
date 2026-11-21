@@ -55,69 +55,6 @@ pub fn wrap(src: &str) -> String {
     format!("{PREFIX}{src}{SUFFIX}")
 }
 
-/// Shadertoy の `iMouse` の状態（#11 で決めた動き）。座標は Lua の `mouse` と同じ
-/// 出力のピクセル（左上原点）で持ち、uniform にするときに y を反転する。
-/// シェーダーに渡すときは `view` でバッファーのピクセルに換算する。
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct DragMouse {
-    pos: [f32; 2],
-    start: [f32; 2],
-    /// ドラッグ中（z が正）。
-    down: bool,
-    /// 押した後、まだ 1 フレームも描いていない（w が正）。
-    clicked: bool,
-    /// 一度でも押したか。押す前は Shadertoy と同じく全部 0 にする。
-    touched: bool,
-}
-
-impl DragMouse {
-    /// どれかのボタンを押した。ほかのボタンを押していても、ここからドラッグを始め直す。
-    pub fn pressed(&mut self, x: f32, y: f32) {
-        self.pos = [x, y];
-        self.start = [x, y];
-        self.down = true;
-        self.clicked = true;
-        self.touched = true;
-    }
-
-    /// どれかのボタンを離した、またはカーソルが surface の外に出た（Leave）。
-    pub fn released(&mut self) {
-        self.down = false;
-    }
-
-    /// カーソルが動いた。ドラッグ中だけ位置を更新する（surface の外の座標もそのまま）。
-    pub fn moved(&mut self, x: f32, y: f32) {
-        if self.down {
-            self.pos = [x, y];
-        }
-    }
-
-    /// 1 フレーム描いた。押した直後の印（w が正）はここで消える。
-    pub fn frame_rendered(&mut self) {
-        self.clicked = false;
-    }
-
-    /// Lua の `mouse.press_x`・`press_y`・`dragging`（#13）。座標は左上原点のまま。
-    /// 一度も押していなければ `iMouse` と同じく位置は 0。
-    pub fn lua(&self) -> ([f32; 2], bool) {
-        (self.start, self.down)
-    }
-
-    /// `iMouse` の値。y は `height - y` にして左下原点にする。
-    pub fn uniform(&self, height: f32) -> [f32; 4] {
-        if !self.touched {
-            return [0.0; 4];
-        }
-        let sign = |b: bool| if b { 1.0 } else { -1.0 };
-        [
-            self.pos[0],
-            height - self.pos[1],
-            self.start[0] * sign(self.down),
-            (height - self.start[1]) * sign(self.clicked),
-        ]
-    }
-}
-
 /// `iDate`: (年, 月 - 1, 日, 0 時からの秒数)。ローカル時刻。
 pub fn local_date() -> [f32; 4] {
     let now = std::time::SystemTime::now()
@@ -138,19 +75,23 @@ pub fn local_date() -> [f32; 4] {
     ]
 }
 
-/// シェーダーに渡す解像度と `iMouse` を決める（#25、#28）。どちらもバッファーのピクセルにする。
-/// `mouse` は `DragMouse::uniform` の値（出力のピクセル、左下原点）。
+/// `iMouse` をバッファーのピクセルに換算する（#25、#28）。シェーダーの解像度もバッファーのピクセルにする。
+/// `mouse` は `Drag::imouse` の値（出力のピクセル、左下原点）。
 /// バッファーのサイズは四捨五入しているので、縦横それぞれの比で換算する。
-pub fn view(buffer: (u32, u32), output: (u32, u32), mouse: [f32; 4]) -> ((u32, u32), [f32; 4]) {
-    let sx = |v: f32| v * buffer.0 as f32 / output.0 as f32;
-    let sy = |v: f32| v * buffer.1 as f32 / output.1 as f32;
+pub fn mouse_to_buffer_px(
+    buffer_size: (u32, u32),
+    output_size: (u32, u32),
+    mouse: [f32; 4],
+) -> [f32; 4] {
+    let sx = |v: f32| v * buffer_size.0 as f32 / output_size.0 as f32;
+    let sy = |v: f32| v * buffer_size.1 as f32 / output_size.1 as f32;
     let [x, y, z, w] = mouse;
-    (buffer, [sx(x), sy(y), sx(z), sy(w)])
+    [sx(x), sy(y), sx(z), sy(w)]
 }
 
 pub struct Uniforms {
-    pub width: u32,
-    pub height: u32,
+    /// 描画するバッファーのピクセルサイズ。`iResolution` と viewport に使う。
+    pub resolution: (u32, u32),
     pub time: f32,
     pub time_delta: f32,
     pub frame: i32,
@@ -222,9 +163,14 @@ impl ShaderProgram {
     pub fn draw(&self, gl: &glow::Context, u: &Uniforms) {
         let [res, time, dt, frame, mouse, date] = &self.loc;
         unsafe {
-            gl.viewport(0, 0, u.width as i32, u.height as i32);
+            gl.viewport(0, 0, u.resolution.0 as i32, u.resolution.1 as i32);
             gl.use_program(Some(self.program));
-            gl.uniform_3_f32(res.as_ref(), u.width as f32, u.height as f32, 1.0);
+            gl.uniform_3_f32(
+                res.as_ref(),
+                u.resolution.0 as f32,
+                u.resolution.1 as f32,
+                1.0,
+            );
             gl.uniform_1_f32(time.as_ref(), u.time);
             gl.uniform_1_f32(dt.as_ref(), u.time_delta);
             gl.uniform_1_i32(frame.as_ref(), u.frame);
@@ -354,8 +300,6 @@ impl GpuTimer {
 mod tests {
     use super::*;
 
-    const H: f32 = 1080.0;
-
     #[test]
     fn picks_shader_by_extension() {
         assert!(is_shader_path(Path::new("a.glsl")));
@@ -374,87 +318,6 @@ mod tests {
     }
 
     #[test]
-    fn starts_at_zero() {
-        // Shadertoy と同じく、一度も押していなければ全部 0（y を反転しない）。
-        assert_eq!(DragMouse::default().uniform(H), [0.0; 4]);
-    }
-
-    #[test]
-    fn lua_fields_follow_drag() {
-        let mut m = DragMouse::default();
-        assert_eq!(m.lua(), ([0.0, 0.0], false));
-        m.pressed(100.0, 80.0);
-        m.moved(150.0, 90.0);
-        // 押し始めた位置は動かず、y も反転しない。
-        assert_eq!(m.lua(), ([100.0, 80.0], true));
-        m.released();
-        assert_eq!(m.lua(), ([100.0, 80.0], false));
-    }
-
-    #[test]
-    fn press_sets_position_and_click_for_one_frame() {
-        let mut m = DragMouse::default();
-        m.pressed(100.0, 80.0);
-        assert_eq!(m.uniform(H), [100.0, H - 80.0, 100.0, H - 80.0]);
-        m.frame_rendered();
-        assert_eq!(m.uniform(H), [100.0, H - 80.0, 100.0, -(H - 80.0)]);
-    }
-
-    #[test]
-    fn drag_moves_xy_only() {
-        let mut m = DragMouse::default();
-        m.pressed(100.0, 80.0);
-        m.frame_rendered();
-        m.moved(150.0, 90.0);
-        assert_eq!(m.uniform(H), [150.0, H - 90.0, 100.0, -(H - 80.0)]);
-        // surface の外の座標もそのまま渡す。
-        m.moved(-20.0, 2000.0);
-        assert_eq!(m.uniform(H), [-20.0, H - 2000.0, 100.0, -(H - 80.0)]);
-    }
-
-    #[test]
-    fn hover_without_button_does_not_move() {
-        let mut m = DragMouse::default();
-        m.moved(10.0, 10.0);
-        assert_eq!(m.uniform(H), [0.0; 4]);
-        m.released();
-        assert_eq!(m.uniform(H), [0.0; 4]);
-    }
-
-    #[test]
-    fn release_makes_z_negative_and_keeps_values() {
-        let mut m = DragMouse::default();
-        m.pressed(100.0, 80.0);
-        m.frame_rendered();
-        m.moved(150.0, 90.0);
-        m.released();
-        assert_eq!(m.uniform(H), [150.0, H - 90.0, -100.0, -(H - 80.0)]);
-        // 切れた後は、残っているボタンを押したまま動かしても変わらない。
-        m.moved(300.0, 300.0);
-        assert_eq!(m.uniform(H), [150.0, H - 90.0, -100.0, -(H - 80.0)]);
-    }
-
-    #[test]
-    fn second_button_restarts_drag() {
-        let mut m = DragMouse::default();
-        m.pressed(100.0, 80.0);
-        m.frame_rendered();
-        m.moved(150.0, 90.0);
-        m.pressed(150.0, 90.0);
-        assert_eq!(m.uniform(H), [150.0, H - 90.0, 150.0, H - 90.0]);
-    }
-
-    #[test]
-    fn press_and_release_before_a_frame_still_shows_the_click() {
-        let mut m = DragMouse::default();
-        m.pressed(100.0, 80.0);
-        m.released();
-        assert_eq!(m.uniform(H), [100.0, H - 80.0, -100.0, H - 80.0]);
-        m.frame_rendered();
-        assert_eq!(m.uniform(H), [100.0, H - 80.0, -100.0, -(H - 80.0)]);
-    }
-
-    #[test]
     fn date_is_plausible() {
         let [y, m, d, s] = local_date();
         assert!(y >= 2024.0);
@@ -464,27 +327,31 @@ mod tests {
     }
 
     #[test]
-    fn view_uses_buffer_pixels() {
-        // 等倍では出力のサイズと同じ。
+    fn mouse_is_converted_to_buffer_pixels() {
+        // 等倍では出力のピクセルと同じ。
         assert_eq!(
-            view((1920, 1080), (1920, 1080), [100.0, 80.0, 100.0, -80.0]),
-            ((1920, 1080), [100.0, 80.0, 100.0, -80.0])
+            mouse_to_buffer_px((1920, 1080), (1920, 1080), [100.0, 80.0, 100.0, -80.0]),
+            [100.0, 80.0, 100.0, -80.0]
         );
-        // -s 0.5: 解像度も iMouse もバッファーのピクセルにする。符号は変えない。
+        // -s 0.5: iMouse もバッファーのピクセルにする。符号は変えない。
         assert_eq!(
-            view((960, 540), (1920, 1080), [100.0, 80.0, -100.0, -80.0]),
-            ((960, 540), [50.0, 40.0, -50.0, -40.0])
+            mouse_to_buffer_px((960, 540), (1920, 1080), [100.0, 80.0, -100.0, -80.0]),
+            [50.0, 40.0, -50.0, -40.0]
         );
         // -s 2
         assert_eq!(
-            view((3840, 2160), (1920, 1080), [100.0, 80.0, 100.0, 80.0]),
-            ((3840, 2160), [200.0, 160.0, 200.0, 160.0])
+            mouse_to_buffer_px((3840, 2160), (1920, 1080), [100.0, 80.0, 100.0, 80.0]),
+            [200.0, 160.0, 200.0, 160.0]
         );
         // 四捨五入したバッファーでは、縦横それぞれの比で換算する（1366 * 0.25 = 341.5 -> 342）。
-        let (res, m) = view((342, 192), (1366, 768), [1366.0, 768.0, 0.0, 0.0]);
-        assert_eq!(res, (342, 192));
-        assert_eq!(m, [342.0, 192.0, 0.0, 0.0]);
+        assert_eq!(
+            mouse_to_buffer_px((342, 192), (1366, 768), [1366.0, 768.0, 0.0, 0.0]),
+            [342.0, 192.0, 0.0, 0.0]
+        );
         // 一度も押していなければ全部 0 のまま。
-        assert_eq!(view((960, 540), (1920, 1080), [0.0; 4]).1, [0.0; 4]);
+        assert_eq!(
+            mouse_to_buffer_px((960, 540), (1920, 1080), [0.0; 4]),
+            [0.0; 4]
+        );
     }
 }

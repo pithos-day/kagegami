@@ -33,7 +33,7 @@ pub enum LayerName {
 pub struct Args {
     pub fps: f64,
     /// 出力の解像度に対する、描画する解像度の倍率。
-    pub scale: f64,
+    pub render_scale: f64,
     pub layer: LayerName,
     pub output: OutputSelector,
     pub script: PathBuf,
@@ -47,7 +47,7 @@ pub enum ParseResult {
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, String> {
     let mut fps = 60.0;
-    let mut scale = 1.0;
+    let mut render_scale = 1.0;
     let mut layer = LayerName::Background;
     let mut output = OutputSelector::All;
     let mut positional = Vec::new();
@@ -69,7 +69,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, Str
             }
             "-s" | "--scale" => {
                 let v = iter.next().ok_or(format!("{arg} requires a value"))?;
-                scale = v
+                render_scale = v
                     .parse::<f64>()
                     .ok()
                     .filter(|s| (SCALE_MIN..=SCALE_MAX).contains(s))
@@ -103,7 +103,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, Str
     };
     Ok(ParseResult::Run(Args {
         fps,
-        scale,
+        render_scale,
         layer,
         output,
         script: PathBuf::from(script),
@@ -131,7 +131,7 @@ mod tests {
             run(&["a.lua"]),
             Args {
                 fps: 60.0,
-                scale: 1.0,
+                render_scale: 1.0,
                 layer: LayerName::Background,
                 output: OutputSelector::All,
                 script: "a.lua".into()
@@ -154,9 +154,9 @@ mod tests {
 
     #[test]
     fn parses_scale_within_range() {
-        assert_eq!(run(&["-s", "0.5", "a.lua"]).scale, 0.5);
-        assert_eq!(run(&["--scale", "0.25", "a.lua"]).scale, 0.25);
-        assert_eq!(run(&["-s", "2", "a.lua"]).scale, 2.0);
+        assert_eq!(run(&["-s", "0.5", "a.lua"]).render_scale, 0.5);
+        assert_eq!(run(&["--scale", "0.25", "a.lua"]).render_scale, 0.25);
+        assert_eq!(run(&["-s", "2", "a.lua"]).render_scale, 2.0);
     }
 
     #[test]
