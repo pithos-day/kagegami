@@ -343,8 +343,7 @@ impl App {
             return self.load_shader(i);
         }
         let w = &mut self.wallpapers[i];
-        let (width, height) = w.output_size;
-        let script = Script::load(&self.args.script, &w.name, seed, width, height)?;
+        let script = Script::load(&self.args.script, &w.name, seed, w.output_size)?;
         w.content = Some(Content::Lua(script));
         Ok(())
     }
@@ -640,7 +639,7 @@ impl App {
         w.frame_pending = false;
         w.next_due = Instant::now();
         if let Some(Content::Lua(script)) = &w.content
-            && let Err(e) = script.set_screen(w.output_size.0, w.output_size.1)
+            && let Err(e) = script.set_screen(w.output_size)
         {
             report(&w.name, e);
         }
