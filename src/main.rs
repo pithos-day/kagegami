@@ -76,8 +76,11 @@ fn run(args: cli::Args) -> Result<(), String> {
 /// 起動時に壁紙のファイルを読めるか確かめる（#37）。
 /// 起動時に読めないのはパスの打ち間違いがほとんどなので、Wayland に接続する前に終了する。
 /// 実行中に消えた場合は保存の途中とみなして待つ（`watcher` を参照）。
-fn check_readable(_path: &std::path::Path) -> Result<(), String> {
-    Ok(())
+fn check_readable(path: &std::path::Path) -> Result<(), String> {
+    // ディレクトリも File::open では開けてしまうので、読んで確かめる。
+    std::fs::read(path)
+        .map(|_| ())
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Wayland の接続にイベントが届くか `timeout` が過ぎるまで待ち、届いたイベントを読む。
