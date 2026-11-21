@@ -8,6 +8,7 @@ mod pointer;
 mod render;
 mod script;
 mod shader;
+mod watcher;
 
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
@@ -42,51 +43,6 @@ fn main() -> ExitCode {
 
 /// スクリプトがこの時間戻ってこなければ終了する。
 const WATCHDOG_LIMIT: Duration = Duration::from_secs(5);
-/// ファイルの更新を確認する間隔。
-const WATCH_INTERVAL: Duration = Duration::from_millis(500);
-
-/// 更新日時とサイズでファイルの変更を検出する。
-/// エディターは別名で保存して置き換えることが多いので、inotify ではなく定期的に確認する。
-struct FileWatcher {
-    path: std::path::PathBuf,
-    last: Option<(std::time::SystemTime, u64)>,
-    next_check: Instant,
-}
-
-impl FileWatcher {
-    fn new(path: std::path::PathBuf) -> Self {
-        let last = Self::stamp(&path);
-        Self {
-            path,
-            last,
-            next_check: Instant::now() + WATCH_INTERVAL,
-        }
-    }
-
-    fn stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
-        let m = std::fs::metadata(path).ok()?;
-        Some((m.modified().ok()?, m.len()))
-    }
-
-    fn until_next(&self, now: Instant) -> Duration {
-        self.next_check.saturating_duration_since(now)
-    }
-
-    fn changed(&mut self, now: Instant) -> bool {
-        if now < self.next_check {
-            return false;
-        }
-        self.next_check = now + WATCH_INTERVAL;
-        let stamp = Self::stamp(&self.path);
-        // 保存の途中で一瞬消えている場合は、次の確認まで待つ。
-        if stamp.is_none() || stamp == self.last {
-            return false;
-        }
-        self.last = stamp;
-        true
-    }
-}
-
 fn run(args: cli::Args) -> Result<(), String> {
     let conn =
         Connection::connect_to_env().map_err(|e| format!("cannot connect to Wayland: {e}"))?;
@@ -128,7 +84,7 @@ fn run(args: cli::Args) -> Result<(), String> {
     };
 
     script::spawn_watchdog(WATCHDOG_LIMIT);
-    let mut watcher = FileWatcher::new(app.args.script.clone());
+    let mut watcher = watcher::FileWatcher::new(app.args.script.clone());
     loop {
         queue
             .dispatch_pending(&mut app)
