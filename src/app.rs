@@ -1,6 +1,5 @@
 //! Wayland のイベント処理と、出力ごとの壁紙 surface の管理。
 
-use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::{
@@ -105,16 +104,22 @@ pub struct Wallpaper {
     next_due: Instant,
     /// 一度でもバッファーを提示したか（layer surface は提示するまで表示されない）。
     presented: bool,
-    script: Option<Script>,
-    /// スクリプトがエラーで止まっている。直前のフレームを表示したままにする。
+    /// 読み込んだ壁紙。まだ読み込めていなければ None。
+    content: Option<Content>,
+    /// 壁紙がエラーで止まっている。直前のフレームを表示したままにする。
+    /// エラーで止まっても `content` は残し、読み直しに失敗しても前の `content` を使い続ける。
     failed: bool,
     last_frame: Option<Instant>,
     seed: u64,
     mouse: MouseState,
-    /// シェーダーの壁紙の状態。Lua の壁紙では None。描画中に書き換えるので RefCell に入れる。
-    shader: RefCell<Option<ShaderState>>,
     /// シェーダーの `iMouse` と、Lua の `mouse.press_x`・`press_y`・`dragging`。
     drag: Drag,
+}
+
+/// 壁紙の中身。種類は起動時のファイルの拡張子で決まり、読み直しても変わらない。
+enum Content {
+    Lua(Script),
+    Shader(ShaderState),
 }
 
 /// コンパイル済みのシェーダーと、`iTime`・`iFrame` の基準。
@@ -198,12 +203,11 @@ impl App {
             frame_pending: false,
             next_due: Instant::now(),
             presented: false,
-            script: None,
+            content: None,
             failed: false,
             last_frame: None,
             seed: seed_for(&self.wallpapers.len()),
             mouse: MouseState::default(),
-            shader: RefCell::new(None),
             drag: Drag::default(),
         });
     }
@@ -224,7 +228,10 @@ impl App {
         self.egl.make_current(es)?;
         let gl = ensure_renderer(&mut self.renderer, &self.egl).gl();
         let program = ShaderProgram::new(gl, &src)?;
-        let old = self.wallpapers[i].shader.borrow_mut().take();
+        let old = match self.wallpapers[i].content.take() {
+            Some(Content::Shader(old)) => Some(old),
+            _ => None,
+        };
         let timer = match old {
             Some(old) => {
                 old.program.delete(gl);
@@ -246,58 +253,60 @@ impl App {
                 t
             }
         };
-        *self.wallpapers[i].shader.borrow_mut() = Some(ShaderState {
+        self.wallpapers[i].content = Some(Content::Shader(ShaderState {
             program,
             timer,
             started: Instant::now(),
             frame: 0,
-        });
+        }));
         Ok(())
+    }
+
+    /// 壁紙のファイルを読み、i 番目の出力の壁紙にする。`seed` は Lua の乱数の種。
+    /// 失敗したら、それまでの壁紙をそのまま残してエラーを返す。
+    fn load_content(&mut self, i: usize, seed: u64) -> Result<(), String> {
+        if self.is_shader() {
+            return self.load_shader(i);
+        }
+        let w = &mut self.wallpapers[i];
+        let (width, height) = w.output_size;
+        let script = Script::load(&self.args.script, &w.name, seed, width, height)?;
+        w.content = Some(Content::Lua(script));
+        Ok(())
+    }
+
+    /// i 番目の出力で壁紙を読み込めるか。シェーダーはコンパイルに EGL surface が要る。
+    /// Lua は出力のサイズが決まっていればよい。
+    fn can_load(&self, i: usize) -> bool {
+        let w = &self.wallpapers[i];
+        if self.is_shader() {
+            w.egl_surface.is_some()
+        } else {
+            w.output_size.0 != 0
+        }
     }
 
     fn find(&mut self, surface: &wl_surface::WlSurface) -> Option<&mut Wallpaper> {
         self.wallpapers.iter_mut().find(|w| w.surface() == surface)
     }
 
-    /// スクリプトのファイルを読み直す。読み込めた出力だけ新しいスクリプトに切り替える。
+    /// 壁紙のファイルを読み直す。読み込めた出力だけ新しい壁紙に切り替える。
     pub fn reload(&mut self) {
         eprintln!("kagegami: reloading {}", self.args.script.display());
-        if self.is_shader() {
-            for i in 0..self.wallpapers.len() {
-                if self.wallpapers[i].egl_surface.is_none() {
-                    continue;
-                }
-                match self.load_shader(i) {
-                    Ok(()) => {
-                        let w = &mut self.wallpapers[i];
-                        w.failed = false;
-                        w.last_frame = None;
-                        w.next_due = Instant::now();
-                    }
-                    Err(e) => report(&self.wallpapers[i].name, e),
-                }
-            }
-            return;
-        }
-        for w in &mut self.wallpapers {
-            if w.output_size.0 == 0 {
+        for i in 0..self.wallpapers.len() {
+            if !self.can_load(i) {
                 continue;
             }
             // 読み直すたびに新しい種を使う（#26）。README の「壁紙の書き方」と合わせて変える。
-            match Script::load(
-                &self.args.script,
-                &w.name,
-                seed_for(&w.seed),
-                w.output_size.0,
-                w.output_size.1,
-            ) {
-                Ok(s) => {
-                    w.script = Some(s);
+            let seed = seed_for(&self.wallpapers[i].seed);
+            match self.load_content(i, seed) {
+                Ok(()) => {
+                    let w = &mut self.wallpapers[i];
                     w.failed = false;
                     w.last_frame = None;
                     w.next_due = Instant::now();
                 }
-                Err(e) => report(&w.name, e),
+                Err(e) => report(&self.wallpapers[i].name, e),
             }
         }
     }
@@ -323,7 +332,7 @@ impl App {
             if w.failed && w.presented {
                 continue;
             }
-            if let Some(script) = &w.script
+            if let Some(Content::Lua(script)) = &w.content
                 && let Err(e) = script.set_mouse(&w.mouse)
             {
                 report(&w.name, e);
@@ -334,14 +343,13 @@ impl App {
             let dt = raw_dt.min(0.25);
             w.last_frame = Some(now);
 
-            let w = &self.wallpapers[i];
+            let w = &mut self.wallpapers[i];
             let es = w.egl_surface.as_ref().unwrap();
             if let Err(e) = self.egl.make_current(es) {
                 report(&w.name, e);
                 continue;
             }
             let renderer = ensure_renderer(&mut self.renderer, &self.egl);
-            let mut shader_state = w.shader.borrow_mut();
             #[cfg(feature = "gpu-bench")]
             let bench_t0 = self.bench.as_ref().map(|b| b.start(renderer.gl()));
             renderer.begin(w.buffer_size, w.output_size);
@@ -350,15 +358,14 @@ impl App {
             let glsl = self.bench.as_ref().is_some_and(|b| b.uses_glsl());
             #[cfg(not(feature = "gpu-bench"))]
             let glsl = false;
-            match &w.script {
+            match &mut w.content {
                 #[cfg(feature = "gpu-bench")]
                 _ if glsl => self.bench.as_mut().unwrap().draw_glsl(
                     renderer.gl(),
                     w.buffer_size.0,
                     w.buffer_size.1,
                 ),
-                _ if shader_state.is_some() && !w.failed => {
-                    let sh = shader_state.as_mut().unwrap();
+                Some(Content::Shader(sh)) if !w.failed => {
                     let gl = renderer.gl();
                     let slow = sh
                         .timer
@@ -398,7 +405,7 @@ impl App {
                         sh.frame = sh.frame.wrapping_add(1);
                     }
                 }
-                Some(script) if !w.failed => match script.frame(dt) {
+                Some(Content::Lua(script)) if !w.failed => match script.frame(dt) {
                     Ok(dl) => renderer.submit(&dl),
                     Err(e) => {
                         report(&w.name, e);
@@ -412,7 +419,7 @@ impl App {
             if let (Some(b), Some(t0)) = (self.bench.as_mut(), bench_t0) {
                 let label = if glsl {
                     "glsl"
-                } else if shader_state.is_some() {
+                } else if matches!(w.content, Some(Content::Shader(_))) {
                     "shader"
                 } else {
                     "lua"
@@ -420,10 +427,9 @@ impl App {
                 b.end(renderer.gl(), t0, label);
             }
             let _ = glsl;
-            drop(shader_state);
             if failed && w.presented {
                 // 直前のフレームを表示したまま止める。
-                self.wallpapers[i].failed = true;
+                w.failed = true;
                 continue;
             }
             #[cfg(debug_assertions)]
@@ -436,10 +442,10 @@ impl App {
 
             let surface = w.surface().clone();
             surface.frame(qh, FrameCallbackData(surface.clone()));
+            let es = w.egl_surface.as_ref().unwrap();
             if let Err(e) = self.egl.swap(es) {
                 report(&w.name, e);
             }
-            let w = &mut self.wallpapers[i];
             w.frame_pending = true;
             w.presented = true;
             w.failed |= failed;
@@ -596,46 +602,23 @@ impl App {
                 Err(e) => report(&w.name, e),
             },
         }
-        if self.is_shader() {
-            let w = &mut self.wallpapers[i];
-            w.frame_pending = false;
-            w.next_due = Instant::now();
-            // load_shader は shader を borrow_mut するので、borrow() は先に評価して手放しておく。
-            let needs_load = w.shader.borrow().is_none() && !w.failed && w.egl_surface.is_some();
-            if needs_load && let Err(e) = self.load_shader(i) {
+        let w = &mut self.wallpapers[i];
+        // 設定が変わったらすぐに描き直す。
+        w.frame_pending = false;
+        w.next_due = Instant::now();
+        if let Some(Content::Lua(script)) = &w.content
+            && let Err(e) = script.set_screen(w.output_size.0, w.output_size.1)
+        {
+            report(&w.name, e);
+        }
+        if w.content.is_none() && !w.failed && self.can_load(i) {
+            let seed = self.wallpapers[i].seed;
+            if let Err(e) = self.load_content(i, seed) {
                 let w = &mut self.wallpapers[i];
                 report(&w.name, e);
                 w.failed = true;
             }
-            return;
         }
-        let w = &mut self.wallpapers[i];
-        match &w.script {
-            Some(script) => {
-                if let Err(e) = script.set_screen(w.output_size.0, w.output_size.1) {
-                    report(&w.name, e);
-                }
-            }
-            None if !w.failed => {
-                match Script::load(
-                    &self.args.script,
-                    &w.name,
-                    w.seed,
-                    w.output_size.0,
-                    w.output_size.1,
-                ) {
-                    Ok(s) => w.script = Some(s),
-                    Err(e) => {
-                        report(&w.name, e);
-                        w.failed = true;
-                    }
-                }
-            }
-            None => {}
-        }
-        // 設定が変わったらすぐに描き直す。
-        w.frame_pending = false;
-        w.next_due = Instant::now();
     }
 }
 
@@ -704,7 +687,7 @@ impl PointerHandler for App {
             let y = (event.position.1 * w.output_scale as f64) as f32;
             w.drag.apply(&event.kind, x, y);
             let click = pointer::apply_to_lua_mouse(&mut w.mouse, &w.drag, &event.kind, x, y);
-            if let (Some(ev), Some(script)) = (click, &w.script) {
+            if let (Some(ev), Some(Content::Lua(script))) = (click, &w.content) {
                 if w.failed {
                     continue;
                 }
