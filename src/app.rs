@@ -446,6 +446,8 @@ impl App {
             .ok_or("no EGL surface")?;
         self.egl.make_current(es)?;
         let gl = ensure_renderer(&mut self.renderer, &self.egl).gl();
+        // コンパイルできないシェーダーのために画像を読まないように、先にコンパイルする。
+        let program = ShaderProgram::new(gl, &src)?;
         let cache = &mut self.channels;
         let reuse = !cache.stale && cache.current.as_ref().is_some_and(|(s, _)| *s == src);
         if !reuse {
@@ -454,13 +456,18 @@ impl App {
                 cache.retired.push(old);
             }
             cache.stale = false;
+            // 読み直しに失敗し続けても、どの出力も使っていない画像が溜まらないようにする。
+            cache.collect(gl);
         }
         let channels = match &cache.current {
             Some((_, Ok(ch))) => Rc::clone(ch),
-            Some((_, Err(e))) => return Err(e.clone()),
+            Some((_, Err(e))) => {
+                let e = e.clone();
+                program.delete(gl);
+                return Err(e);
+            }
             None => unreachable!(),
         };
-        let program = ShaderProgram::new(gl, &src)?;
         let old = match self.wallpapers[i].content.take() {
             Some(Content::Shader(old)) => Some(old),
             _ => None,
