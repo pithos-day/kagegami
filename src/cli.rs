@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-pub const USAGE: &str = "usage: kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] <wallpaper.lua|wallpaper.glsl>";
+pub const USAGE: &str = "usage: kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] [-p] <wallpaper.lua|wallpaper.glsl>";
 
 /// `--scale` で受け付ける範囲。
 pub const SCALE_MIN: f64 = 0.25;
@@ -36,6 +36,8 @@ pub struct Args {
     pub render_scale: f64,
     pub layer: LayerName,
     pub output: OutputSelector,
+    /// `--perf`: 負荷を標準エラー出力へ出し続ける。
+    pub perf: bool,
     pub script: PathBuf,
 }
 
@@ -50,11 +52,13 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, Str
     let mut render_scale = 1.0;
     let mut layer = LayerName::Background;
     let mut output = OutputSelector::All;
+    let mut perf = false;
     let mut positional = Vec::new();
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(ParseResult::Help),
+            "-p" | "--perf" => perf = true,
             "-o" | "--output" => {
                 let v = iter.next().ok_or(format!("{arg} requires a value"))?;
                 output = OutputSelector::Name(v);
@@ -106,6 +110,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, Str
         render_scale,
         layer,
         output,
+        perf,
         script: PathBuf::from(script),
     }))
 }
@@ -134,6 +139,7 @@ mod tests {
                 render_scale: 1.0,
                 layer: LayerName::Background,
                 output: OutputSelector::All,
+                perf: false,
                 script: "a.lua".into()
             }
         );
@@ -150,6 +156,15 @@ mod tests {
         let a = run(&["-f", "120", "-l", "top", "a.lua"]);
         assert_eq!(a.fps, 120.0);
         assert_eq!(a.layer, LayerName::Top);
+    }
+
+    #[test]
+    fn parses_perf() {
+        assert!(run(&["-p", "a.lua"]).perf);
+        assert!(run(&["a.lua", "--perf"]).perf);
+        assert!(!run(&["a.lua"]).perf);
+        // -s は --scale のまま。
+        assert!(p(&["-s", "a.lua"]).is_err());
     }
 
     #[test]

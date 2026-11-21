@@ -31,10 +31,12 @@ use wayland_protocols::wp::viewporter::client::{
 
 use crate::cli::{Args, LayerName};
 use crate::egl::{EglContext, EglSurface};
+use crate::perf::{self, OutputStats};
 use crate::pointer::{self, Drag};
 use crate::render::Renderer;
-use crate::script::{MouseState, Script};
+use crate::script::{self, MouseState, Script};
 use crate::shader::{self, GpuTimer, ShaderProgram};
+use crate::stderr::elog;
 
 /// 出力ごとに違う乱数の種を作る。
 fn seed_for<T: std::hash::Hash>(salt: &T) -> u64 {
@@ -62,7 +64,7 @@ impl From<LayerName> for Layer {
 
 /// 出力ごとのエラーを、出力の名前を付けて出す。
 fn report(output: &str, e: impl std::fmt::Display) {
-    eprintln!("kagegami: {output}: {e}");
+    elog!("kagegami: {output}: {e}");
 }
 
 /// 描画の準備ができていなければ作る。作れなければ続けられないので終了する。
@@ -72,7 +74,7 @@ fn ensure_renderer<'a>(renderer: &'a mut Option<Renderer>, egl: &EglContext) -> 
         match Renderer::new(egl) {
             Ok(r) => *renderer = Some(r),
             Err(e) => {
-                eprintln!("kagegami: {e}");
+                elog!("kagegami: {e}");
                 std::process::exit(1);
             }
         }
@@ -115,6 +117,20 @@ pub struct Wallpaper {
     mouse: MouseState,
     /// シェーダーの `iMouse` と、Lua の `mouse.press_x`・`press_y`・`dragging`。
     drag: Drag,
+    /// `--perf` で出す負荷の集計。
+    stats: OutputStats,
+    /// `--perf` のときだけ使う、Lua の壁紙の GPU 時間を測るタイマー。
+    /// 描画するときに作る（EGL surface より先に Lua を読み込むことがあるため）。
+    lua_timer: LuaTimer,
+}
+
+/// Lua の壁紙の GPU 時間を測るタイマーの状態。
+enum LuaTimer {
+    /// まだ作っていない。
+    Unchecked,
+    /// 拡張機能がなく、作れなかった。GPU 時間は出さない。
+    Unavailable,
+    Ready(GpuTimer),
 }
 
 /// 壁紙の中身。種類は起動時のファイルの拡張子で決まり、読み直しても変わらない。
@@ -141,12 +157,11 @@ impl ShaderState {
         mouse: [f32; 4],
         now: Instant,
         dt: f64,
+        stats: &mut OutputStats,
     ) -> Result<(), String> {
-        let slow = self
-            .timer
-            .as_mut()
-            .and_then(|t| t.poll(gl))
-            .filter(|d| *d > shader::FRAME_GPU_LIMIT);
+        let times = self.timer.as_mut().map(|t| t.poll(gl)).unwrap_or_default();
+        stats.gpu(times.as_slice());
+        let slow = times.longest().filter(|d| *d > shader::FRAME_GPU_LIMIT);
         if let Some(d) = slow {
             return Err(format!(
                 "shader took {} ms on the GPU in one frame (limit {} ms)",
@@ -192,11 +207,25 @@ fn draw_content(
                 w.output_size,
                 w.drag.imouse(w.output_size.1 as f32),
             );
-            sh.draw(renderer.gl(), w.buffer_size, mouse, now, dt)
+            sh.draw(renderer.gl(), w.buffer_size, mouse, now, dt, &mut w.stats)
         }
         Some(Content::Lua(script)) if !w.failed => {
+            let timer = match &mut w.lua_timer {
+                LuaTimer::Ready(t) => Some(t),
+                _ => None,
+            };
+            let t0 = Instant::now();
             let dl = script.frame(dt.min(MAX_LUA_DT))?;
-            renderer.submit(&dl);
+            w.stats.lua(t0.elapsed(), dl.batch.quads());
+            match timer {
+                Some(t) => {
+                    w.stats.gpu(t.poll(renderer.gl()).as_slice());
+                    t.begin(renderer.gl());
+                    renderer.submit(&dl);
+                    t.end(renderer.gl());
+                }
+                None => renderer.submit(&dl),
+            }
             Ok(())
         }
         _ => {
@@ -227,9 +256,26 @@ pub struct App {
     args: Args,
     frame_period: Duration,
     wallpapers: Vec<Wallpaper>,
+    /// `--perf` のときだけ Some。
+    perf: Option<PerfState>,
     #[cfg(feature = "gpu-bench")]
     bench: Option<crate::bench::Bench>,
 }
+
+/// `--perf` の表示の状態。
+struct PerfState {
+    /// 標準エラー出力が端末か。端末なら最後の行を書き換え、そうでなければ 1 行ずつ出す。
+    tty: bool,
+    /// 前に表示した時刻。
+    last: Instant,
+    meter: perf::ProcessMeter,
+}
+
+const PERF_LIMITS: perf::Limits = perf::Limits {
+    lua: script::FRAME_BUDGET,
+    quads: script::MAX_FRAME_QUADS,
+    shader_gpu: shader::FRAME_GPU_LIMIT,
+};
 
 impl App {
     /// Wayland の global を bind し、EGL を初期化する。壁紙は出力が見つかったときに作る。
@@ -266,6 +312,11 @@ impl App {
             renderer: None,
             timer_warned: false,
             frame_period: Duration::from_secs_f64(1.0 / args.fps),
+            perf: args.perf.then(|| PerfState {
+                tty: std::io::IsTerminal::is_terminal(&std::io::stderr()),
+                last: Instant::now(),
+                meter: perf::ProcessMeter::new(),
+            }),
             args,
             wallpapers: Vec::new(),
             #[cfg(feature = "gpu-bench")]
@@ -305,7 +356,7 @@ impl App {
             layer.wl_surface().set_buffer_scale(output_scale);
         }
         layer.commit();
-        eprintln!("kagegami: attached to output {name}");
+        elog!("kagegami: attached to output {name}");
         self.wallpapers.push(Wallpaper {
             output,
             name,
@@ -325,6 +376,8 @@ impl App {
             seed: seed_for(&self.wallpapers.len()),
             mouse: MouseState::default(),
             drag: Drag::default(),
+            stats: OutputStats::default(),
+            lua_timer: LuaTimer::Unchecked,
         });
     }
 
@@ -361,7 +414,7 @@ impl App {
                 let t = GpuTimer::new(gl, |n| self.egl.proc_address(n));
                 if t.is_none() && !self.timer_warned {
                     self.timer_warned = true;
-                    eprintln!(
+                    elog!(
                         "kagegami: warning: GL_EXT_disjoint_timer_query is not available; \
                          shaders that take too long on the GPU will not be stopped"
                     );
@@ -407,7 +460,7 @@ impl App {
 
     /// 壁紙のファイルを読み直す。読み込めた出力だけ新しい壁紙に切り替える。
     pub fn reload(&mut self) {
-        eprintln!("kagegami: reloading {}", self.args.script.display());
+        elog!("kagegami: reloading {}", self.args.script.display());
         for i in 0..self.wallpapers.len() {
             if !self.can_load(i) {
                 continue;
@@ -417,6 +470,11 @@ impl App {
             match self.load_content(i, seed) {
                 Ok(()) => {
                     let w = &mut self.wallpapers[i];
+                    // 直したあとの負荷だけを見られるように、最大値も消す。
+                    w.stats.reset();
+                    if let LuaTimer::Ready(t) = &mut w.lua_timer {
+                        t.reset();
+                    }
                     w.failed = false;
                     w.last_frame = None;
                     w.next_due = Instant::now();
@@ -434,6 +492,61 @@ impl App {
             .filter(|w| w.egl_surface.is_some() && !w.frame_pending && !(w.failed && w.presented))
             .map(|w| w.next_due.saturating_duration_since(now))
             .min()
+    }
+
+    /// 次に `--perf` の表示を更新する時刻までの待ち時間。`--perf` でなければ None。
+    pub fn perf_timeout(&self, now: Instant) -> Option<Duration> {
+        let p = self.perf.as_ref()?;
+        Some((p.last + perf::INTERVAL).saturating_duration_since(now))
+    }
+
+    /// 前の表示から `perf::INTERVAL` 経っていれば、負荷の表示を更新する。
+    pub fn perf_tick(&mut self, now: Instant) {
+        let Some(p) = self.perf.as_mut() else {
+            return;
+        };
+        if now < p.last + perf::INTERVAL {
+            return;
+        }
+        let elapsed = now.duration_since(p.last);
+        p.last = now;
+        let shader_file = shader::is_shader_path(&self.args.script);
+        let mut lua_bytes = None;
+        let rows: Vec<_> = self
+            .wallpapers
+            .iter_mut()
+            .map(|w| {
+                let kind = match &w.content {
+                    Some(Content::Shader(_)) => perf::Kind::Shader,
+                    Some(Content::Lua(script)) => {
+                        *lua_bytes.get_or_insert(0) += script.used_memory();
+                        perf::Kind::Lua
+                    }
+                    None if shader_file => perf::Kind::Shader,
+                    None => perf::Kind::Lua,
+                };
+                perf::take_row(&w.name, kind, w.failed, &mut w.stats, elapsed)
+            })
+            .collect();
+        let (cpu_percent, rss_bytes) = p.meter.sample(now);
+        let process = perf::ProcessRow {
+            cpu_percent,
+            rss_bytes,
+            lua_bytes,
+        };
+        if p.tty {
+            crate::stderr::redraw_block(&perf::format_tty(
+                &rows,
+                &process,
+                self.args.fps,
+                &PERF_LIMITS,
+            ));
+        } else {
+            elog!(
+                "{}",
+                perf::format_logfmt(&rows, &process, self.args.fps, &PERF_LIMITS)
+            );
+        }
     }
 
     pub fn render_due(&mut self, qh: &QueueHandle<Self>, now: Instant) {
@@ -470,6 +583,15 @@ impl App {
             return;
         }
         let renderer = ensure_renderer(&mut self.renderer, &self.egl);
+        if self.perf.is_some()
+            && matches!(w.content, Some(Content::Lua(_)))
+            && matches!(w.lua_timer, LuaTimer::Unchecked)
+        {
+            w.lua_timer = match GpuTimer::new(renderer.gl(), |n| self.egl.proc_address(n)) {
+                Some(t) => LuaTimer::Ready(t),
+                None => LuaTimer::Unavailable,
+            };
+        }
         #[cfg(feature = "gpu-bench")]
         let bench_t0 = self.bench.as_ref().map(|b| b.start(renderer.gl()));
         renderer.begin(w.buffer_size, w.output_size);
@@ -523,6 +645,7 @@ impl App {
         }
         w.frame_pending = true;
         w.presented = true;
+        w.stats.frame();
         w.failed |= failed;
         w.drag.frame_rendered();
     }
@@ -615,7 +738,7 @@ impl OutputHandler for App {
     ) {
         if let Some(i) = self.wallpapers.iter().position(|w| w.output == output) {
             let mut w = self.wallpapers.remove(i);
-            eprintln!("kagegami: output {} removed", w.name);
+            elog!("kagegami: output {} removed", w.name);
             if let Some(s) = w.egl_surface.take() {
                 self.egl.destroy_surface(s);
             }
@@ -724,7 +847,7 @@ impl SeatHandler for App {
         if capability == Capability::Pointer && self.pointer.is_none() {
             match self.seat_state.get_pointer(qh, &seat) {
                 Ok(p) => self.pointer = Some(p),
-                Err(e) => eprintln!("kagegami: pointer: {e}"),
+                Err(e) => elog!("kagegami: pointer: {e}"),
             }
         }
     }

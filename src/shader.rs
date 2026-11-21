@@ -188,6 +188,29 @@ const QUERIES: usize = 3;
 
 type GetQueryObjectUi64v = unsafe extern "system" fn(u32, u32, *mut u64);
 
+/// `GpuTimer::poll` で届いた、1 フレームごとの GPU 時間。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct GpuTimes {
+    times: [Duration; QUERIES],
+    len: usize,
+}
+
+impl GpuTimes {
+    fn push(&mut self, d: Duration) {
+        self.times[self.len] = d;
+        self.len += 1;
+    }
+
+    pub fn as_slice(&self) -> &[Duration] {
+        &self.times[..self.len]
+    }
+
+    /// 最も長い GPU 時間。届いた結果がなければ None。
+    pub fn longest(&self) -> Option<Duration> {
+        self.as_slice().iter().copied().max()
+    }
+}
+
 /// 1 フレームの GPU 時間を測る。結果は描いた次のフレーム以降に届く。
 pub struct GpuTimer {
     queries: [glow::Query; QUERIES],
@@ -238,9 +261,9 @@ impl GpuTimer {
         self.in_flight = [false; QUERIES];
     }
 
-    /// 届いた結果のうち最も長い GPU 時間。disjoint が起きていたら、その間の結果は捨てる。
-    pub fn poll(&mut self, gl: &glow::Context) -> Option<Duration> {
-        let mut longest: Option<Duration> = None;
+    /// 届いた結果。disjoint が起きていたら、その間の結果は捨てる。
+    pub fn poll(&mut self, gl: &glow::Context) -> GpuTimes {
+        let mut times = GpuTimes::default();
         for i in 0..QUERIES {
             if !self.in_flight[i] {
                 continue;
@@ -254,11 +277,10 @@ impl GpuTimer {
             let mut ns = 0u64;
             unsafe { (self.get_u64)(q.0.get(), glow::QUERY_RESULT, &mut ns) };
             self.in_flight[i] = false;
-            let d = Duration::from_nanos(ns);
-            longest = Some(longest.map_or(d, |l| l.max(d)));
+            times.push(Duration::from_nanos(ns));
         }
         let disjoint = unsafe { gl.get_parameter_i32(GPU_DISJOINT_EXT) } != 0;
-        if disjoint { None } else { longest }
+        if disjoint { GpuTimes::default() } else { times }
     }
 
     /// 測り始める。空いているクエリーがなければ、このフレームは測らない。
@@ -285,6 +307,17 @@ impl GpuTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_times_keep_every_result() {
+        let mut t = GpuTimes::default();
+        assert_eq!(t.longest(), None);
+        t.push(Duration::from_millis(2));
+        t.push(Duration::from_millis(5));
+        t.push(Duration::from_millis(3));
+        assert_eq!(t.as_slice().len(), 3);
+        assert_eq!(t.longest(), Some(Duration::from_millis(5)));
+    }
 
     #[test]
     fn picks_shader_by_extension() {

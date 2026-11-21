@@ -4,10 +4,12 @@ mod bench;
 mod cli;
 mod egl;
 mod gl_program;
+mod perf;
 mod pointer;
 mod render;
 mod script;
 mod shader;
+mod stderr;
 mod watcher;
 
 use std::os::fd::AsRawFd;
@@ -32,7 +34,7 @@ fn main() -> ExitCode {
     match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("kagegami: {e}");
+            stderr::elog!("kagegami: {e}");
             ExitCode::FAILURE
         }
     }
@@ -60,15 +62,17 @@ fn run(args: cli::Args) -> Result<(), String> {
             app.reload();
         }
         app.render_due(&qh, Instant::now());
+        app.perf_tick(Instant::now());
         queue.flush().map_err(|e| e.to_string())?;
 
         let Some(guard) = queue.prepare_read() else {
             continue;
         };
         let now = Instant::now();
-        let timeout = app
-            .next_timeout(now)
-            .map_or(watcher.until_next(now), |t| t.min(watcher.until_next(now)));
+        let timeout = [app.next_timeout(now), app.perf_timeout(now)]
+            .into_iter()
+            .flatten()
+            .fold(watcher.until_next(now), Duration::min);
         wait_and_read(guard, timeout)?;
     }
 }
