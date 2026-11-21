@@ -131,6 +131,80 @@ struct ShaderState {
     frame: i32,
 }
 
+impl ShaderState {
+    /// 1 フレーム描く。前のフレームまでに測れた GPU 時間が上限を超えていたら、描かずにエラーを返す。
+    fn draw(
+        &mut self,
+        gl: &glow::Context,
+        resolution: (u32, u32),
+        mouse: [f32; 4],
+        now: Instant,
+        dt: f64,
+    ) -> Result<(), String> {
+        let slow = self
+            .timer
+            .as_mut()
+            .and_then(|t| t.poll(gl))
+            .filter(|d| *d > shader::FRAME_GPU_LIMIT);
+        if let Some(d) = slow {
+            return Err(format!(
+                "shader took {} ms on the GPU in one frame (limit {} ms)",
+                d.as_millis(),
+                shader::FRAME_GPU_LIMIT.as_millis()
+            ));
+        }
+        let u = shader::Uniforms {
+            resolution,
+            time: now.duration_since(self.started).as_secs_f32(),
+            time_delta: dt as f32,
+            frame: self.frame,
+            mouse,
+            date: shader::local_date(),
+        };
+        if let Some(t) = self.timer.as_mut() {
+            t.begin(gl);
+        }
+        self.program.draw(gl, &u);
+        if let Some(t) = self.timer.as_mut() {
+            t.end(gl);
+        }
+        self.frame = self.frame.wrapping_add(1);
+        Ok(())
+    }
+}
+
+/// Lua の `update` に渡す `dt` の上限（秒）。README の `update(dt)` の説明と合わせて変える。
+const MAX_LUA_DT: f64 = 0.25;
+
+/// 壁紙の中身を 1 フレーム描く。`dt` は前のフレームからの秒数。読み込めていないときや、
+/// エラーで止まっているときは黒で塗る。壁紙を止めるべきエラーが起きたら、そのメッセージを返す。
+fn draw_content(
+    w: &mut Wallpaper,
+    renderer: &mut Renderer,
+    now: Instant,
+    dt: f64,
+) -> Result<(), String> {
+    match &mut w.content {
+        Some(Content::Shader(sh)) if !w.failed => {
+            let mouse = shader::mouse_to_buffer_px(
+                w.buffer_size,
+                w.output_size,
+                w.drag.imouse(w.output_size.1 as f32),
+            );
+            sh.draw(renderer.gl(), w.buffer_size, mouse, now, dt)
+        }
+        Some(Content::Lua(script)) if !w.failed => {
+            let dl = script.frame(dt.min(MAX_LUA_DT))?;
+            renderer.submit(&dl);
+            Ok(())
+        }
+        _ => {
+            renderer.clear(0.0, 0.0, 0.0);
+            Ok(())
+        }
+    }
+}
+
 impl Wallpaper {
     fn surface(&self) -> &wl_surface::WlSurface {
         self.layer.wl_surface()
@@ -329,128 +403,87 @@ impl App {
             }
             // 遅れた場合は追いつこうとせず、今から 1 周期後にする。
             w.next_due = (w.next_due + self.frame_period).max(now);
+            // エラーで止まった壁紙は、直前のフレームを表示したまま描き直さない。
             if w.failed && w.presented {
                 continue;
             }
-            if let Some(Content::Lua(script)) = &w.content
-                && let Err(e) = script.set_mouse(&w.mouse)
-            {
-                report(&w.name, e);
-            }
-            let raw_dt = w
-                .last_frame
-                .map_or(0.0, |t| now.duration_since(t).as_secs_f64());
-            let dt = raw_dt.min(0.25);
-            w.last_frame = Some(now);
-
-            let w = &mut self.wallpapers[i];
-            let es = w.egl_surface.as_ref().unwrap();
-            if let Err(e) = self.egl.make_current(es) {
-                report(&w.name, e);
-                continue;
-            }
-            let renderer = ensure_renderer(&mut self.renderer, &self.egl);
-            #[cfg(feature = "gpu-bench")]
-            let bench_t0 = self.bench.as_ref().map(|b| b.start(renderer.gl()));
-            renderer.begin(w.buffer_size, w.output_size);
-            let mut failed = false;
-            #[cfg(feature = "gpu-bench")]
-            let glsl = self.bench.as_ref().is_some_and(|b| b.uses_glsl());
-            #[cfg(not(feature = "gpu-bench"))]
-            let glsl = false;
-            match &mut w.content {
-                #[cfg(feature = "gpu-bench")]
-                _ if glsl => self.bench.as_mut().unwrap().draw_glsl(
-                    renderer.gl(),
-                    w.buffer_size.0,
-                    w.buffer_size.1,
-                ),
-                Some(Content::Shader(sh)) if !w.failed => {
-                    let gl = renderer.gl();
-                    let slow = sh
-                        .timer
-                        .as_mut()
-                        .and_then(|t| t.poll(gl))
-                        .filter(|d| *d > shader::FRAME_GPU_LIMIT);
-                    if let Some(d) = slow {
-                        eprintln!(
-                            "kagegami: {}: shader took {} ms on the GPU in one frame (limit {} ms)",
-                            w.name,
-                            d.as_millis(),
-                            shader::FRAME_GPU_LIMIT.as_millis()
-                        );
-                        failed = true;
-                        renderer.clear(0.0, 0.0, 0.0);
-                    } else {
-                        let mouse = shader::mouse_to_buffer_px(
-                            w.buffer_size,
-                            w.output_size,
-                            w.drag.imouse(w.output_size.1 as f32),
-                        );
-                        let u = shader::Uniforms {
-                            resolution: w.buffer_size,
-                            time: now.duration_since(sh.started).as_secs_f32(),
-                            time_delta: raw_dt as f32,
-                            frame: sh.frame,
-                            mouse,
-                            date: shader::local_date(),
-                        };
-                        if let Some(t) = sh.timer.as_mut() {
-                            t.begin(gl);
-                        }
-                        sh.program.draw(gl, &u);
-                        if let Some(t) = sh.timer.as_mut() {
-                            t.end(gl);
-                        }
-                        sh.frame = sh.frame.wrapping_add(1);
-                    }
-                }
-                Some(Content::Lua(script)) if !w.failed => match script.frame(dt) {
-                    Ok(dl) => renderer.submit(&dl),
-                    Err(e) => {
-                        report(&w.name, e);
-                        failed = true;
-                        renderer.clear(0.0, 0.0, 0.0);
-                    }
-                },
-                _ => renderer.clear(0.0, 0.0, 0.0),
-            }
-            #[cfg(feature = "gpu-bench")]
-            if let (Some(b), Some(t0)) = (self.bench.as_mut(), bench_t0) {
-                let label = if glsl {
-                    "glsl"
-                } else if matches!(w.content, Some(Content::Shader(_))) {
-                    "shader"
-                } else {
-                    "lua"
-                };
-                b.end(renderer.gl(), t0, label);
-            }
-            let _ = glsl;
-            if failed && w.presented {
-                // 直前のフレームを表示したまま止める。
-                w.failed = true;
-                continue;
-            }
-            #[cfg(debug_assertions)]
-            if let Ok(dir) = std::env::var("KAGEGAMI_DUMP_DIR") {
-                let path = format!("{dir}/{}.ppm", w.name);
-                if !std::path::Path::new(&path).exists() {
-                    let _ = renderer.dump_ppm(w.buffer_size.0, w.buffer_size.1, &path);
-                }
-            }
-
-            let surface = w.surface().clone();
-            surface.frame(qh, FrameCallbackData(surface.clone()));
-            let es = w.egl_surface.as_ref().unwrap();
-            if let Err(e) = self.egl.swap(es) {
-                report(&w.name, e);
-            }
-            w.frame_pending = true;
-            w.presented = true;
-            w.failed |= failed;
-            w.drag.frame_rendered();
+            self.render(i, qh, now);
         }
+    }
+
+    /// i 番目の出力の壁紙を 1 フレーム描いて提示する。
+    fn render(&mut self, i: usize, qh: &QueueHandle<Self>, now: Instant) {
+        let w = &mut self.wallpapers[i];
+        if let Some(Content::Lua(script)) = &w.content
+            && let Err(e) = script.set_mouse(&w.mouse)
+        {
+            report(&w.name, e);
+        }
+        let dt = w
+            .last_frame
+            .map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+        w.last_frame = Some(now);
+
+        if let Err(e) = self.egl.make_current(w.egl_surface.as_ref().unwrap()) {
+            report(&w.name, e);
+            return;
+        }
+        let renderer = ensure_renderer(&mut self.renderer, &self.egl);
+        #[cfg(feature = "gpu-bench")]
+        let bench_t0 = self.bench.as_ref().map(|b| b.start(renderer.gl()));
+        renderer.begin(w.buffer_size, w.output_size);
+        #[cfg(feature = "gpu-bench")]
+        let result = match self.bench.as_mut() {
+            // 比較用のシェーダーは、壁紙がエラーで止まっていても描く。
+            Some(b) if b.uses_glsl() => {
+                b.draw_glsl(renderer.gl(), w.buffer_size.0, w.buffer_size.1);
+                Ok(())
+            }
+            _ => draw_content(w, renderer, now, dt),
+        };
+        #[cfg(not(feature = "gpu-bench"))]
+        let result = draw_content(w, renderer, now, dt);
+        let failed = match result {
+            Ok(()) => false,
+            Err(e) => {
+                report(&w.name, e);
+                renderer.clear(0.0, 0.0, 0.0);
+                true
+            }
+        };
+        #[cfg(feature = "gpu-bench")]
+        if let (Some(b), Some(t0)) = (self.bench.as_mut(), bench_t0) {
+            let label = if b.uses_glsl() {
+                "glsl"
+            } else if matches!(w.content, Some(Content::Shader(_))) {
+                "shader"
+            } else {
+                "lua"
+            };
+            b.end(renderer.gl(), t0, label);
+        }
+        if failed && w.presented {
+            // 直前のフレームを表示したまま止める。
+            w.failed = true;
+            return;
+        }
+        #[cfg(debug_assertions)]
+        if let Ok(dir) = std::env::var("KAGEGAMI_DUMP_DIR") {
+            let path = format!("{dir}/{}.ppm", w.name);
+            if !std::path::Path::new(&path).exists() {
+                let _ = renderer.dump_ppm(w.buffer_size.0, w.buffer_size.1, &path);
+            }
+        }
+
+        let surface = w.surface().clone();
+        surface.frame(qh, FrameCallbackData(surface.clone()));
+        if let Err(e) = self.egl.swap(w.egl_surface.as_ref().unwrap()) {
+            report(&w.name, e);
+        }
+        w.frame_pending = true;
+        w.presented = true;
+        w.failed |= failed;
+        w.drag.frame_rendered();
     }
 }
 
