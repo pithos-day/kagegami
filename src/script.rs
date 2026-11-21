@@ -536,15 +536,17 @@ mod tests {
     }
 
     #[test]
-    fn every_lua_example_loads() {
+    fn every_lua_example_loads_and_draws_a_frame() {
         let mut names = Vec::new();
         for entry in std::fs::read_dir("examples").unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|e| e == "lua") {
                 let src = std::fs::read_to_string(&path).unwrap();
                 let name = path.display().to_string();
-                if let Err(e) = Script::from_source(&src, &name, "A", 1, (1920, 1080)) {
-                    panic!("{name} を読み込めない: {e}");
+                let s = Script::from_source(&src, &name, "A", 1, (1920, 1080))
+                    .unwrap_or_else(|e| panic!("{name} を読み込めない: {e}"));
+                if let Err(e) = s.frame(1.0 / 60.0) {
+                    panic!("{name} の 1 フレーム目でエラーになる: {e}");
                 }
                 names.push(name);
             }
