@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use glow::HasContext;
 
+use crate::directive::ImageSpec;
 use crate::gl_program::{self, ProgramError};
+use crate::texture::{self, Texture};
 
 /// 1 フレームの GPU 時間の上限。Lua の毎フレームの制限と同じ値。
 pub const FRAME_GPU_LIMIT: Duration = Duration::from_millis(250);
@@ -31,6 +33,11 @@ uniform float iTimeDelta;
 uniform int iFrame;
 uniform vec4 iMouse;
 uniform vec4 iDate;
+uniform sampler2D iChannel0;
+uniform sampler2D iChannel1;
+uniform sampler2D iChannel2;
+uniform sampler2D iChannel3;
+uniform vec3 iChannelResolution[4];
 out vec4 kagegami_FragColor;
 #line 1
 ";
@@ -101,10 +108,92 @@ pub struct Uniforms {
     pub date: [f32; 4],
 }
 
+/// `iChannel0`〜`3` に渡す画像。画像を指定していないチャンネルは黒い 1×1 のテクスチャーにする。
+pub struct Channels {
+    images: [Option<Texture>; 4],
+    black: Texture,
+}
+
+impl Channels {
+    /// 指定された画像をデコードしてテクスチャーにする。デコードは画像ごとに別のスレッドで並べて行う。
+    /// どれか 1 つでも読めなければ、作ったテクスチャーを消してエラーを返す。
+    /// エラーは `<壁紙のファイル>:<行>: <画像のパス>: <内容>` の形。
+    pub fn load(gl: &glow::Context, specs: &[ImageSpec], wallpaper: &Path) -> Result<Self, String> {
+        let max = texture::max_size(gl);
+        let decoded: Vec<Result<crate::image::Image, String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = specs
+                .iter()
+                .map(|spec| {
+                    s.spawn(move || {
+                        let mut img = crate::image::load(&spec.resolve(wallpaper), max)?;
+                        if spec.sampler.vflip {
+                            img.flip_rows();
+                        }
+                        Ok(img)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("image decoder panicked".into()))
+                })
+                .collect()
+        });
+        let mut images: [Option<Texture>; 4] = Default::default();
+        let mut result = Ok(());
+        for (spec, img) in specs.iter().zip(decoded) {
+            let tex = img.and_then(|img| texture::upload(gl, &img, spec.sampler));
+            match tex {
+                Ok(t) => images[spec.name.parse::<usize>().unwrap_or(0)] = Some(t),
+                Err(e) => {
+                    result = Err(format!("{}:{}: {e}", wallpaper.display(), spec.line));
+                    break;
+                }
+            }
+        }
+        let black = result.and_then(|()| texture::black(gl));
+        match black {
+            Ok(black) => Ok(Self { images, black }),
+            Err(e) => {
+                for t in images.into_iter().flatten() {
+                    texture::delete(gl, t);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// `iChannelResolution`。画像を指定していないチャンネルは (0, 0, 0)。
+    pub fn resolutions(&self) -> [f32; 12] {
+        let mut r = [0.0; 12];
+        for (i, t) in self.images.iter().enumerate() {
+            if let Some(t) = t {
+                r[i * 3] = t.width as f32;
+                r[i * 3 + 1] = t.height as f32;
+                r[i * 3 + 2] = 1.0;
+            }
+        }
+        r
+    }
+
+    fn texture(&self, i: usize) -> glow::Texture {
+        self.images[i].as_ref().unwrap_or(&self.black).tex
+    }
+
+    pub fn delete(self, gl: &glow::Context) {
+        for t in self.images.into_iter().flatten() {
+            texture::delete(gl, t);
+        }
+        texture::delete(gl, self.black);
+    }
+}
+
 pub struct ShaderProgram {
     program: glow::Program,
     vao: glow::VertexArray,
-    loc: [Option<glow::UniformLocation>; 6],
+    loc: [Option<glow::UniformLocation>; 7],
 }
 
 impl ShaderProgram {
@@ -140,14 +229,21 @@ impl ShaderProgram {
                 "iFrame",
                 "iMouse",
                 "iDate",
+                "iChannelResolution[0]",
             ]
             .map(|n| gl.get_uniform_location(program, n));
+            // sampler の uniform は既定ですべてユニット 0 を指すので、チャンネルの番号のユニットにする。
+            gl.use_program(Some(program));
+            for i in 0..4 {
+                let l = gl.get_uniform_location(program, &format!("iChannel{i}"));
+                gl.uniform_1_i32(l.as_ref(), i);
+            }
             Ok(Self { program, vao, loc })
         }
     }
 
-    pub fn draw(&self, gl: &glow::Context, u: &Uniforms) {
-        let [res, time, dt, frame, mouse, date] = &self.loc;
+    pub fn draw(&self, gl: &glow::Context, u: &Uniforms, channels: &Channels) {
+        let [res, time, dt, frame, mouse, date, channel_res] = &self.loc;
         unsafe {
             gl.viewport(0, 0, u.resolution.0 as i32, u.resolution.1 as i32);
             gl.use_program(Some(self.program));
@@ -164,6 +260,12 @@ impl ShaderProgram {
             gl.uniform_4_f32(mouse.as_ref(), mx, my, mz, mw);
             let [dy, dm, dd, ds] = u.date;
             gl.uniform_4_f32(date.as_ref(), dy, dm, dd, ds);
+            gl.uniform_3_f32_slice(channel_res.as_ref(), &channels.resolutions());
+            for i in 0..4 {
+                gl.active_texture(glow::TEXTURE0 + i as u32);
+                gl.bind_texture(glow::TEXTURE_2D, Some(channels.texture(i)));
+            }
+            gl.active_texture(glow::TEXTURE0);
             gl.disable(glow::BLEND);
             // 図形の描画が使う既定の VAO の設定を壊さないように、専用の空の VAO で描く。
             gl.bind_vertex_array(Some(self.vao));
@@ -332,8 +434,27 @@ mod tests {
         let s = wrap("void mainImage(out vec4 c, in vec2 p) { c = vec4(1.0); }");
         assert!(s.starts_with("#version 300 es\n"));
         assert!(s.contains("uniform int iFrame;"));
+        assert!(s.contains("uniform sampler2D iChannel3;"));
+        assert!(s.contains("uniform vec3 iChannelResolution[4];"));
         assert!(s.contains("#line 1\nvoid mainImage"));
         assert!(s.contains("vec4(kagegami_c.rgb, 1.0)"));
+    }
+
+    #[test]
+    fn every_shader_example_names_images_that_decode() {
+        for entry in std::fs::read_dir("examples").unwrap() {
+            let path = entry.unwrap().path();
+            if !is_shader_path(&path) {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            let specs = crate::directive::parse(&src, crate::directive::Syntax::Glsl)
+                .unwrap_or_else(|e| panic!("{}:{e}", path.display()));
+            for spec in specs {
+                crate::image::load(&spec.resolve(&path), 2048)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            }
+        }
     }
 
     #[test]
