@@ -3,14 +3,15 @@
 //! 出力ごとに独立した Lua state を 1 つ持つ。スクリプトに渡すのは画面とマウスの情報だけで、
 //! ファイルや OS には触れられないようにしている。
 
-use std::path::Path;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, VmState};
 
-use crate::render::{Batch, Blend, Vertex};
+use crate::lua_images::Images;
+use crate::render::{Batch, Blend, ImageVertex, Vertex};
 
 /// スクリプトの 1 回の呼び出しに許す時間。超えたらエラーにして止める。
 const LOAD_BUDGET: Duration = Duration::from_secs(2);
@@ -18,36 +19,70 @@ pub const FRAME_BUDGET: Duration = Duration::from_millis(250);
 /// 時間切れを確認する間隔（命令数）。
 const HOOK_INTERVAL: u32 = 10_000;
 
-/// スクリプトが 1 フレームで積んだ描画命令。
+/// 描画命令の区間が描くもの。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// 図形（`DrawList::batch`）。
+    Shapes,
+    /// i 番目の画像（`DrawList::images`）。
+    Image(u32),
+}
+
+/// 同じものを同じブレンドで続けて描く区間。`start` と `quads` は、それぞれの頂点の列での四角形の番号と数。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub kind: Kind,
+    pub blend: Blend,
+    pub start: usize,
+    pub quads: usize,
+}
+
+/// スクリプトが 1 フレームで積んだ描画命令。`segments` の順に描く。
 #[derive(Default)]
 pub struct DrawList {
     pub clear: Option<[f32; 3]>,
     pub batch: Batch,
-    /// (ブレンドモード, この区間が始まる四角形の番号)。
-    pub segments: Vec<(Blend, usize)>,
+    pub images: Vec<ImageVertex>,
+    pub segments: Vec<Segment>,
     blend: Blend,
 }
 
 impl DrawList {
     fn reset(&mut self) {
+        self.discard();
         self.clear = None;
-        self.batch.vertices.clear();
         self.batch.color = [255; 4];
-        self.segments.clear();
         self.blend = Blend::Alpha;
-        self.segments.push((Blend::Alpha, 0));
     }
 
-    fn set_blend(&mut self, blend: Blend) {
-        if blend == self.blend {
+    /// 積んだ図形と画像を捨てる（`clear`）。
+    fn discard(&mut self) {
+        self.batch.vertices.clear();
+        self.images.clear();
+        self.segments.clear();
+    }
+
+    /// 図形と画像を合わせた四角形の数。
+    pub fn quads(&self) -> usize {
+        self.batch.quads() + self.images.len() / 4
+    }
+
+    /// 頂点の列の終わりに足した `quads` 個の四角形を、今のブレンドの区間に入れる。
+    fn push(&mut self, kind: Kind, start: usize, quads: usize) {
+        if let Some(last) = self.segments.last_mut()
+            && last.kind == kind
+            && last.blend == self.blend
+        {
+            debug_assert_eq!(last.start + last.quads, start);
+            last.quads += quads;
             return;
         }
-        self.blend = blend;
-        let at = self.batch.quads();
-        match self.segments.last_mut() {
-            Some(last) if last.1 == at => last.0 = blend,
-            _ => self.segments.push((blend, at)),
-        }
+        self.segments.push(Segment {
+            kind,
+            blend: self.blend,
+            start,
+            quads,
+        });
     }
 }
 
@@ -150,8 +185,10 @@ pub struct Script {
     jit_enabled: bool,
     begin: Function,
     finish: Function,
-    /// prelude が ffi で直接書き込む頂点バッファー。確保した後は動かさない。
+    /// prelude が ffi で直接書き込む頂点バッファー（図形と画像）。確保した後は動かさない。
     _buf: Box<[Vertex]>,
+    _image_buf: Box<[ImageVertex]>,
+    images: Rc<Images>,
 }
 
 /// 壁紙スクリプトに見せないグローバル。ファイル読み込みや別環境への抜け道になるもの。
@@ -177,44 +214,76 @@ const REMOVED_GLOBALS: &[&str] = &[
 pub const MAX_FRAME_QUADS: usize = 1_000_000;
 
 /// prelude の頂点バッファーの容量（頂点数、4 の倍数）。満杯になるたびに DrawList へ移す。
+/// 図形と画像で同じ数にする。
 const PRELUDE_CAP: usize = 4096;
 
-/// 描画関数（color, line など）を prelude.lua で作り、グローバルに置く。
-///
-/// prelude は ffi で `buf` に直接頂点を書き、満杯になったときやフレームの終わりに
-/// `take(n)` で DrawList へ移す。ffi は prelude の upvalue にしか残らない。
-fn install_prelude(lua: &Lua, buf: *mut Vertex) -> mlua::Result<(Function, Function)> {
+/// prelude に渡す Rust の関数。
+struct HostFns {
+    take: Function,
+    take_images: Function,
+    clear: Function,
+    blend: Function,
+}
+
+/// `take` と `take_images` の共通部分: 頂点の数と時間と図形の数を確かめる。
+fn check_take(lua: &Lua, dl: &DrawList, n: i64) -> mlua::Result<()> {
+    if n < 0 || n as usize > PRELUDE_CAP || n % 4 != 0 {
+        return Err(mlua::Error::runtime(format!(
+            "internal: bad vertex count {n}"
+        )));
+    }
+    // JIT コンパイルされた描画ループは hook では止まらないが、ここは必ず通るので時間もここで確かめる。
+    if lua
+        .app_data_ref::<Deadline>()
+        .is_some_and(|d| Instant::now() > d.0)
+    {
+        return Err(mlua::Error::runtime("time limit exceeded"));
+    }
+    if dl.quads() + n as usize / 4 > MAX_FRAME_QUADS {
+        return Err(mlua::Error::runtime(format!(
+            "too many shapes in one frame (max {MAX_FRAME_QUADS})"
+        )));
+    }
+    Ok(())
+}
+
+fn host_fns(
+    lua: &Lua,
+    buf: *mut Vertex,
+    image_buf: *mut ImageVertex,
+    images: usize,
+) -> mlua::Result<HostFns> {
     let base = buf as usize;
     let take = lua.create_function(move |lua, n: i64| {
-        if n < 0 || n as usize > PRELUDE_CAP || n % 4 != 0 {
-            return Err(mlua::Error::runtime(format!(
-                "internal: bad vertex count {n}"
-            )));
-        }
-        // JIT コンパイルされた描画ループは hook では止まらないが、ここは必ず通るので時間もここで確かめる。
-        if lua
-            .app_data_ref::<Deadline>()
-            .is_some_and(|d| Instant::now() > d.0)
-        {
-            return Err(mlua::Error::runtime("time limit exceeded"));
-        }
         let mut dl = lua.app_data_mut::<DrawList>().unwrap();
-        if dl.batch.quads() + n as usize / 4 > MAX_FRAME_QUADS {
-            return Err(mlua::Error::runtime(format!(
-                "too many shapes in one frame (max {MAX_FRAME_QUADS})"
-            )));
-        }
+        check_take(lua, &dl, n)?;
         // 安全性: buf は PRELUDE_CAP 個の Vertex を持つ Box で、Script が生きている間は動かない。
         let src = unsafe { std::slice::from_raw_parts(base as *const Vertex, n as usize) };
+        let start = dl.batch.quads();
         dl.batch.vertices.extend_from_slice(src);
+        dl.push(Kind::Shapes, start, n as usize / 4);
+        Ok(())
+    })?;
+    let image_base = image_buf as usize;
+    let take_images = lua.create_function(move |lua, (n, i): (i64, i64)| {
+        let mut dl = lua.app_data_mut::<DrawList>().unwrap();
+        check_take(lua, &dl, n)?;
+        if i < 0 || i as usize >= images {
+            return Err(mlua::Error::runtime(format!(
+                "internal: bad image index {i}"
+            )));
+        }
+        // 安全性: image_buf は PRELUDE_CAP 個の ImageVertex を持つ Box で、Script が生きている間は動かない。
+        let src =
+            unsafe { std::slice::from_raw_parts(image_base as *const ImageVertex, n as usize) };
+        let start = dl.images.len() / 4;
+        dl.images.extend_from_slice(src);
+        dl.push(Kind::Image(i as u32), start, n as usize / 4);
         Ok(())
     })?;
     let clear = lua.create_function(|lua, (r, g, b): (f32, f32, f32)| {
         let mut dl = lua.app_data_mut::<DrawList>().unwrap();
-        dl.batch.vertices.clear();
-        let blend = dl.blend;
-        dl.segments.clear();
-        dl.segments.push((blend, 0));
+        dl.discard();
         dl.clear = Some([r, g, b]);
         Ok(())
     })?;
@@ -224,9 +293,38 @@ fn install_prelude(lua: &Lua, buf: *mut Vertex) -> mlua::Result<(Function, Funct
             Some(b"add") => Blend::Add,
             _ => return Err(mlua::Error::runtime("blend: expected \"alpha\" or \"add\"")),
         };
-        lua.app_data_mut::<DrawList>().unwrap().set_blend(blend);
+        lua.app_data_mut::<DrawList>().unwrap().blend = blend;
         Ok(())
     })?;
+    Ok(HostFns {
+        take,
+        take_images,
+        clear,
+        blend,
+    })
+}
+
+/// 描画関数（color, line など）を prelude.lua で作り、グローバルに置く。
+///
+/// prelude は ffi で `buf`（図形）と `image_buf`（画像）に直接頂点を書き、満杯になったときや
+/// フレームの終わりに `take(n)`・`take_images(n, 画像の番号)` で DrawList へ移す。
+/// ffi は prelude の upvalue にしか残らない。
+fn install_prelude(
+    lua: &Lua,
+    buf: *mut Vertex,
+    image_buf: *mut ImageVertex,
+    images: &Images,
+) -> mlua::Result<(Function, Function)> {
+    let host = host_fns(lua, buf, image_buf, images.len())?;
+    // 名前 → 番号（0 始まり）と、番号（1 始まり）→ 幅・高さ。名前の表と番号の表は分けておく。
+    let index = lua.create_table()?;
+    let widths = lua.create_table()?;
+    let heights = lua.create_table()?;
+    for (i, (name, w, h)) in images.sizes().enumerate() {
+        index.raw_set(name, i)?;
+        widths.raw_set(i + 1, w)?;
+        heights.raw_set(i + 1, h)?;
+    }
     let g = lua.globals();
     let ffi: Table = g.get("ffi")?;
     let math: Table = g.get("math")?;
@@ -237,10 +335,19 @@ fn install_prelude(lua: &Lua, buf: *mut Vertex) -> mlua::Result<(Function, Funct
         .call((
             ffi,
             mlua::LightUserData(buf.cast()),
+            mlua::LightUserData(image_buf.cast()),
             PRELUDE_CAP,
-            take,
-            clear,
-            blend,
+            host.take,
+            host.take_images,
+            host.clear,
+            host.blend,
+            {
+                let t = lua.create_table()?;
+                t.set("index", index)?;
+                t.set("w", widths)?;
+                t.set("h", heights)?;
+                t
+            },
             math.get::<Function>("sqrt")?,
             math.get::<Function>("cos")?,
             math.get::<Function>("sin")?,
@@ -248,30 +355,51 @@ fn install_prelude(lua: &Lua, buf: *mut Vertex) -> mlua::Result<(Function, Funct
             g.get::<Function>("type")?,
             g.get::<Function>("select")?,
         ))?;
-    for name in ["color", "circle", "line", "rect", "clear", "blend"] {
+    for name in [
+        "color",
+        "circle",
+        "line",
+        "rect",
+        "image",
+        "subimage",
+        "imagesize",
+        "clear",
+        "blend",
+    ] {
         g.set(name, api.get::<Function>(name)?)?;
     }
     Ok((host.get("begin")?, host.get("finish")?))
 }
 
 impl Script {
-    /// `output` は出力の名前、`screen_size` は `screen.w`・`screen.h`（出力のピクセルサイズ）。
-    pub fn load(
-        path: &Path,
-        output: &str,
-        seed: u64,
-        screen_size: (u32, u32),
-    ) -> Result<Self, String> {
-        let src = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Self::from_source(&src, &path.display().to_string(), output, seed, screen_size)
-    }
-
+    /// 画像を指定しない壁紙（テスト用）。
+    #[cfg(test)]
     pub fn from_source(
         src: &str,
         chunk_name: &str,
         output: &str,
         seed: u64,
         screen_size: (u32, u32),
+    ) -> Result<Self, String> {
+        Self::with_images(
+            src,
+            chunk_name,
+            output,
+            seed,
+            screen_size,
+            Rc::new(Images::default()),
+        )
+    }
+
+    /// `output` は出力の名前、`screen_size` は `screen.w`・`screen.h`（出力のピクセルサイズ）。
+    /// `images` は `-- @image` で指定した画像（`Images::load` で読んだもの）。
+    pub fn with_images(
+        src: &str,
+        chunk_name: &str,
+        output: &str,
+        seed: u64,
+        screen_size: (u32, u32),
+        images: Rc<Images>,
     ) -> Result<Self, String> {
         // LuaJIT は jit ライブラリを開いたときに JIT コンパイラーを有効にするので、JIT も読み込む。
         // スクリプトから jit.off() などを呼べないよう、読み込んだ後にグローバルから外す。
@@ -281,8 +409,8 @@ impl Script {
             StdLib::MATH | StdLib::STRING | StdLib::TABLE | StdLib::BIT | StdLib::JIT | StdLib::FFI;
         let lua = unsafe { Lua::unsafe_new_with(libs, LuaOptions::default()) };
         let _busy = BusyGuard::new();
-        let buf = vec![Vertex::default(); PRELUDE_CAP].into_boxed_slice();
-        let script = Self::setup(lua, buf, output, seed, screen_size).map_err(|e| e.to_string())?;
+        let script =
+            Self::setup(lua, output, seed, screen_size, images).map_err(|e| e.to_string())?;
         script
             .lua
             .set_app_data(Deadline(Instant::now() + LOAD_BUDGET));
@@ -299,12 +427,15 @@ impl Script {
 
     fn setup(
         lua: Lua,
-        buf: Box<[Vertex]>,
         output: &str,
         seed: u64,
         screen_size: (u32, u32),
+        images: Rc<Images>,
     ) -> mlua::Result<Self> {
+        let buf = vec![Vertex::default(); PRELUDE_CAP].into_boxed_slice();
+        let image_buf = vec![ImageVertex::default(); PRELUDE_CAP].into_boxed_slice();
         let buf_ptr = buf.as_ptr() as *mut Vertex;
+        let image_buf_ptr = image_buf.as_ptr() as *mut ImageVertex;
         let g = lua.globals();
         let jit: Table = g.get("jit")?;
         let jit_enabled: bool = jit.get::<Function>("status")?.call(())?;
@@ -336,7 +467,7 @@ impl Script {
         lua.set_app_data(DrawList::default());
         lua.app_data_mut::<DrawList>().unwrap().reset();
 
-        let (begin, finish) = install_prelude(&lua, buf_ptr)?;
+        let (begin, finish) = install_prelude(&lua, buf_ptr, image_buf_ptr, &images)?;
         for name in REMOVED_GLOBALS {
             g.raw_set(*name, mlua::Nil)?;
         }
@@ -368,6 +499,8 @@ impl Script {
             begin,
             finish,
             _buf: buf,
+            _image_buf: image_buf,
+            images,
         };
         s.set_mouse(&MouseState::default())
             .map_err(mlua::Error::runtime)?;
@@ -416,6 +549,11 @@ impl Script {
         .map_err(|e| e.to_string())
     }
 
+    /// `-- @image` で指定した画像。
+    pub fn images(&self) -> &Images {
+        &self.images
+    }
+
     /// Lua が使っているメモリ（バイト）。
     pub fn used_memory(&self) -> usize {
         self.lua.used_memory()
@@ -441,6 +579,43 @@ mod tests {
 
     fn run(src: &str) -> Result<Script, String> {
         Script::from_source(src, "test", "TEST-1", 1, (800, 600))
+    }
+
+    fn seg(kind: Kind, blend: Blend, start: usize, quads: usize) -> Segment {
+        Segment {
+            kind,
+            blend,
+            start,
+            quads,
+        }
+    }
+
+    /// 画像 "a"（30×40）と "b"（100×50）を指定した壁紙。
+    fn run_images(src: &str) -> Result<Script, String> {
+        use crate::directive::Sampler;
+        use crate::image::Image;
+        let img = |width, height| Image {
+            width,
+            height,
+            rgba: vec![255; (width * height * 4) as usize],
+        };
+        let sampler = Sampler {
+            vflip: false,
+            ..Default::default()
+        };
+        let images = Images::from_images(vec![
+            ("a", sampler, img(30, 40)),
+            ("b", sampler, img(100, 50)),
+        ]);
+        Script::with_images(src, "test", "TEST-1", 1, (800, 600), Rc::new(images))
+    }
+
+    /// 1 フレーム描いて、エラーを返す（エラーにならなければ panic）。
+    fn frame_error(src: &str) -> String {
+        match run_images(src).unwrap().frame(0.0) {
+            Ok(_) => panic!("no error: {src}"),
+            Err(e) => e,
+        }
     }
 
     #[test]
@@ -503,7 +678,13 @@ mod tests {
         let dl = s.frame(1.0 / 30.0).unwrap();
         assert_eq!(dl.clear, Some([0.1, 0.2, 0.3]));
         assert_eq!(dl.batch.quads(), 3);
-        assert_eq!(dl.segments, vec![(Blend::Alpha, 0), (Blend::Add, 1)]);
+        assert_eq!(
+            dl.segments,
+            vec![
+                seg(Kind::Shapes, Blend::Alpha, 0, 1),
+                seg(Kind::Shapes, Blend::Add, 1, 2)
+            ]
+        );
         assert_eq!(dl.batch.vertices[0].color, [255, 0, 0, 128]);
     }
 
@@ -739,6 +920,8 @@ mod tests {
             assert(select('#', rect(0, 0, 1, 1)) == 0)
             assert(select('#', rect(0, 0, 1, 1, 0.5)) == 0)
             assert(select('#', color(1, 1, 1)) == 0)
+            assert(select('#', clear(0, 0, 0)) == 0)
+            assert(select('#', blend("add")) == 0)
             -- 描画関数は C 関数ではなく Lua 関数だが、upvalue を覗く手段がない
             assert(debug == nil and getfenv == nil and string.dump == nil)
         "#,
@@ -761,7 +944,13 @@ mod tests {
         for _ in 0..3 {
             let dl = s.frame(0.0).unwrap();
             assert_eq!(dl.batch.quads(), 8000);
-            assert_eq!(dl.segments, vec![(Blend::Alpha, 0), (Blend::Add, 5000)]);
+            assert_eq!(
+                dl.segments,
+                vec![
+                    seg(Kind::Shapes, Blend::Alpha, 0, 5000),
+                    seg(Kind::Shapes, Blend::Add, 5000, 3000)
+                ]
+            );
         }
     }
 
@@ -833,6 +1022,281 @@ mod tests {
             "{err}"
         );
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn image_uses_its_size_and_the_whole_texture() {
+        let s = run_images("function draw() color(1, 0, 0, 0.5) image('a', 10, 20) end").unwrap();
+        let dl = s.frame(0.0).unwrap();
+        assert_eq!(dl.segments, vec![seg(Kind::Image(0), Blend::Alpha, 0, 1)]);
+        let v = &dl.images;
+        let pos: Vec<_> = v.iter().map(|v| v.pos).collect();
+        let uv: Vec<_> = v.iter().map(|v| v.uv).collect();
+        assert_eq!(
+            pos,
+            [[10.0, 20.0], [40.0, 20.0], [10.0, 60.0], [40.0, 60.0]]
+        );
+        assert_eq!(uv, [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]);
+        assert_eq!(v[0].half, [0.0, 0.0]);
+        assert_eq!(v[0].color, [255, 0, 0, 128]);
+    }
+
+    #[test]
+    fn image_with_negative_size_is_flipped() {
+        let s = run_images("function draw() image('a', 10, 20, -30, 40) end").unwrap();
+        let dl = s.frame(0.0).unwrap();
+        // 左上の頂点 (u, v) = (0, 0) が x = 10、右の頂点 (1, 0) が x = -20 に来る（左右が裏返る）。
+        assert_eq!(dl.images[0].pos, [10.0, 20.0]);
+        assert_eq!(dl.images[1].pos, [-20.0, 20.0]);
+        assert_eq!(dl.images[1].uv, [1.0, 0.0]);
+    }
+
+    #[test]
+    fn subimage_maps_pixels_to_texture_coordinates() {
+        let s =
+            run_images("function draw() subimage('b', 10, 5, 20, 10, 0, 0, 40, 20) end").unwrap();
+        let dl = s.frame(0.0).unwrap();
+        assert_eq!(dl.segments, vec![seg(Kind::Image(1), Blend::Alpha, 0, 1)]);
+        assert_eq!(dl.images[0].uv, [0.1, 0.1]);
+        assert_eq!(dl.images[3].uv, [0.3, 0.3]);
+        assert_eq!(dl.images[3].pos, [40.0, 20.0]);
+    }
+
+    #[test]
+    fn rotated_image_extends_the_texture_coordinates_over_the_aa_pad() {
+        let s =
+            run_images("function draw() image('a', 10, 20, 0) image('a', 40, 20, -30, 40, 0) end")
+                .unwrap();
+        let dl = s.frame(0.0).unwrap();
+        let v = &dl.images;
+        // 中心 (25, 40)、半分の大きさ (15, 20) に、AA の 1px を足して広げる。
+        assert_eq!(v[0].pos, [9.0, 19.0]);
+        assert_eq!(v[0].local, [-16.0, -21.0]);
+        assert_eq!(v[0].half, [15.0, 20.0]);
+        let close =
+            |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
+        assert!(
+            close(v[0].uv, [0.5 - 16.0 / 30.0, 0.5 - 21.0 / 40.0]),
+            "{:?}",
+            v[0].uv
+        );
+        assert!(
+            close(v[3].uv, [0.5 + 16.0 / 30.0, 0.5 + 21.0 / 40.0]),
+            "{:?}",
+            v[3].uv
+        );
+        // 幅が負なら、同じ位置の左側に u の大きい側が来る。
+        assert_eq!(v[4].pos, [9.0, 19.0]);
+        assert!(
+            close(v[4].uv, [0.5 + 16.0 / 30.0, 0.5 - 21.0 / 40.0]),
+            "{:?}",
+            v[4].uv
+        );
+    }
+
+    #[test]
+    fn rotated_image_with_empty_size_draws_nothing() {
+        let s =
+            run_images("function draw() image('a', 0, 0, 0, 5, 1) image('a', 0, 0, 5, 0/0, 1) end")
+                .unwrap();
+        assert_eq!(s.frame(0.0).unwrap().quads(), 0);
+    }
+
+    #[test]
+    fn many_calls_on_one_image_make_one_segment() {
+        // 画像の頂点バッファー（PRELUDE_CAP 頂点）を何度も溢れさせても、区間は 1 つ。
+        let s = run_images(
+            "function draw() for i = 1, 5000 do subimage('b', i, 0, 4, 4, i, 0, 4, 4) end end",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let dl = s.frame(0.0).unwrap();
+            assert_eq!(
+                dl.segments,
+                vec![seg(Kind::Image(1), Blend::Alpha, 0, 5000)]
+            );
+            assert_eq!(dl.images[4999 * 4].uv[0], 5000.0 / 100.0);
+        }
+    }
+
+    #[test]
+    fn images_and_shapes_keep_their_order() {
+        let s = run_images(
+            r#"
+            function draw()
+                image("a", 0, 0)
+                circle(0, 0, 1)
+                image("a", 0, 0)
+                image("b", 0, 0)
+                circle(0, 0, 1)
+                circle(0, 0, 1)
+                blend("add")
+                image("b", 0, 0)
+                image("b", 0, 0)
+                rect(0, 0, 1, 1)
+            end
+        "#,
+        )
+        .unwrap();
+        let dl = s.frame(0.0).unwrap();
+        assert_eq!(
+            dl.segments,
+            vec![
+                seg(Kind::Image(0), Blend::Alpha, 0, 1),
+                seg(Kind::Shapes, Blend::Alpha, 0, 1),
+                seg(Kind::Image(0), Blend::Alpha, 1, 1),
+                seg(Kind::Image(1), Blend::Alpha, 2, 1),
+                seg(Kind::Shapes, Blend::Alpha, 1, 2),
+                seg(Kind::Image(1), Blend::Add, 3, 2),
+                seg(Kind::Shapes, Blend::Add, 3, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn interleaved_images_and_shapes_overflow_in_order() {
+        // 図形のバッファーが溢れるたびに、先に書いた画像から渡す。
+        let s = run_images(
+            r#"
+            function draw()
+                for i = 1, 3000 do circle(i, 0, 1) end
+                image("a", 0, 0)
+                for i = 1, 3000 do circle(i, 0, 1) end
+                for i = 1, 1500 do image("a", i, 0) circle(i, 0, 1) end
+            end
+        "#,
+        )
+        .unwrap();
+        let dl = s.frame(0.0).unwrap();
+        assert_eq!(dl.quads(), 3000 + 1 + 3000 + 3000);
+        assert_eq!(dl.segments.len(), 3 + 2 * 1500);
+        assert_eq!(dl.segments[0], seg(Kind::Shapes, Blend::Alpha, 0, 3000));
+        assert_eq!(dl.segments[1], seg(Kind::Image(0), Blend::Alpha, 0, 1));
+        assert_eq!(dl.segments[2], seg(Kind::Shapes, Blend::Alpha, 3000, 3000));
+        for k in 0..1500 {
+            assert_eq!(
+                dl.segments[3 + 2 * k],
+                seg(Kind::Image(0), Blend::Alpha, 1 + k, 1)
+            );
+            assert_eq!(
+                dl.segments[4 + 2 * k],
+                seg(Kind::Shapes, Blend::Alpha, 6000 + k, 1)
+            );
+            assert_eq!(dl.images[(1 + k) * 4].pos[0], (k + 1) as f32);
+        }
+    }
+
+    #[test]
+    fn clear_discards_images() {
+        let s = run_images(
+            "function draw() for i = 1, 2000 do image('a', i, 0) end clear(0, 0, 0) image('b', 0, 0) end",
+        )
+        .unwrap();
+        let dl = s.frame(0.0).unwrap();
+        assert_eq!(dl.segments, vec![seg(Kind::Image(1), Blend::Alpha, 0, 1)]);
+        assert_eq!(dl.images.len(), 4);
+    }
+
+    #[test]
+    fn an_error_mid_frame_leaves_nothing_for_the_next_frame() {
+        let s = run_images(
+            r#"
+            n = 0
+            function draw()
+                n = n + 1
+                image("a", 0, 0)
+                circle(0, 0, 1)
+                if n == 1 then error("boom") end
+            end
+        "#,
+        )
+        .unwrap();
+        assert!(s.frame(0.0).is_err());
+        let dl = s.frame(0.0).unwrap();
+        assert_eq!(
+            dl.segments,
+            vec![
+                seg(Kind::Image(0), Blend::Alpha, 0, 1),
+                seg(Kind::Shapes, Blend::Alpha, 0, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn imagesize_works_in_load() {
+        let s =
+            run_images("function load() w, h = imagesize('b') n = select('#', imagesize('a')) end")
+                .unwrap();
+        s.lua
+            .load("assert(w == 100 and h == 50 and n == 2)")
+            .exec()
+            .unwrap();
+    }
+
+    #[test]
+    fn image_argument_errors_point_at_the_caller() {
+        for (src, msg) in [
+            (
+                "image('nope', 0, 0)",
+                "image: unknown image \"nope\" (declare it with -- @image)",
+            ),
+            ("image(1, 0, 0)", "image: image name expected, got number"),
+            ("image({}, 0, 0)", "image: image name expected, got table"),
+            ("image(nil, 0, 0)", "image: image name expected, got nil"),
+            ("image('a', 0)", "image: number expected, got nil"),
+            (
+                "image('a', 0, 0, 1, 2, 3, 4)",
+                "image: too many arguments (max 6)",
+            ),
+            (
+                "image('a', 0, 0, nil, nil, 1)",
+                "image: number expected, got nil",
+            ),
+            (
+                "image('a', 0, 0, 1, 'x')",
+                "image: number expected, got string",
+            ),
+            (
+                "subimage('a', 0, 0, 1, 1, 0, 0, 1)",
+                "subimage: number expected, got nil",
+            ),
+            (
+                "subimage('a', 0, 0, 1, 1, 0, 0, 1, 1, 0, 0)",
+                "subimage: too many arguments (max 10)",
+            ),
+            (
+                "subimage('c', 0, 0, 1, 1, 0, 0, 1, 1)",
+                "subimage: unknown image \"c\"",
+            ),
+            ("imagesize('a', 1)", "imagesize: too many arguments (max 1)"),
+            ("imagesize('z')", "imagesize: unknown image \"z\""),
+        ] {
+            let err = frame_error(&format!("function draw()\n{src}\nend"));
+            assert!(err.contains(&format!("test:2: {msg}")), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn trailing_nils_are_not_counted_for_images() {
+        let s = run_images(
+            "function draw() image('a', 0, 0, nil, nil, nil, nil) subimage('a', 0, 0, 1, 1, 0, 0, 1, 1, nil, nil) end",
+        )
+        .unwrap();
+        let dl = s.frame(0.0).unwrap();
+        assert_eq!(dl.quads(), 2);
+        assert_eq!(dl.images[0].half, [0.0, 0.0]);
+        assert_eq!(dl.images[4].half, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn images_count_toward_the_shape_limit() {
+        let half = MAX_FRAME_QUADS / 2 + 10;
+        let s = run_images(&format!(
+            "function draw() for i = 1, {half} do circle(0, 0, 1) end for i = 1, {half} do image('a', 0, 0) end end"
+        ))
+        .unwrap();
+        let err = s.frame(0.0).err().unwrap();
+        assert!(err.contains("too many shapes"), "{err}");
     }
 
     #[test]

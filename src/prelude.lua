@@ -5,9 +5,12 @@
 --   壁紙スクリプトからは debug / getfenv が無いので届かない。
 -- * このチャンクは空の環境で動かすので、グローバルを参照しない（壁紙側で書き換えられても影響しない）。
 -- * 頂点を書く前に必ず残り容量を確かめる。満杯なら Rust 側へ渡してから書く。
--- * 返す関数は何も返さない（cdata を壁紙側に渡さない）。
+-- * 返す関数は何も返さない（cdata を壁紙側に渡さない）。imagesize だけは数を 2 つ返す。
+-- * 画像は図形と別のバッファーに書く。書き込み済みの画像は、書き込み済みの図形より必ず前に描くもの
+--   （画像を書く前に、書き込み済みの図形を渡す）。なので渡すときは、いつも画像を先に渡す。
 
-local ffi, ptr, CAP, take, rust_clear, rust_blend, sqrt, cos, sin, error, type, select = ...
+local ffi, ptr, image_ptr, CAP, take, take_images, rust_clear, rust_blend, images,
+  sqrt, cos, sin, error, type, select = ...
 
 ffi.cdef [[
 typedef struct {
@@ -16,20 +19,42 @@ typedef struct {
   float sl, sr;
   uint8_t r, g, b, a;
 } kagegami_vertex;
+typedef struct {
+  float px, py;
+  float u, v;
+  float lx, ly;
+  float hx, hy;
+  uint8_t r, g, b, a;
+} kagegami_image_vertex;
 ]]
 
 local buf = ffi.cast("kagegami_vertex *", ptr)
-ptr = nil
+local ibuf = ffi.cast("kagegami_image_vertex *", image_ptr)
+ptr, image_ptr = nil, nil
+
+-- 名前 → 番号（0 始まり）と、番号 + 1 → 幅・高さ。
+local IMAGE_INDEX, IMAGE_W, IMAGE_H = images.index, images.w, images.h
+images = nil
 
 -- render.rs の AA_PAD / FILL_RADIUS / MIN_HALF_SIZE と同じ値。
 local AA_PAD = 1.0
 local FILL_RADIUS = 8192.0
 local MIN_HALF_SIZE = 1e-4
 
-local n = 0 -- 書き込み済みの頂点数
+local n = 0 -- 書き込み済みの図形の頂点数
+local ni = 0 -- 書き込み済みの画像の頂点数
+local cur = -1 -- 書き込み済みの画像の番号
 local cr, cg, cb, ca = 255, 255, 255, 255
 
+local function flush_images()
+  if ni > 0 then
+    take_images(ni, cur)
+    ni = 0
+  end
+end
+
 local function flush()
+  flush_images()
   if n > 0 then
     take(n)
     n = 0
@@ -151,16 +176,105 @@ function api.rect(x, y, w, h, angle, ...)
   put(x + w, y + h, 0, 0, 0, FILL_RADIUS)
 end
 
+-- 画像の名前を番号にする。直接 api.* から呼ぶ（エラーの位置を呼び出し元にするため）。
+local function image_index(name, fname)
+  local i = IMAGE_INDEX[name]
+  if i ~= nil then return i end
+  if type(name) ~= "string" then
+    error(fname .. ": image name expected, got " .. type(name), 3)
+  end
+  error(fname .. ": unknown image \"" .. name .. "\" (declare it with -- @image)", 3)
+end
+
+local function put_image(px, py, u, v, lx, ly, hx, hy)
+  local p = ibuf[ni]
+  p.px, p.py, p.u, p.v, p.lx, p.ly, p.hx, p.hy = px, py, u, v, lx, ly, hx, hy
+  p.r, p.g, p.b, p.a = cr, cg, cb, ca
+  ni = ni + 1
+end
+
+-- 画像の頂点を書く前に、順番を保つために渡すものを渡し、空きを作る。
+local function reserve_image(i)
+  if n > 0 then
+    flush()
+  elseif i ~= cur then
+    flush_images()
+  end
+  if ni + 4 > CAP then flush_images() end
+  cur = i
+end
+
+-- 画像 i の (u0, v0)〜(u1, v1) の部分を、(x, y, w, h) の矩形に描く。w・h が負なら裏返す。
+-- angle を渡したときは、矩形の中心のまわりに回し、縁にアンチエイリアスを付ける（rect と同じ）。
+local function draw_image(i, x, y, w, h, u0, v0, u1, v1, angle)
+  if angle == nil then
+    reserve_image(i)
+    put_image(x, y, u0, v0, 0, 0, 0, 0)
+    put_image(x + w, y, u1, v0, 0, 0, 0, 0)
+    put_image(x, y + h, u0, v1, 0, 0, 0, 0)
+    put_image(x + w, y + h, u1, v1, 0, 0, 0, 0)
+    return
+  end
+  local hx = (w < 0 and -w or w) * 0.5
+  local hy = (h < 0 and -h or h) * 0.5
+  if not (hx >= MIN_HALF_SIZE and hy >= MIN_HALF_SIZE) then return end
+  local cx, cy = x + w * 0.5, y + h * 0.5
+  local c, s = cos(angle), sin(angle)
+  local ex, ey = hx + AA_PAD, hy + AA_PAD
+  -- ローカル座標 lx でのテクスチャー座標は uc + lx * du（w が負なら du も負で、裏返る）。
+  local uc, vc = (u0 + u1) * 0.5, (v0 + v1) * 0.5
+  local du, dv = (u1 - u0) / w, (v1 - v0) / h
+  reserve_image(i)
+  put_image(cx - ex * c + ey * s, cy - ex * s - ey * c, uc - ex * du, vc - ey * dv, -ex, -ey, hx, hy)
+  put_image(cx + ex * c + ey * s, cy + ex * s - ey * c, uc + ex * du, vc - ey * dv, ex, -ey, hx, hy)
+  put_image(cx - ex * c - ey * s, cy - ex * s + ey * c, uc - ex * du, vc + ey * dv, -ex, ey, hx, hy)
+  put_image(cx + ex * c - ey * s, cy + ex * s + ey * c, uc + ex * du, vc + ey * dv, ex, ey, hx, hy)
+end
+
+-- image(name, x, y) / (name, x, y, angle) / (name, x, y, w, h) / (name, x, y, w, h, angle)
+function api.image(name, x, y, a, b, c, ...)
+  if select("#", ...) > 0 then too_many("image", 6, ...) end
+  local i = image_index(name, "image")
+  num(x, "image"); num(y, "image")
+  local w, h, angle
+  if b == nil and c == nil then
+    w, h = IMAGE_W[i + 1], IMAGE_H[i + 1]
+    if a ~= nil then angle = num(a, "image") end
+  else
+    w, h = num(a, "image"), num(b, "image")
+    if c ~= nil then angle = num(c, "image") end
+  end
+  draw_image(i, x, y, w, h, 0, 0, 1, 1, angle)
+end
+
+-- subimage(name, sx, sy, sw, sh, x, y, w, h[, angle])。(sx, sy, sw, sh) は画像のピクセルで、
+-- 画像の外は wrap の指定に従う。
+function api.subimage(name, sx, sy, sw, sh, x, y, w, h, angle, ...)
+  if select("#", ...) > 0 then too_many("subimage", 10, ...) end
+  local i = image_index(name, "subimage")
+  num(sx, "subimage"); num(sy, "subimage"); num(sw, "subimage"); num(sh, "subimage")
+  num(x, "subimage"); num(y, "subimage"); num(w, "subimage"); num(h, "subimage")
+  if angle ~= nil then num(angle, "subimage") end
+  local iw, ih = IMAGE_W[i + 1], IMAGE_H[i + 1]
+  draw_image(i, x, y, w, h, sx / iw, sy / ih, (sx + sw) / iw, (sy + sh) / ih, angle)
+end
+
+function api.imagesize(name, ...)
+  if select("#", ...) > 0 then too_many("imagesize", 1, ...) end
+  local i = image_index(name, "imagesize")
+  return IMAGE_W[i + 1], IMAGE_H[i + 1]
+end
+
 function api.clear(r, g, b, ...)
   if select("#", ...) > 0 then too_many("clear", 3, ...) end
-  -- clear より前の図形は見えなくなるので捨てる。
-  n = 0
+  -- clear より前の図形と画像は見えなくなるので捨てる。
+  n, ni = 0, 0
   rust_clear(num(r, "clear"), num(g, "clear"), num(b, "clear"))
 end
 
 function api.blend(mode, ...)
   if select("#", ...) > 0 then too_many("blend", 1, ...) end
-  -- 切り替える前に、それまでの図形を前のモードの区間として渡す。
+  -- 切り替える前に、それまでの図形と画像を前のモードの区間として渡す。
   flush()
   rust_blend(mode)
 end
@@ -169,7 +283,7 @@ end
 local host = {}
 
 function host.begin()
-  n = 0
+  n, ni = 0, 0
   cr, cg, cb, ca = 255, 255, 255, 255
 end
 

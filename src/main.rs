@@ -7,6 +7,7 @@ mod egl;
 mod gl_program;
 mod gpu_usage;
 mod image;
+mod lua_images;
 mod perf;
 mod pointer;
 mod render;

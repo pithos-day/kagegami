@@ -34,6 +34,7 @@ use wayland_protocols::wp::viewporter::client::{
 use crate::cli::{Args, LayerName};
 use crate::directive::{self, Syntax};
 use crate::egl::{EglContext, EglSurface};
+use crate::lua_images::Images;
 use crate::perf::{self, OutputStats};
 use crate::pointer::{self, Drag};
 use crate::render::Renderer;
@@ -221,17 +222,17 @@ fn draw_content(
             };
             let t0 = Instant::now();
             let dl = script.frame(dt.min(MAX_LUA_DT))?;
-            w.stats.lua(t0.elapsed(), dl.batch.quads());
+            w.stats.lua(t0.elapsed(), dl.quads());
             match timer {
                 Some(t) => {
                     w.stats.gpu(t.poll(renderer.gl()).as_slice());
                     t.begin(renderer.gl());
-                    renderer.submit(&dl);
+                    let r = renderer.submit(&dl, script.images());
                     t.end(renderer.gl());
+                    r
                 }
-                None => renderer.submit(&dl),
+                None => renderer.submit(&dl, script.images()),
             }
-            Ok(())
         }
         _ => {
             renderer.clear(0.0, 0.0, 0.0);
@@ -258,8 +259,9 @@ pub struct App {
     renderer: Option<Renderer>,
     /// タイマーの拡張機能がないことを一度警告したか。
     timer_warned: bool,
-    /// シェーダーの壁紙の画像。読み直すたびに 1 回だけ作り、すべての出力で使う。
-    channels: ChannelCache,
+    /// 壁紙の画像（シェーダーと Lua）。読み直すたびに 1 回だけ作り、すべての出力で使う。
+    channels: AssetCache<Channels>,
+    lua_images: AssetCache<Images>,
     /// 見張るファイル（壁紙のファイルと、指定された画像）。変わったら `watch_changed` を立てる。
     watch: Vec<PathBuf>,
     watch_changed: bool,
@@ -272,25 +274,71 @@ pub struct App {
     bench: Option<crate::bench::Bench>,
 }
 
-/// シェーダーの壁紙の画像の、読み直し 1 回分の結果。
-#[derive(Default)]
-struct ChannelCache {
+/// 画像のテクスチャーなど、消すのに GL のコンテキストが要るもの。
+trait GlAssets {
+    fn delete(self, gl: &glow::Context);
+}
+
+impl GlAssets for Channels {
+    fn delete(self, gl: &glow::Context) {
+        Channels::delete(self, gl)
+    }
+}
+
+impl GlAssets for Images {
+    fn delete(self, gl: &glow::Context) {
+        Images::delete(self, gl)
+    }
+}
+
+/// 壁紙の画像の、読み直し 1 回分の結果。
+struct AssetCache<T> {
     /// 次に読み込むときに作り直す（読み直しを始めたとき）。
     stale: bool,
     /// 作ったときの壁紙のファイルの中身と、その結果（エラーも、同じ読み直しの間は使い回す）。
-    current: Option<(String, Result<Rc<Channels>, String>)>,
+    current: Option<(String, Result<Rc<T>, String>)>,
     /// 新しいものに置き換えたが、まだどこかの出力が使っているもの。使われなくなったら消す。
-    retired: Vec<Rc<Channels>>,
+    retired: Vec<Rc<T>>,
 }
 
-impl ChannelCache {
-    /// 使われなくなった画像のテクスチャーを消す。
+impl<T> Default for AssetCache<T> {
+    fn default() -> Self {
+        Self {
+            stale: false,
+            current: None,
+            retired: Vec::new(),
+        }
+    }
+}
+
+impl<T: GlAssets> AssetCache<T> {
+    /// 壁紙のファイルの中身が `src` のときの画像。この読み直しでまだ作っていなければ `load` で作る。
+    fn get(
+        &mut self,
+        src: &str,
+        load: impl FnOnce() -> Result<T, String>,
+    ) -> Result<Rc<T>, String> {
+        let reuse = !self.stale && self.current.as_ref().is_some_and(|(s, _)| s == src);
+        if !reuse {
+            let loaded = load().map(Rc::new);
+            if let Some((_, Ok(old))) = self.current.replace((src.to_string(), loaded)) {
+                self.retired.push(old);
+            }
+            self.stale = false;
+        }
+        match &self.current {
+            Some((_, r)) => r.clone(),
+            None => unreachable!(),
+        }
+    }
+
+    /// 使われなくなった画像のテクスチャーを消す。コンテキストが current のときに呼ぶ。
     fn collect(&mut self, gl: &glow::Context) {
         let mut keep = Vec::new();
-        for ch in self.retired.drain(..) {
-            match Rc::try_unwrap(ch) {
-                Ok(ch) => ch.delete(gl),
-                Err(ch) => keep.push(ch),
+        for a in self.retired.drain(..) {
+            match Rc::try_unwrap(a) {
+                Ok(a) => a.delete(gl),
+                Err(a) => keep.push(a),
             }
         }
         self.retired = keep;
@@ -347,7 +395,8 @@ impl App {
             egl,
             renderer: None,
             timer_warned: false,
-            channels: ChannelCache::default(),
+            channels: AssetCache::default(),
+            lua_images: AssetCache::default(),
             watch: vec![args.script.clone()],
             watch_changed: false,
             frame_period: Duration::from_secs_f64(1.0 / args.fps),
@@ -428,18 +477,12 @@ impl App {
     /// シェーダーのファイルを読んでコンパイルし、i 番目の出力の壁紙にする。
     /// 失敗したら、それまでのシェーダーをそのまま残してエラーを返す（Lua の読み直しと同じ）。
     fn load_shader(&mut self, i: usize) -> Result<(), String> {
-        let script = &self.args.script;
+        let script = &self.args.script.clone();
         let src =
             std::fs::read_to_string(script).map_err(|e| format!("{}: {e}", script.display()))?;
         let specs = directive::parse(&src, Syntax::Glsl)
             .map_err(|e| format!("{}:{e}", script.display()))?;
-        // 画像が読めなくても見張る（直して保存したら読み直すため）。
-        let mut watch = vec![script.clone()];
-        watch.extend(specs.iter().map(|s| s.resolve(script)));
-        if watch != self.watch {
-            self.watch = watch;
-            self.watch_changed = true;
-        }
+        self.set_watch(&specs);
         let es = self.wallpapers[i]
             .egl_surface
             .as_ref()
@@ -448,25 +491,17 @@ impl App {
         let gl = ensure_renderer(&mut self.renderer, &self.egl).gl();
         // コンパイルできないシェーダーのために画像を読まないように、先にコンパイルする。
         let program = ShaderProgram::new(gl, &src)?;
-        let cache = &mut self.channels;
-        let reuse = !cache.stale && cache.current.as_ref().is_some_and(|(s, _)| *s == src);
-        if !reuse {
-            let loaded = Channels::load(gl, &specs, script).map(Rc::new);
-            if let Some((_, Ok(old))) = cache.current.replace((src.clone(), loaded)) {
-                cache.retired.push(old);
-            }
-            cache.stale = false;
-            // 読み直しに失敗し続けても、どの出力も使っていない画像が溜まらないようにする。
-            cache.collect(gl);
-        }
-        let channels = match &cache.current {
-            Some((_, Ok(ch))) => Rc::clone(ch),
-            Some((_, Err(e))) => {
-                let e = e.clone();
+        let channels = self
+            .channels
+            .get(&src, || Channels::load(gl, &specs, script));
+        // 読み直しに失敗し続けても、どの出力も使っていない画像が溜まらないようにする。
+        self.channels.collect(gl);
+        let channels = match channels {
+            Ok(ch) => ch,
+            Err(e) => {
                 program.delete(gl);
                 return Err(e);
             }
-            None => unreachable!(),
         };
         let old = match self.wallpapers[i].content.take() {
             Some(Content::Shader(old)) => Some(old),
@@ -511,10 +546,36 @@ impl App {
         if self.is_shader() {
             return self.load_shader(i);
         }
+        let path = &self.args.script.clone();
+        let src = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let specs =
+            directive::parse(&src, Syntax::Lua).map_err(|e| format!("{}:{e}", path.display()))?;
+        self.set_watch(&specs);
+        // テクスチャーにするのは最初に描くとき。使われなくなった画像は render で消す。
+        let images = self.lua_images.get(&src, || Images::load(&specs, path))?;
         let w = &mut self.wallpapers[i];
-        let script = Script::load(&self.args.script, &w.name, seed, w.output_size)?;
+        let script = Script::with_images(
+            &src,
+            &path.display().to_string(),
+            &w.name,
+            seed,
+            w.output_size,
+            images,
+        )?;
         w.content = Some(Content::Lua(script));
         Ok(())
+    }
+
+    /// 見張るファイルを、壁紙のファイルと指定された画像にする。
+    /// 画像が読めなくても見張る（直して保存したら読み直すため）。
+    fn set_watch(&mut self, specs: &[directive::ImageSpec]) {
+        let script = &self.args.script;
+        let mut watch = vec![script.clone()];
+        watch.extend(specs.iter().map(|s| s.resolve(script)));
+        if watch != self.watch {
+            self.watch = watch;
+            self.watch_changed = true;
+        }
     }
 
     /// i 番目の出力で壁紙を読み込めるか。シェーダーはコンパイルに EGL surface が要る。
@@ -536,6 +597,7 @@ impl App {
     pub fn reload(&mut self) {
         elog!("kagegami: reloading {}", self.args.script.display());
         self.channels.stale = true;
+        self.lua_images.stale = true;
         for i in 0..self.wallpapers.len() {
             if !self.can_load(i) {
                 continue;
@@ -664,6 +726,8 @@ impl App {
             return;
         }
         let renderer = ensure_renderer(&mut self.renderer, &self.egl);
+        // 読み直して使われなくなった Lua の壁紙の画像を消す（読み込むときはコンテキストが無いことがある）。
+        self.lua_images.collect(renderer.gl());
         if self.perf.is_some()
             && matches!(w.content, Some(Content::Lua(_)))
             && matches!(w.lua_timer, LuaTimer::Unchecked)

@@ -20,8 +20,6 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Syntax {
     Glsl,
-    /// Lua の壁紙の `@image` は、まだ本体から読んでいない（#36）。
-    #[cfg_attr(not(test), allow(dead_code))]
     Lua,
 }
 
