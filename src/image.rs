@@ -24,6 +24,46 @@ impl Image {
             top[y * row..(y + 1) * row].swap_with_slice(&mut bottom[..row]);
         }
     }
+
+    /// 色にアルファを掛けておく（Lua の壁紙の画像）。拡大・縮小で透明な画素の色が縁に混ざらないようにする。
+    pub fn premultiply(&mut self) {
+        for p in self.rgba.as_chunks_mut::<4>().0 {
+            let a = p[3] as u32;
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
+}
+
+/// 指定された画像を、画像ごとに別のスレッドで並べてデコードする。`vflip` の指定もここで行う。
+/// 結果は `specs` と同じ順に並ぶ。
+pub fn load_all(
+    specs: &[crate::directive::ImageSpec],
+    wallpaper: &Path,
+    max_size: u32,
+) -> Vec<Result<Image, String>> {
+    std::thread::scope(|s| {
+        let handles: Vec<_> = specs
+            .iter()
+            .map(|spec| {
+                s.spawn(move || {
+                    let mut img = load(&spec.resolve(wallpaper), max_size)?;
+                    if spec.sampler.vflip {
+                        img.flip_rows();
+                    }
+                    Ok(img)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err("image decoder panicked".into()))
+            })
+            .collect()
+    })
 }
 
 /// ファイルを読んでデコードする。縦横のどちらかが `max_size` を超えたら、画素をデコードする前にエラーにする。

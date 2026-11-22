@@ -120,27 +120,7 @@ impl Channels {
     /// エラーは `<壁紙のファイル>:<行>: <画像のパス>: <内容>` の形。
     pub fn load(gl: &glow::Context, specs: &[ImageSpec], wallpaper: &Path) -> Result<Self, String> {
         let max = texture::max_size(gl);
-        let decoded: Vec<Result<crate::image::Image, String>> = std::thread::scope(|s| {
-            let handles: Vec<_> = specs
-                .iter()
-                .map(|spec| {
-                    s.spawn(move || {
-                        let mut img = crate::image::load(&spec.resolve(wallpaper), max)?;
-                        if spec.sampler.vflip {
-                            img.flip_rows();
-                        }
-                        Ok(img)
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err("image decoder panicked".into()))
-                })
-                .collect()
-        });
+        let decoded = crate::image::load_all(specs, wallpaper, max);
         let mut images: [Option<Texture>; 4] = Default::default();
         let mut result = Ok(());
         for (spec, img) in specs.iter().zip(decoded) {

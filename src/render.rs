@@ -4,11 +4,15 @@
 //! 円は長さ 0 のカプセル、線は丸い端のカプセル、矩形は判定を常に内側にした四角形。
 //! 回転した矩形（`rect` に angle を渡したとき）だけは箱の SDF で、縁にアンチエイリアスを付ける。
 //! 頂点はまとめて 1 回の draw call で送る。
+//!
+//! 画像（`image`・`subimage`）は別の頂点の形と別のシェーダーで描く（図形の頂点を大きくしないため）。
+//! 画像のテクスチャーは色にアルファを掛けてあるので、ブレンドの係数も図形とは違う。
 
 use glow::HasContext;
 
 use crate::egl::EglContext;
 use crate::gl_program::{self, ProgramError};
+use crate::script::Kind;
 
 /// 1 回の draw call に詰める四角形の上限（u16 インデックスに収まる数）。
 pub const MAX_QUADS: usize = 8192;
@@ -24,6 +28,21 @@ pub struct Vertex {
     /// カプセルは (線分の長さ, 半径)。回転した矩形は (-半分の幅, 半分の高さ)。
     /// x が負なら回転した矩形（カプセルの長さは負にならない）。
     pub shape: [f32; 2],
+    pub color: [u8; 4],
+}
+
+/// 画像の頂点。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ImageVertex {
+    /// 画面上の位置（ピクセル、左上原点）。
+    pub pos: [f32; 2],
+    /// テクスチャー座標。(0, 0) が画像の左上、(1, 1) が右下。
+    pub uv: [f32; 2],
+    /// 回転した画像の、中心を原点としたローカル座標（ピクセル）。回していなければ 0。
+    pub local: [f32; 2],
+    /// 回転した画像の半分の幅・高さ。0 なら回していない画像で、縁にアンチエイリアスを付けない。
+    pub half: [f32; 2],
     pub color: [u8; 4],
 }
 
@@ -184,39 +203,145 @@ void main() {
 }
 "#;
 
-pub struct Renderer {
-    gl: glow::Context,
+const IMAGE_VERT: &str = r#"
+attribute vec2 a_pos;
+attribute vec2 a_uv;
+attribute vec2 a_local;
+attribute vec2 a_half;
+attribute vec4 a_color;
+uniform vec2 u_res;
+varying vec2 v_uv;
+varying vec2 v_local;
+varying vec2 v_half;
+varying vec4 v_color;
+void main() {
+    v_uv = a_uv;
+    v_local = a_local;
+    v_half = a_half;
+    v_color = a_color;
+    vec2 ndc = a_pos / u_res * 2.0 - 1.0;
+    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
+}
+"#;
+
+const IMAGE_FRAG: &str = r#"
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D u_tex;
+varying vec2 v_uv;
+varying vec2 v_local;
+varying vec2 v_half;
+varying vec4 v_color;
+void main() {
+    // ミップマップの選択に微分を使うので、分岐の外で読む。
+    vec4 c = texture2D(u_tex, v_uv);
+    float a = 1.0;
+    if (v_half.x > 0.0) {
+        // 回転した画像: 縁を箱の SDF でぼかす（回転した矩形と同じ）。
+        vec2 q = abs(v_local) - v_half;
+        float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+        a = clamp(0.5 - d, 0.0, 1.0);
+    }
+    // テクスチャーは色にアルファを掛けてあるので、色合いも掛けた形にして掛ける。
+    gl_FragColor = c * vec4(v_color.rgb * v_color.a, v_color.a) * a;
+}
+"#;
+
+/// 描く頂点の形。ブレンドの係数も、テクスチャーの色にアルファを掛けてあるかで変わる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    Shapes,
+    Images,
+}
+
+struct Pass {
     program: glow::Program,
     u_res: glow::UniformLocation,
+    vao: glow::VertexArray,
     vbo: glow::Buffer,
+}
+
+pub struct Renderer {
+    gl: glow::Context,
+    shapes: Pass,
+    images: Pass,
+    /// いま設定してある頂点の形とブレンド。
+    layout: Layout,
     blend: Blend,
+    texture: Option<glow::Texture>,
+}
+
+/// 頂点の属性（場所の番号, 要素数, 型, 正規化するか, 先頭からのバイト数）。
+type Attrib = (&'static str, i32, u32, bool, i32);
+
+const SHAPE_ATTRIBS: &[Attrib] = &[
+    ("a_pos", 2, glow::FLOAT, false, 0),
+    ("a_local", 2, glow::FLOAT, false, 8),
+    ("a_shape", 2, glow::FLOAT, false, 16),
+    ("a_color", 4, glow::UNSIGNED_BYTE, true, 24),
+];
+
+const IMAGE_ATTRIBS: &[Attrib] = &[
+    ("a_pos", 2, glow::FLOAT, false, 0),
+    ("a_uv", 2, glow::FLOAT, false, 8),
+    ("a_local", 2, glow::FLOAT, false, 16),
+    ("a_half", 2, glow::FLOAT, false, 24),
+    ("a_color", 4, glow::UNSIGNED_BYTE, true, 32),
+];
+
+/// プログラムと、頂点の形を覚えた VAO を作る。`ibo` は VAO ごとに結び付ける。
+unsafe fn pass(
+    gl: &glow::Context,
+    vert: &str,
+    frag: &str,
+    attribs: &[Attrib],
+    stride: usize,
+    ibo: glow::Buffer,
+) -> Result<Pass, String> {
+    unsafe {
+        let program = gl_program::build(
+            gl,
+            &[(glow::VERTEX_SHADER, vert), (glow::FRAGMENT_SHADER, frag)],
+            |program| {
+                for (i, a) in attribs.iter().enumerate() {
+                    gl.bind_attrib_location(program, i as u32, a.0);
+                }
+            },
+        )
+        .map_err(|e| match e {
+            ProgramError::Create(e) => e,
+            ProgramError::Compile { log, .. } => format!("shader compile: {log}"),
+            ProgramError::Link(log) => format!("shader link: {log}"),
+        })?;
+        let u_res = gl
+            .get_uniform_location(program, "u_res")
+            .ok_or("u_res not found")?;
+        let vao = gl.create_vertex_array()?;
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ibo));
+        let vbo = gl.create_buffer()?;
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        for (i, &(_, size, ty, normalized, offset)) in attribs.iter().enumerate() {
+            gl.enable_vertex_attrib_array(i as u32);
+            gl.vertex_attrib_pointer_f32(i as u32, size, ty, normalized, stride as i32, offset);
+        }
+        gl.bind_vertex_array(None);
+        Ok(Pass {
+            program,
+            u_res,
+            vao,
+            vbo,
+        })
+    }
 }
 
 impl Renderer {
     pub fn new(egl: &EglContext) -> Result<Self, String> {
         let gl = unsafe { glow::Context::from_loader_function(|s| egl.proc_address(s)) };
         unsafe {
-            let program = gl_program::build(
-                &gl,
-                &[(glow::VERTEX_SHADER, VERT), (glow::FRAGMENT_SHADER, FRAG)],
-                |program| {
-                    for (i, name) in ["a_pos", "a_local", "a_shape", "a_color"]
-                        .iter()
-                        .enumerate()
-                    {
-                        gl.bind_attrib_location(program, i as u32, name);
-                    }
-                },
-            )
-            .map_err(|e| match e {
-                ProgramError::Create(e) => e,
-                ProgramError::Compile { log, .. } => format!("shader compile: {log}"),
-                ProgramError::Link(log) => format!("shader link: {log}"),
-            })?;
-            let u_res = gl
-                .get_uniform_location(program, "u_res")
-                .ok_or("u_res not found")?;
-
             // 四角形 1 つ = 頂点 4 つ = 三角形 2 つ。インデックスは固定なので最初に 1 回だけ送る。
             let mut indices = Vec::with_capacity(MAX_QUADS * 6);
             for q in 0..MAX_QUADS as u16 {
@@ -230,46 +355,76 @@ impl Renderer {
                 as_bytes(&indices),
                 glow::STATIC_DRAW,
             );
-
-            let vbo = gl.create_buffer()?;
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            let stride = std::mem::size_of::<Vertex>() as i32;
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
-            gl.enable_vertex_attrib_array(1);
-            gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 8);
-            gl.enable_vertex_attrib_array(2);
-            gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 16);
-            gl.enable_vertex_attrib_array(3);
-            gl.vertex_attrib_pointer_f32(3, 4, glow::UNSIGNED_BYTE, true, stride, 24);
-
-            gl.use_program(Some(program));
+            let shapes = pass(
+                &gl,
+                VERT,
+                FRAG,
+                SHAPE_ATTRIBS,
+                std::mem::size_of::<Vertex>(),
+                ibo,
+            )?;
+            let images = pass(
+                &gl,
+                IMAGE_VERT,
+                IMAGE_FRAG,
+                IMAGE_ATTRIBS,
+                std::mem::size_of::<ImageVertex>(),
+                ibo,
+            )?;
+            // u_tex はテクスチャーユニット 0（uniform の既定値）。
             gl.enable(glow::BLEND);
             gl.disable(glow::DEPTH_TEST);
 
-            let r = Self {
+            Ok(Self {
                 gl,
-                program,
-                u_res,
-                vbo,
+                shapes,
+                images,
+                layout: Layout::Shapes,
                 blend: Blend::Alpha,
-            };
-            r.apply_blend();
-            Ok(r)
+                texture: None,
+            })
         }
     }
 
     fn apply_blend(&self) {
         unsafe {
-            // フレームバッファーのアルファは 1 のまま保つ。アルファが減ると、コンポジターが
-            // その部分を半透明として扱い、背面が透けてしまう。
+            // 画像のテクスチャーは色にアルファを掛けてあるので、色にはアルファを掛けずに足す。
+            let src = match self.layout {
+                Layout::Shapes => glow::SRC_ALPHA,
+                Layout::Images => glow::ONE,
+            };
             let dst = match self.blend {
                 Blend::Alpha => glow::ONE_MINUS_SRC_ALPHA,
                 Blend::Add => glow::ONE,
             };
-            self.gl
-                .blend_func_separate(glow::SRC_ALPHA, dst, glow::ZERO, glow::ONE);
+            // フレームバッファーのアルファは 1 のまま保つ。アルファが減ると、コンポジターが
+            // その部分を半透明として扱い、背面が透けてしまう。
+            self.gl.blend_func_separate(src, dst, glow::ZERO, glow::ONE);
         }
+    }
+
+    fn pass(&self, layout: Layout) -> &Pass {
+        match layout {
+            Layout::Shapes => &self.shapes,
+            Layout::Images => &self.images,
+        }
+    }
+
+    /// 頂点の形とブレンドを切り替える。変わっていなければ何もしない。
+    fn set_state(&mut self, layout: Layout, blend: Blend) {
+        if layout != self.layout {
+            self.layout = layout;
+            let p = self.pass(layout);
+            unsafe {
+                self.gl.use_program(Some(p.program));
+                self.gl.bind_vertex_array(Some(p.vao));
+                self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.vbo));
+            }
+        } else if blend == self.blend {
+            return;
+        }
+        self.blend = blend;
+        self.apply_blend();
     }
 
     pub fn gl(&self) -> &glow::Context {
@@ -282,12 +437,19 @@ impl Renderer {
     pub fn begin(&mut self, buffer: (u32, u32), screen: (u32, u32)) {
         unsafe {
             self.gl.viewport(0, 0, buffer.0 as i32, buffer.1 as i32);
-            self.gl.use_program(Some(self.program));
+            for p in [&self.images, &self.shapes] {
+                self.gl.use_program(Some(p.program));
+                self.gl
+                    .uniform_2_f32(Some(&p.u_res), screen.0 as f32, screen.1 as f32);
+            }
+            self.gl.bind_vertex_array(Some(self.shapes.vao));
             self.gl
-                .uniform_2_f32(Some(&self.u_res), screen.0 as f32, screen.1 as f32);
-            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+                .bind_buffer(glow::ARRAY_BUFFER, Some(self.shapes.vbo));
+            self.gl.active_texture(glow::TEXTURE0);
         }
+        self.layout = Layout::Shapes;
         self.blend = Blend::Alpha;
+        self.texture = None;
         self.apply_blend();
     }
 
@@ -298,40 +460,56 @@ impl Renderer {
         }
     }
 
-    fn set_blend(&mut self, blend: Blend) {
-        if blend != self.blend {
-            self.blend = blend;
-            self.apply_blend();
+    /// スクリプトが積んだ描画命令を描く。画像をまだテクスチャーにしていなければ、ここで作る。
+    /// テクスチャーを作れなかったときはエラーを返す（何も描かない）。
+    pub fn submit(
+        &mut self,
+        dl: &crate::script::DrawList,
+        images: &crate::lua_images::Images,
+    ) -> Result<(), String> {
+        if dl.segments.iter().any(|s| s.kind != Kind::Shapes) {
+            images.upload(&self.gl)?;
         }
-    }
-
-    /// スクリプトが積んだ描画命令を描く。
-    pub fn submit(&mut self, dl: &crate::script::DrawList) {
         let [r, g, b] = dl.clear.unwrap_or([0.0; 3]);
         self.clear(r, g, b);
-        let total = dl.batch.quads();
-        for (i, &(blend, start)) in dl.segments.iter().enumerate() {
-            let end = dl.segments.get(i + 1).map_or(total, |s| s.1);
-            self.set_blend(blend);
-            let mut q = start;
-            while q < end {
-                let n = (end - q).min(MAX_QUADS);
-                self.draw_quads(&dl.batch.vertices[q * 4..(q + n) * 4]);
-                q += n;
+        for s in &dl.segments {
+            match s.kind {
+                Kind::Shapes => {
+                    self.set_state(Layout::Shapes, s.blend);
+                    self.draw_quads(&dl.batch.vertices[s.start * 4..(s.start + s.quads) * 4]);
+                }
+                Kind::Image(i) => {
+                    let tex = images
+                        .texture(i as usize)
+                        .ok_or("internal: bad image index")?;
+                    self.set_state(Layout::Images, s.blend);
+                    if self.texture != Some(tex) {
+                        self.texture = Some(tex);
+                        unsafe { self.gl.bind_texture(glow::TEXTURE_2D, Some(tex)) };
+                    }
+                    self.draw_quads(&dl.images[s.start * 4..(s.start + s.quads) * 4]);
+                }
             }
         }
+        Ok(())
     }
 
-    fn draw_quads(&self, vertices: &[Vertex]) {
-        unsafe {
-            self.gl
-                .buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(vertices), glow::STREAM_DRAW);
-            self.gl.draw_elements(
-                glow::TRIANGLES,
-                (vertices.len() / 4 * 6) as i32,
-                glow::UNSIGNED_SHORT,
-                0,
-            );
+    /// 四角形を、MAX_QUADS 個ずつに分けて描く。
+    fn draw_quads<T: Copy>(&self, vertices: &[T]) {
+        for chunk in vertices.chunks(MAX_QUADS * 4) {
+            unsafe {
+                self.gl.buffer_data_u8_slice(
+                    glow::ARRAY_BUFFER,
+                    as_bytes(chunk),
+                    glow::STREAM_DRAW,
+                );
+                self.gl.draw_elements(
+                    glow::TRIANGLES,
+                    (chunk.len() / 4 * 6) as i32,
+                    glow::UNSIGNED_SHORT,
+                    0,
+                );
+            }
         }
     }
 
@@ -375,6 +553,11 @@ mod tests {
     #[test]
     fn vertex_is_28_bytes() {
         assert_eq!(std::mem::size_of::<Vertex>(), 28);
+    }
+
+    #[test]
+    fn image_vertex_is_36_bytes() {
+        assert_eq!(std::mem::size_of::<ImageVertex>(), 36);
     }
 
     #[test]

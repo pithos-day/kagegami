@@ -77,11 +77,11 @@ impl Bench {
         let t = self.started.elapsed().as_secs_f32();
         unsafe {
             gl.use_program(Some(g.program));
+            // 図形の描画は自分の VAO を使うので、ここでは既定の VAO を使う。
+            gl.bind_vertex_array(None);
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(g.vbo));
+            gl.enable_vertex_attrib_array(0);
             gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
-            for i in 1..4 {
-                gl.disable_vertex_attrib_array(i);
-            }
             gl.disable(glow::BLEND);
             let loc = |n: &str| gl.get_uniform_location(g.program, n);
             gl.uniform_3_f32(
