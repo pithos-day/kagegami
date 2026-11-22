@@ -90,13 +90,25 @@ fn draw_call_cost() {
         ("rect+angle", "rect(i, 0, 10, 10, 0.5)"),
         ("clear", "clear(0, 0, 0)"),
         ("blend", "blend('alpha')"),
+        ("image", "image('p', i, 0)"),
+        ("image+size", "image('p', i, 0, 10, 10)"),
+        ("image+angle", "image('p', i, 0, 10, 10, 0.5)"),
+        ("subimage", "subimage('p', 1, 1, 4, 4, i, 0, 10, 10)"),
+        ("imagesize", "local w, h = imagesize('p')"),
     ] {
-        let s = Script::from_source(
+        let img = crate::image::Image {
+            width: 16,
+            height: 16,
+            rgba: vec![255; 16 * 16 * 4],
+        };
+        let images = Images::from_images(vec![("p", Default::default(), img)]);
+        let s = Script::with_images(
             &format!("function draw() for i = 1, 10000 do {call} end end"),
             "calls",
             "B",
             1,
             (1920, 1080),
+            Rc::new(images),
         )
         .unwrap();
         for _ in 0..20 {
