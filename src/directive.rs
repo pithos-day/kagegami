@@ -45,7 +45,8 @@ pub enum Wrap {
     Repeat,
 }
 
-/// テクスチャーの設定。既定は filter=mipmap、wrap=repeat、vflip=true。
+/// テクスチャーの設定。シェーダーの既定は filter=mipmap、wrap=repeat、vflip=true。
+/// Lua の既定は filter=mipmap、wrap=clamp で、vflip は指定できない（常に false）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sampler {
     pub filter: Filter,
@@ -225,7 +226,13 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<ImageS
     let path = args
         .next()
         .ok_or_else(|| err(format!("{label}: expected a path")))?;
+    // Lua の画像は 1 枚の絵として置くことが多いので、拡大したときに反対側の端が縁に混ざらないよう
+    // clamp を既定にする（#36）。
     let mut sampler = Sampler {
+        wrap: match syntax {
+            Syntax::Glsl => Wrap::Repeat,
+            Syntax::Lua => Wrap::Clamp,
+        },
         vflip: syntax == Syntax::Glsl,
         ..Sampler::default()
     };
@@ -436,20 +443,20 @@ mod tests {
     }
 
     #[test]
-    fn lua_images_default_to_mipmap_repeat_without_flip() {
+    fn lua_images_default_to_mipmap_clamp_without_flip() {
         let s =
-            lua("-- @image bg a.png\n-- @image dots b.png filter=nearest wrap=clamp\n").unwrap();
+            lua("-- @image bg a.png\n-- @image dots b.png filter=nearest wrap=repeat\n").unwrap();
         assert_eq!(
             s[0].sampler,
             Sampler {
                 filter: Filter::Mipmap,
-                wrap: Wrap::Repeat,
+                wrap: Wrap::Clamp,
                 vflip: false
             }
         );
         assert_eq!(s[1].name, "dots");
         assert_eq!(s[1].sampler.filter, Filter::Nearest);
-        assert_eq!(s[1].sampler.wrap, Wrap::Clamp);
+        assert_eq!(s[1].sampler.wrap, Wrap::Repeat);
     }
 
     #[test]
