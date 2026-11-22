@@ -245,7 +245,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 | `vflip` | `true` / `false` | `true` |
 
 - `vflip=true` は、画像の上が画面の上に来る向き（`fragCoord / iResolution.xy` で画像の左下が画面の左下に来る）
-- 既定の値は Shadertoy と同じつもりだが、Shadertoy のサイトでは確かめていない
+- 既定の値は、Shadertoy のサイトで iChannel に新しく画像を指定したときの設定（mipmap・repeat・vflip 有効）と同じ
 - 大文字・小文字を問わず `@ichannel` か `@image` で始まる名前は指定として確かめ、正しくなければエラーにする（`@iChannel4`・`@ichannel0` など）。それ以外の `@author` などは、ただのコメントとして無視する
 - 画像はすべての出力で 1 回だけ読み込み、出力の間で共有する。読み込みは、壁紙のファイルを読むときに行う（読み込む間は描画が止まる。4K の JPEG のデコードは、#36 の計測で約 20ms）
 

@@ -91,7 +91,9 @@ fn expand(src: &[u8], n: usize, f: impl Fn(&[u8]) -> [u8; 4]) -> Vec<u8> {
 
 fn decode_jpeg(bytes: &[u8], max_size: u32) -> Result<Image, String> {
     use zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
+    // strict mode: 途中で切れたファイルを、足りない部分を埋めてデコードせずにエラーにする（#36）。
     let options = DecoderOptions::default()
+        .set_strict_mode(true)
         .jpeg_set_out_colorspace(ColorSpace::RGBA)
         .set_max_width(max_size as usize)
         .set_max_height(max_size as usize);
@@ -203,7 +205,7 @@ mod tests {
     }
 
     fn reds(img: &Image) -> Vec<u8> {
-        img.rgba.chunks_exact(4).map(|p| p[0]).collect()
+        img.rgba.as_chunks::<4>().0.iter().map(|p| p[0]).collect()
     }
 
     #[test]
@@ -361,6 +363,14 @@ mod tests {
         // 途中で切れたファイル
         assert!(decode(&rgb[..rgb.len() - 20], 16).is_err());
         assert!(decode(&[0xFF, 0xD8, 0xFF], 16).is_err());
+    }
+
+    #[test]
+    fn truncated_jpeg_is_an_error() {
+        let full = std::fs::read("examples/images/plasma.jpg").unwrap();
+        decode(&full, 2048).unwrap();
+        let e = decode(&full[..full.len() / 2], 2048).unwrap_err();
+        assert!(e.starts_with("JPEG:"), "{e}");
     }
 
     #[test]
