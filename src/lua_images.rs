@@ -160,3 +160,40 @@ impl Images {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::directive::{Syntax, parse};
+
+    #[test]
+    fn load_reports_the_line_and_path_of_a_missing_image() {
+        let src = "-- @image a images/plasma.jpg\n-- @image b images/missing.png\n";
+        let specs = parse(src, Syntax::Lua).unwrap();
+        let e = Images::load(&specs, Path::new("examples/x.lua"))
+            .err()
+            .unwrap();
+        assert!(
+            e.starts_with("examples/x.lua:2: examples/images/missing.png: "),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn load_keeps_the_order_and_sizes() {
+        let specs = parse("-- @image p images/plasma.jpg\n", Syntax::Lua).unwrap();
+        let images = Images::load(&specs, Path::new("examples/x.lua")).unwrap();
+        assert_eq!(images.sizes().collect::<Vec<_>>(), [("p", 512, 512)]);
+    }
+
+    #[test]
+    fn premultiply_scales_color_by_alpha() {
+        let mut img = Image {
+            width: 2,
+            height: 1,
+            rgba: vec![255, 128, 10, 128, 200, 200, 200, 0],
+        };
+        img.premultiply();
+        assert_eq!(img.rgba, [128, 64, 5, 128, 0, 0, 0, 0]);
+    }
+}

@@ -749,7 +749,12 @@ mod tests {
             if path.extension().is_some_and(|e| e == "lua") {
                 let src = std::fs::read_to_string(&path).unwrap();
                 let name = path.display().to_string();
-                let s = Script::from_source(&src, &name, "A", 1, (1920, 1080))
+                // App と同じ関数で画像を読む。
+                let specs = crate::directive::parse(&src, crate::directive::Syntax::Lua)
+                    .unwrap_or_else(|e| panic!("{name}:{e}"));
+                let images = Images::load(&specs, &path)
+                    .unwrap_or_else(|e| panic!("{name} の画像を読めない: {e}"));
+                let s = Script::with_images(&src, &name, "A", 1, (1920, 1080), Rc::new(images))
                     .unwrap_or_else(|e| panic!("{name} を読み込めない: {e}"));
                 if let Err(e) = s.frame(1.0 / 60.0) {
                     panic!("{name} の 1 フレーム目でエラーになる: {e}");
