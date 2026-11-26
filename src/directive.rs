@@ -6,6 +6,7 @@
 //! // @bufferA a.glsl
 //! // @common common.glsl
 //! // @iChannel2 bufferA filter=nearest
+//! // @iChannel3 noise3d-rgba
 //! ```
 //!
 //! ```lua
@@ -18,6 +19,8 @@
 //!   だけを指定として確かめる。それ以外の `@author` などは、ただのコメントとして無視する
 
 use std::path::{Path, PathBuf};
+
+use crate::noise::Noise;
 
 /// どちらの壁紙のファイルか。コメントの書き方と、使える指定が違う。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +106,21 @@ pub struct BufferRef {
     pub line: usize,
 }
 
+/// 組み込みの 3D ノイズの名前（#70）。
+pub const NOISE_NAMES: [(&str, Noise); 2] =
+    [("noise3d-grey", Noise::Grey), ("noise3d-rgba", Noise::Rgba)];
+
+/// `@iChannelN noise3d-rgba` のように、チャンネルに組み込みの 3D ノイズを渡す指定（#70）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct NoiseRef {
+    /// チャンネルの番号（0〜3）。
+    pub channel: usize,
+    pub noise: Noise,
+    /// filter と wrap だけを使う。既定は mipmap・repeat。
+    pub sampler: Sampler,
+    pub line: usize,
+}
+
 /// `@bufferA a.glsl`・`@common common.glsl` のように、別のファイルを指す指定。
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileDecl {
@@ -122,6 +140,7 @@ impl FileDecl {
 pub struct GlslHeader {
     pub images: Vec<ImageSpec>,
     pub buffer_refs: Vec<BufferRef>,
+    pub noise_refs: Vec<NoiseRef>,
     /// `@bufferA`〜`@bufferD`。添字はバッファーの添字。
     pub buffers: [Option<FileDecl>; 4],
     pub common: Option<FileDecl>,
@@ -138,14 +157,18 @@ impl GlslHeader {
         buffers.chain(common).min_by_key(|(line, _)| *line)
     }
 
-    /// 画像とバッファーの指定のうち、最初に書かれた行。どれもなければ None。
+    /// 画像・バッファー・ノイズの指定のうち、最初に書かれた行。どれもなければ None。
     pub fn first_channel(&self) -> Option<(usize, usize)> {
         let images = self
             .images
             .iter()
             .map(|s| (s.line, s.name.parse().unwrap_or(0)));
         let refs = self.buffer_refs.iter().map(|r| (r.line, r.channel));
-        images.chain(refs).min_by_key(|(line, _)| *line)
+        let noise = self.noise_refs.iter().map(|r| (r.line, r.channel));
+        images
+            .chain(refs)
+            .chain(noise)
+            .min_by_key(|(line, _)| *line)
     }
 }
 
@@ -153,6 +176,7 @@ impl GlslHeader {
 enum Item {
     Image(ImageSpec),
     BufferRef(BufferRef),
+    NoiseRef(NoiseRef),
     Buffer(usize, FileDecl),
     Common(FileDecl),
 }
@@ -179,6 +203,9 @@ pub fn parse(src: &str, syntax: Syntax) -> Result<Vec<ImageSpec>, String> {
             Item::BufferRef(r) => {
                 return Err(format!("{}: buffers can only be used in shaders", r.line));
             }
+            Item::NoiseRef(r) => {
+                return Err(format!("{}: noise can only be used in shaders", r.line));
+            }
             Item::Buffer(_, d) | Item::Common(d) => {
                 return Err(format!("{}: buffers can only be used in shaders", d.line));
             }
@@ -194,6 +221,7 @@ pub fn parse_glsl(src: &str) -> Result<GlslHeader, String> {
         match item {
             Item::Image(spec) => h.images.push(spec),
             Item::BufferRef(r) => h.buffer_refs.push(r),
+            Item::NoiseRef(r) => h.noise_refs.push(r),
             Item::Buffer(i, d) => {
                 if h.buffers[i].is_some() {
                     return Err(format!(
@@ -258,6 +286,7 @@ fn items(src: &str, syntax: Syntax) -> Result<Vec<Item>, String> {
                     let name = match &item {
                         Item::Image(spec) => Some(spec.name.clone()),
                         Item::BufferRef(r) => Some(r.channel.to_string()),
+                        Item::NoiseRef(r) => Some(r.channel.to_string()),
                         _ => None,
                     };
                     if let Some(name) = name {
@@ -347,6 +376,20 @@ fn buffer_index(token: &str) -> Result<Option<usize>, String> {
     Ok(None)
 }
 
+/// `noise3d-grey`・`noise3d-rgba` ならノイズ。大文字・小文字の違いや、`noise3d-gray` のような
+/// `noise3d` で始まる書き間違いはエラーにする（バッファーの名前と同じ理由）。
+fn noise_name(token: &str) -> Result<Option<Noise>, String> {
+    if let Some((_, n)) = NOISE_NAMES.iter().find(|(name, _)| *name == token) {
+        return Ok(Some(*n));
+    }
+    if token.to_ascii_lowercase().starts_with("noise3d") {
+        return Err(format!(
+            "unknown noise {token:?} (write noise3d-grey or noise3d-rgba; use ./{token} for a file)"
+        ));
+    }
+    Ok(None)
+}
+
 /// `@bufferA a.glsl`・`@common common.glsl` を読む。
 fn file_decl(name: &str, args: Vec<String>, line: usize) -> Result<Item, String> {
     let err = |msg: String| format!("{line}: {msg}");
@@ -414,6 +457,10 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<Item>,
         Syntax::Glsl => buffer_index(&path).map_err(|e| err(format!("{label}: {e}")))?,
         Syntax::Lua => None,
     };
+    let noise = match syntax {
+        Syntax::Glsl => noise_name(&path).map_err(|e| err(format!("{label}: {e}")))?,
+        Syntax::Lua => None,
+    };
     // Lua の画像は 1 枚の絵として置くことが多いので、拡大したときに反対側の端が縁に混ざらないよう
     // clamp を既定にする（#36）。
     let mut sampler = match buffer {
@@ -422,6 +469,11 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<Item>,
             filter: Filter::Linear,
             wrap: Wrap::Clamp,
             vflip: false,
+        },
+        // ノイズの既定は mipmap・repeat（#70）。
+        None if noise.is_some() => Sampler {
+            vflip: false,
+            ..Sampler::default()
         },
         None => Sampler {
             wrap: match syntax {
@@ -456,6 +508,9 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<Item>,
             "vflip" if buffer.is_some() => {
                 return Err(err(format!("{label}: vflip cannot be used with a buffer")));
             }
+            "vflip" if noise.is_some() => {
+                return Err(err(format!("{label}: vflip cannot be used with noise")));
+            }
             "vflip" if syntax == Syntax::Glsl => {
                 sampler.vflip = match value {
                     "true" => true,
@@ -470,6 +525,14 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<Item>,
         return Ok(Some(Item::BufferRef(BufferRef {
             channel: spec_name.parse().unwrap_or(0),
             buffer,
+            sampler,
+            line,
+        })));
+    }
+    if let Some(noise) = noise {
+        return Ok(Some(Item::NoiseRef(NoiseRef {
+            channel: spec_name.parse().unwrap_or(0),
+            noise,
             sampler,
             line,
         })));
@@ -749,6 +812,80 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reads_noise_channels() {
+        let h = parse_glsl(
+            "// @iChannel0 noise3d-grey\n\
+             // @iChannel1 noise3d-rgba filter=nearest wrap=clamp\n\
+             // @iChannel2 ./noise3d-rgba\n",
+        )
+        .unwrap();
+        assert_eq!(
+            h.noise_refs,
+            vec![
+                NoiseRef {
+                    channel: 0,
+                    noise: Noise::Grey,
+                    sampler: Sampler {
+                        filter: Filter::Mipmap,
+                        wrap: Wrap::Repeat,
+                        vflip: false
+                    },
+                    line: 1
+                },
+                NoiseRef {
+                    channel: 1,
+                    noise: Noise::Rgba,
+                    sampler: Sampler {
+                        filter: Filter::Nearest,
+                        wrap: Wrap::Clamp,
+                        vflip: false
+                    },
+                    line: 2
+                },
+            ]
+        );
+        assert_eq!(h.first_channel(), Some((1, 0)));
+        // ./noise3d-rgba はファイルの名前。
+        assert_eq!(h.images.len(), 1);
+        assert_eq!(h.images[0].path, "./noise3d-rgba");
+        // Lua の壁紙では、ただのファイルの名前。
+        assert_eq!(
+            lua("-- @image n noise3d-rgba\n").unwrap()[0].path,
+            "noise3d-rgba"
+        );
+    }
+
+    #[test]
+    fn bad_noise_directives_are_errors() {
+        for (src, want) in [
+            (
+                "// @iChannel0 noise3d-gray",
+                "@iChannel0: unknown noise \"noise3d-gray\" (write noise3d-grey or noise3d-rgba; use ./noise3d-gray for a file)",
+            ),
+            (
+                "// @iChannel0 Noise3D-rgba",
+                "unknown noise \"Noise3D-rgba\"",
+            ),
+            ("// @iChannel0 noise3d", "unknown noise \"noise3d\""),
+            (
+                "// @iChannel0 noise3d-rgba vflip=false",
+                "@iChannel0: vflip cannot be used with noise",
+            ),
+            (
+                "// @iChannel0 noise3d-rgba filter=cubic",
+                "unknown value \"cubic\" for filter",
+            ),
+            (
+                "// @iChannel1 noise3d-grey\n// @iChannel1 a.png",
+                "2: @iChannel1 is specified twice",
+            ),
+        ] {
+            let e = parse_glsl(src).unwrap_err();
+            assert!(e.contains(want), "{src}: {e}");
+        }
     }
 
     #[test]

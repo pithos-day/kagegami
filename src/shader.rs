@@ -3,13 +3,14 @@
 //! `mainImage(out vec4, in vec2)` を書いたファイルを GLSL ES 3.00 で包み、全画面に描く。
 //! 1 フレームの GPU 時間を `EXT_disjoint_timer_query` で測り、長すぎたらエラーとして止める。
 //! バッファー（Buffer A〜D）と Common を使う壁紙（#57）は、パスごとに 1 つのプログラムにする。
+//! 組み込みの 3D ノイズ（#70）を渡すチャンネルは `sampler3D` で宣言する。
 
 use std::path::Path;
 use std::time::Duration;
 
 use glow::HasContext;
 
-use crate::directive::ImageSpec;
+use crate::directive::{ImageSpec, NoiseRef};
 use crate::gl_program::{self, ProgramError};
 use crate::multipass::ShaderFiles;
 use crate::source::Source;
@@ -29,23 +30,52 @@ pub fn is_shader_path(path: &Path) -> bool {
 /// 壁紙のシェーダーの前に付けるもの。`#line` でエラーの行番号をファイルの行に合わせる（`wrap` を参照）。
 /// sampler の既定の精度は lowp なので、Shadertoy と同じく highp にする（RGBA32F のバッファーを
 /// 16 ビットの精度で読まないように。#57）。
-const PREFIX: &str = "#version 300 es
+/// `iChannel0`〜`3` の宣言は、チャンネルの型に合わせて `prefix` で入れる。
+const PREFIX_HEAD: &str = "#version 300 es
 precision highp float;
 precision highp int;
 precision highp sampler2D;
-uniform vec3 iResolution;
+";
+
+const PREFIX_UNIFORMS: &str = "uniform vec3 iResolution;
 uniform float iTime;
 uniform float iTimeDelta;
 uniform int iFrame;
 uniform vec4 iMouse;
 uniform vec4 iDate;
-uniform sampler2D iChannel0;
-uniform sampler2D iChannel1;
-uniform sampler2D iChannel2;
-uniform sampler2D iChannel3;
-uniform vec3 iChannelResolution[4];
+";
+
+const PREFIX_TAIL: &str = "uniform vec3 iChannelResolution[4];
 out vec4 kagegami_FragColor;
 ";
+
+/// チャンネルの sampler の型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dim {
+    /// `sampler2D`（画像・バッファー・何も指定していないチャンネル）。
+    D2,
+    /// `sampler3D`（組み込みの 3D ノイズ）。
+    D3,
+}
+
+/// 壁紙のシェーダーの前に付けるもの。3D のチャンネルがなければ、ノイズを足す前と同じ文字列になる。
+fn prefix(dims: [Dim; 4]) -> String {
+    let mut s = String::from(PREFIX_HEAD);
+    // sampler3D には既定の精度がないので、使うときだけ宣言する。
+    if dims.contains(&Dim::D3) {
+        s.push_str("precision highp sampler3D;\n");
+    }
+    s.push_str(PREFIX_UNIFORMS);
+    for (i, d) in dims.iter().enumerate() {
+        let ty = match d {
+            Dim::D2 => "sampler2D",
+            Dim::D3 => "sampler3D",
+        };
+        s.push_str(&format!("uniform {ty} iChannel{i};\n"));
+    }
+    s.push_str(PREFIX_TAIL);
+    s
+}
 
 /// Image のシェーダーの後に付けるもの。アルファは 1 に固定する（render.rs と同じく、
 /// アルファが 1 未満だとコンポジターが半透明として扱い、背面が透けるため）。
@@ -84,14 +114,15 @@ void main() {
 /// 壁紙のシェーダーを GLSL ES 3.00 で包む。Shadertoy と同じく、uniform の宣言の後に Common、
 /// その後にパスのソースを置く。`#line 行 ソース番号` で、エラーの位置をファイルの行に合わせる。
 /// パスのソースは番号 0、Common は番号 1 にする（Mesa のエラーは `番号:行(列)` の形）。
-pub fn wrap(common: Option<&str>, src: &str, kind: PassKind) -> String {
+pub fn wrap(common: Option<&str>, src: &str, kind: PassKind, dims: [Dim; 4]) -> String {
     let suffix = match kind {
         PassKind::Image => IMAGE_SUFFIX,
         PassKind::Buffer => BUFFER_SUFFIX,
     };
+    let prefix = prefix(dims);
     match common {
-        Some(c) => format!("{PREFIX}#line 1 1\n{c}\n#line 1 0\n{src}{suffix}"),
-        None => format!("{PREFIX}#line 1\n{src}{suffix}"),
+        Some(c) => format!("{prefix}#line 1 1\n{c}\n#line 1 0\n{src}{suffix}"),
+        None => format!("{prefix}#line 1\n{src}{suffix}"),
     }
 }
 
@@ -139,20 +170,22 @@ pub struct Uniforms {
     pub date: [f32; 4],
 }
 
-/// `iChannel0`〜`3` に渡す画像。画像を指定していないチャンネルは黒い 1×1 のテクスチャーにする。
+/// `iChannel0`〜`3` に渡す画像と 3D ノイズ。どちらも指定していないチャンネルは黒い 1×1 のテクスチャーにする。
 pub struct Channels {
     images: [Option<Texture>; 4],
     black: Texture,
 }
 
 impl Channels {
-    /// 指定された画像をデコードしてテクスチャーにする。デコードは画像ごとに別のスレッドで並べて行う。
+    /// 指定された画像をデコードしてテクスチャーにし、ノイズのテクスチャーを作る。
+    /// デコードは画像ごとに別のスレッドで並べて行う。
     /// どれか 1 つでも読めなければ、作ったテクスチャーを消してエラーを返す。
     /// エラーは `<壁紙のファイル>:<行>: <画像のパス>: <内容>` の形。
     pub fn load(
         gl: &glow::Context,
         source: &Source,
         specs: &[ImageSpec],
+        noise: &[NoiseRef],
         wallpaper: &Path,
     ) -> Result<Self, String> {
         let max = texture::max_size(gl);
@@ -169,6 +202,17 @@ impl Channels {
                 }
             }
         }
+        if result.is_ok() {
+            for r in noise {
+                match texture::upload_noise(gl, r.noise, r.sampler) {
+                    Ok(t) => images[r.channel] = Some(t),
+                    Err(e) => {
+                        result = Err(format!("{}:{}: {e}", wallpaper.display(), r.line));
+                        break;
+                    }
+                }
+            }
+        }
         let black = result.and_then(|()| texture::black(gl));
         match black {
             Ok(black) => Ok(Self { images, black }),
@@ -181,21 +225,24 @@ impl Channels {
         }
     }
 
-    /// `iChannelResolution`。画像を指定していないチャンネルは (0, 0, 0)。
+    /// `iChannelResolution`。画像は (幅, 高さ, 1)、ノイズは (32, 32, 32)。
+    /// どちらも指定していないチャンネルは (0, 0, 0)。
     pub fn resolutions(&self) -> [f32; 12] {
         let mut r = [0.0; 12];
         for (i, t) in self.images.iter().enumerate() {
             if let Some(t) = t {
                 r[i * 3] = t.width as f32;
                 r[i * 3 + 1] = t.height as f32;
-                r[i * 3 + 2] = 1.0;
+                r[i * 3 + 2] = t.depth as f32;
             }
         }
         r
     }
 
-    pub fn texture(&self, i: usize) -> glow::Texture {
-        self.images[i].as_ref().unwrap_or(&self.black).tex
+    /// (ターゲット, テクスチャー)。
+    pub fn texture(&self, i: usize) -> (u32, glow::Texture) {
+        let t = self.images[i].as_ref().unwrap_or(&self.black);
+        (t.target(), t.tex)
     }
 
     pub fn delete(self, gl: &glow::Context) {
@@ -216,11 +263,17 @@ pub struct ShaderImages {
 impl ShaderImages {
     /// 画像はそれぞれ、指定を書いたファイルのディレクトリから探す。
     pub fn load(gl: &glow::Context, source: &Source, files: &ShaderFiles) -> Result<Self, String> {
-        let image = Channels::load(gl, source, files.image.images(), &files.image.path)?;
+        let image = Channels::load(
+            gl,
+            source,
+            files.image.images(),
+            files.image.noise_refs(),
+            &files.image.path,
+        )?;
         let mut buffers: [Option<Channels>; 4] = Default::default();
         for (i, pass) in files.buffers.iter().enumerate() {
             let Some(pass) = pass else { continue };
-            match Channels::load(gl, source, pass.images(), &pass.path) {
+            match Channels::load(gl, source, pass.images(), pass.noise_refs(), &pass.path) {
                 Ok(ch) => buffers[i] = Some(ch),
                 Err(e) => {
                     Self { image, buffers }.delete(gl);
@@ -241,7 +294,8 @@ impl ShaderImages {
 
 /// 1 回の描画でチャンネルに渡すもの。
 pub struct Bindings {
-    pub textures: [glow::Texture; 4],
+    /// (ターゲット, テクスチャー)。ノイズのチャンネルだけ `TEXTURE_3D`。
+    pub textures: [(u32, glow::Texture); 4],
     /// バッファーのチャンネルだけ Some（画像はテクスチャーの設定で読む）。
     pub samplers: [Option<glow::Sampler>; 4],
     /// `iChannelResolution`。
@@ -265,7 +319,7 @@ impl Bindings {
         sampler: glow::Sampler,
         size: (u32, u32),
     ) {
-        self.textures[i] = tex;
+        self.textures[i] = (glow::TEXTURE_2D, tex);
         self.samplers[i] = Some(sampler);
         self.resolutions[i * 3] = size.0 as f32;
         self.resolutions[i * 3 + 1] = size.1 as f32;
@@ -286,8 +340,9 @@ impl ShaderProgram {
         common: Option<&str>,
         src: &str,
         kind: PassKind,
+        dims: [Dim; 4],
     ) -> Result<Self, String> {
-        let frag = wrap(common, src, kind);
+        let frag = wrap(common, src, kind, dims);
         let program = gl_program::build(
             gl,
             &[
@@ -351,7 +406,8 @@ impl ShaderProgram {
             gl.uniform_3_f32_slice(channel_res.as_ref(), &channels.resolutions);
             for i in 0..4 {
                 gl.active_texture(glow::TEXTURE0 + i as u32);
-                gl.bind_texture(glow::TEXTURE_2D, Some(channels.textures[i]));
+                let (target, tex) = channels.textures[i];
+                gl.bind_texture(target, Some(tex));
                 gl.bind_sampler(i as u32, channels.samplers[i]);
             }
             gl.active_texture(glow::TEXTURE0);
@@ -533,6 +589,7 @@ mod tests {
             None,
             "void mainImage(out vec4 c, in vec2 p) { c = vec4(1.0); }",
             PassKind::Image,
+            [Dim::D2; 4],
         );
         assert!(s.starts_with("#version 300 es\n"));
         assert!(s.contains("precision highp sampler2D;\n"));
@@ -544,11 +601,47 @@ mod tests {
     }
 
     #[test]
+    fn prefix_without_noise_is_unchanged() {
+        // ノイズを足す前（#70 より前）の前置き。ノイズを使わない壁紙では同じ文字列にする。
+        const BEFORE: &str = "#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+uniform vec3 iResolution;
+uniform float iTime;
+uniform float iTimeDelta;
+uniform int iFrame;
+uniform vec4 iMouse;
+uniform vec4 iDate;
+uniform sampler2D iChannel0;
+uniform sampler2D iChannel1;
+uniform sampler2D iChannel2;
+uniform sampler2D iChannel3;
+uniform vec3 iChannelResolution[4];
+out vec4 kagegami_FragColor;
+";
+        assert_eq!(prefix([Dim::D2; 4]), BEFORE);
+    }
+
+    #[test]
+    fn noise_channels_are_sampler3d() {
+        let s = prefix([Dim::D2, Dim::D3, Dim::D2, Dim::D3]);
+        assert!(s.contains("precision highp sampler3D;\n"));
+        assert!(s.contains("uniform sampler2D iChannel0;\n"));
+        assert!(s.contains("uniform sampler3D iChannel1;\n"));
+        assert!(s.contains("uniform sampler2D iChannel2;\n"));
+        assert!(s.contains("uniform sampler3D iChannel3;\n"));
+        // 精度の宣言は、使う前に置く。
+        assert!(s.find("sampler3D;").unwrap() < s.find("uniform sampler3D").unwrap());
+    }
+
+    #[test]
     fn wrap_puts_common_between_uniforms_and_the_pass() {
         let s = wrap(
             Some("float k() { return 1.0; }"),
             "void mainImage(out vec4 c, in vec2 p) {}",
             PassKind::Buffer,
+            [Dim::D2; 4],
         );
         let uniforms = s.find("uniform vec3 iChannelResolution[4];").unwrap();
         let common = s.find("#line 1 1\nfloat k()").unwrap();

@@ -162,11 +162,13 @@ impl Pass {
         common: Option<&str>,
         kind: PassKind,
     ) -> Result<Self, String> {
-        let program = ShaderProgram::new(gl, common, &file.src, kind).map_err(|e| match kind {
-            // 1 つのファイルだけの壁紙は、今までと同じメッセージにする。
-            PassKind::Image if common.is_none() => e,
-            _ => format!("{}: {e}", file.path.display()),
-        })?;
+        let dims = file.channel_dims();
+        let program =
+            ShaderProgram::new(gl, common, &file.src, kind, dims).map_err(|e| match kind {
+                // 1 つのファイルだけの壁紙は、今までと同じメッセージにする。
+                PassKind::Image if common.is_none() => e,
+                _ => format!("{}: {e}", file.path.display()),
+            })?;
         Ok(Self {
             program,
             buffer_refs: file.buffer_refs().map(|r| r.map(|r| (r.buffer, r.sampler))),
