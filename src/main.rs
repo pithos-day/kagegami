@@ -1,6 +1,7 @@
 mod app;
 #[cfg(feature = "gpu-bench")]
 mod bench;
+mod buffers;
 mod cli;
 mod directive;
 mod egl;
@@ -8,6 +9,7 @@ mod gl_program;
 mod gpu_usage;
 mod image;
 mod lua_images;
+mod multipass;
 mod perf;
 mod pointer;
 mod render;

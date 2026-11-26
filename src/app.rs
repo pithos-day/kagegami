@@ -31,15 +31,18 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
 
+use crate::buffers::{self, BufferSet};
 use crate::cli::{Args, LayerName};
+use crate::directive::Sampler;
 use crate::directive::{self, Syntax};
 use crate::egl::{EglContext, EglSurface};
 use crate::lua_images::Images;
+use crate::multipass::{PassFile, ShaderFiles};
 use crate::perf::{self, OutputStats};
 use crate::pointer::{self, Drag};
 use crate::render::Renderer;
 use crate::script::{self, MouseState, Script};
-use crate::shader::{self, Channels, GpuTimer, ShaderProgram};
+use crate::shader::{self, Bindings, Channels, GpuTimer, PassKind, ShaderImages, ShaderProgram};
 use crate::stderr::elog;
 
 /// 出力ごとに違う乱数の種を作る。
@@ -140,14 +143,99 @@ enum LuaTimer {
 /// 壁紙の中身。種類は起動時のファイルの拡張子で決まり、読み直しても変わらない。
 enum Content {
     Lua(Script),
-    Shader(ShaderState),
+    /// パスごとのプログラムを持つので大きい。
+    Shader(Box<ShaderState>),
+}
+
+/// 1 つのパスのプログラムと、チャンネルに渡すバッファー。
+struct Pass {
+    program: ShaderProgram,
+    /// チャンネルごとの (バッファーの添字, 読むときの設定)。画像のチャンネルは None。
+    buffer_refs: [Option<(usize, Sampler)>; 4],
+}
+
+impl Pass {
+    fn compile(
+        gl: &glow::Context,
+        file: &PassFile,
+        common: Option<&str>,
+        kind: PassKind,
+    ) -> Result<Self, String> {
+        let program = ShaderProgram::new(gl, common, &file.src, kind).map_err(|e| match kind {
+            // 1 つのファイルだけの壁紙は、今までと同じメッセージにする。
+            PassKind::Image if common.is_none() => e,
+            _ => format!("{}: {e}", file.path.display()),
+        })?;
+        Ok(Self {
+            program,
+            buffer_refs: file.buffer_refs().map(|r| r.map(|r| (r.buffer, r.sampler))),
+        })
+    }
+
+    fn bindings(&self, channels: &Channels, buffers: Option<&BufferSet>) -> Bindings {
+        let mut b = Bindings::images(channels);
+        if let Some(set) = buffers {
+            for (i, r) in self.buffer_refs.iter().enumerate() {
+                if let Some((k, sampler)) = r
+                    && let Some(tex) = set.texture(*k)
+                {
+                    b.set_buffer(i, tex, set.sampler(*sampler), set.size());
+                }
+            }
+        }
+        b
+    }
+}
+
+/// Image と Buffer A〜D のパス。
+struct Passes {
+    image: Pass,
+    buffers: [Option<Pass>; 4],
+}
+
+impl Passes {
+    /// すべてのパスをコンパイルする。どれかが失敗したら、作ったものを消してエラーを返す。
+    fn compile(gl: &glow::Context, files: &ShaderFiles) -> Result<Self, String> {
+        let common = files.common.as_ref().map(|(_, src)| src.as_str());
+        let mut buffers: [Option<Pass>; 4] = Default::default();
+        let mut result = Ok(());
+        for (i, f) in files.buffers.iter().enumerate() {
+            let Some(f) = f else { continue };
+            match Pass::compile(gl, f, common, PassKind::Buffer) {
+                Ok(p) => buffers[i] = Some(p),
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        let image = result.and_then(|()| Pass::compile(gl, &files.image, common, PassKind::Image));
+        match image {
+            Ok(image) => Ok(Self { image, buffers }),
+            Err(e) => {
+                for p in buffers.into_iter().flatten() {
+                    p.program.delete(gl);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn delete(self, gl: &glow::Context) {
+        self.image.program.delete(gl);
+        for p in self.buffers.into_iter().flatten() {
+            p.program.delete(gl);
+        }
+    }
 }
 
 /// コンパイル済みのシェーダーと、`iTime`・`iFrame` の基準。
 struct ShaderState {
-    program: ShaderProgram,
-    /// `iChannel0`〜`3`。読み直すまで、すべての出力で同じものを使う。
-    channels: Rc<Channels>,
+    passes: Passes,
+    /// すべてのパスの `iChannel0`〜`3` の画像。読み直すまで、すべての出力で同じものを使う。
+    images: Rc<ShaderImages>,
+    /// Buffer A〜D のテクスチャー（この出力のもの）。バッファーを使わない壁紙では None。
+    buffers: Option<BufferSet>,
     /// GPU 時間を測るタイマー。拡張機能がなければ None（見張らずに描く）。
     timer: Option<GpuTimer>,
     started: Instant,
@@ -155,6 +243,15 @@ struct ShaderState {
 }
 
 impl ShaderState {
+    /// プログラムとバッファーを消し、タイマーを返す。画像は使う出力がなくなったら `AssetCache::collect` で消える。
+    fn delete(self, gl: &glow::Context) -> Option<GpuTimer> {
+        self.passes.delete(gl);
+        if let Some(set) = self.buffers {
+            set.delete(gl);
+        }
+        self.timer
+    }
+
     /// 1 フレーム描く。前のフレームまでに測れた GPU 時間が上限を超えていたら、描かずにエラーを返す。
     fn draw(
         &mut self,
@@ -183,10 +280,31 @@ impl ShaderState {
             mouse,
             date: shader::local_date(),
         };
+        // 出力のサイズや --scale が変わったら、中身を写してサイズを合わせる（#57）。
+        if let Some(set) = &mut self.buffers {
+            set.resize(gl, resolution)?;
+        }
         if let Some(t) = self.timer.as_mut() {
             t.begin(gl);
         }
-        self.program.draw(gl, &u, &self.channels);
+        // A → B → C → D → Image の順に描く。前に描いたバッファーは今のフレーム、
+        // 自分と後ろのバッファーは前のフレームの結果を読む（Shadertoy と同じ）。
+        for (i, pass) in self.passes.buffers.iter().enumerate() {
+            let (Some(pass), Some(set), Some(channels)) =
+                (pass, self.buffers.as_mut(), &self.images.buffers[i])
+            else {
+                continue;
+            };
+            let b = pass.bindings(channels, Some(set));
+            set.begin(gl, i);
+            pass.program.draw(gl, &u, &b);
+            set.end(gl, i);
+        }
+        let b = self
+            .passes
+            .image
+            .bindings(&self.images.image, self.buffers.as_ref());
+        self.passes.image.program.draw(gl, &u, &b);
         if let Some(t) = self.timer.as_mut() {
             t.end(gl);
         }
@@ -259,8 +377,10 @@ pub struct App {
     renderer: Option<Renderer>,
     /// タイマーの拡張機能がないことを一度警告したか。
     timer_warned: bool,
+    /// バッファーを線形フィルターで読めないことを一度警告したか。
+    float_linear_warned: bool,
     /// 壁紙の画像（シェーダーと Lua）。読み直すたびに 1 回だけ作り、すべての出力で使う。
-    channels: AssetCache<Channels>,
+    channels: AssetCache<ShaderImages>,
     lua_images: AssetCache<Images>,
     /// 見張るファイル（壁紙のファイルと、指定された画像）。変わったら `watch_changed` を立てる。
     watch: Vec<PathBuf>,
@@ -279,9 +399,9 @@ trait GlAssets {
     fn delete(self, gl: &glow::Context);
 }
 
-impl GlAssets for Channels {
+impl GlAssets for ShaderImages {
     fn delete(self, gl: &glow::Context) {
-        Channels::delete(self, gl)
+        ShaderImages::delete(self, gl)
     }
 }
 
@@ -395,6 +515,7 @@ impl App {
             egl,
             renderer: None,
             timer_warned: false,
+            float_linear_warned: false,
             channels: AssetCache::default(),
             lua_images: AssetCache::default(),
             watch: vec![args.script.clone()],
@@ -474,34 +595,60 @@ impl App {
         shader::is_shader_path(&self.args.script)
     }
 
-    /// シェーダーのファイルを読んでコンパイルし、i 番目の出力の壁紙にする。
+    /// シェーダーのファイル（とバッファー・Common のファイル）を読んでコンパイルし、i 番目の出力の壁紙にする。
     /// 失敗したら、それまでのシェーダーをそのまま残してエラーを返す（Lua の読み直しと同じ）。
     fn load_shader(&mut self, i: usize) -> Result<(), String> {
         let script = &self.args.script.clone();
-        let src =
-            std::fs::read_to_string(script).map_err(|e| format!("{}: {e}", script.display()))?;
-        let specs = directive::parse(&src, Syntax::Glsl)
-            .map_err(|e| format!("{}:{e}", script.display()))?;
-        self.set_watch(&specs);
+        let mut watch = vec![script.clone()];
+        let files = ShaderFiles::read(script, &mut watch);
+        self.set_watch_paths(watch);
+        let files = files?;
         let es = self.wallpapers[i]
             .egl_surface
             .as_ref()
             .ok_or("no EGL surface")?;
         self.egl.make_current(es)?;
         let gl = ensure_renderer(&mut self.renderer, &self.egl).gl();
+        let float_linear = if files.has_buffers() {
+            let float_linear = buffers::check_support(gl)?;
+            if !float_linear && files.filters_buffers() && !self.float_linear_warned {
+                self.float_linear_warned = true;
+                elog!(
+                    "kagegami: warning: GL_OES_texture_float_linear is not available; \
+                     buffers are read with filter=nearest"
+                );
+            }
+            float_linear
+        } else {
+            false
+        };
         // コンパイルできないシェーダーのために画像を読まないように、先にコンパイルする。
-        let program = ShaderProgram::new(gl, &src)?;
-        let channels = self
+        let passes = Passes::compile(gl, &files)?;
+        let images = self
             .channels
-            .get(&src, || Channels::load(gl, &specs, script));
+            .get(&files.cache_key(), || ShaderImages::load(gl, &files));
         // 読み直しに失敗し続けても、どの出力も使っていない画像が溜まらないようにする。
         self.channels.collect(gl);
-        let channels = match channels {
-            Ok(ch) => ch,
+        let images = match images {
+            Ok(im) => im,
             Err(e) => {
-                program.delete(gl);
+                passes.delete(gl);
                 return Err(e);
             }
+        };
+        // 読み直したときは、バッファーを 0 から作り直す（iFrame も 0 に戻る）。
+        let buffers = if files.has_buffers() {
+            let declared = files.buffers.each_ref().map(Option::is_some);
+            let size = self.wallpapers[i].buffer_size;
+            match BufferSet::new(gl, size, declared, files.mipmapped_buffers(), float_linear) {
+                Ok(set) => Some(set),
+                Err(e) => {
+                    passes.delete(gl);
+                    return Err(e);
+                }
+            }
+        } else {
+            None
         };
         let old = match self.wallpapers[i].content.take() {
             Some(Content::Shader(old)) => Some(old),
@@ -509,10 +656,9 @@ impl App {
         };
         let timer = match old {
             Some(old) => {
-                old.program.delete(gl);
-                drop(old.channels);
+                let timer = old.delete(gl);
                 self.channels.collect(gl);
-                old.timer.map(|mut t| {
+                timer.map(|mut t| {
                     // 前のシェーダーの結果で、直したシェーダーを止めないようにする。
                     t.reset();
                     t
@@ -530,13 +676,14 @@ impl App {
                 t
             }
         };
-        self.wallpapers[i].content = Some(Content::Shader(ShaderState {
-            program,
-            channels,
+        self.wallpapers[i].content = Some(Content::Shader(Box::new(ShaderState {
+            passes,
+            images,
+            buffers,
             timer,
             started: Instant::now(),
             frame: 0,
-        }));
+        })));
         Ok(())
     }
 
@@ -572,6 +719,10 @@ impl App {
         let script = &self.args.script;
         let mut watch = vec![script.clone()];
         watch.extend(specs.iter().map(|s| s.resolve(script)));
+        self.set_watch_paths(watch);
+    }
+
+    fn set_watch_paths(&mut self, watch: Vec<PathBuf>) {
         if watch != self.watch {
             self.watch = watch;
             self.watch_changed = true;
@@ -882,11 +1033,8 @@ impl OutputHandler for App {
         output: wl_output::WlOutput,
     ) {
         if let Some(i) = self.wallpapers.iter().position(|w| w.output == output) {
-            let mut w = self.wallpapers.remove(i);
-            elog!("kagegami: output {} removed", w.name);
-            if let Some(s) = w.egl_surface.take() {
-                self.egl.destroy_surface(s);
-            }
+            elog!("kagegami: output {} removed", self.wallpapers[i].name);
+            self.remove_wallpaper(i);
         }
     }
 }
@@ -894,10 +1042,7 @@ impl OutputHandler for App {
 impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
         if let Some(i) = self.wallpapers.iter().position(|w| &w.layer == layer) {
-            let mut w = self.wallpapers.remove(i);
-            if let Some(s) = w.egl_surface.take() {
-                self.egl.destroy_surface(s);
-            }
+            self.remove_wallpaper(i);
         }
     }
 
@@ -922,6 +1067,32 @@ impl LayerShellHandler for App {
 }
 
 impl App {
+    /// i 番目の出力の壁紙を消す。GL のもの（シェーダーのプログラム・バッファー・タイマー）は、
+    /// コンテキストを共有しているので、ほかの出力が残っていても消えない。ここで消す（#57）。
+    fn remove_wallpaper(&mut self, i: usize) {
+        let mut w = self.wallpapers.remove(i);
+        let Some(s) = w.egl_surface.take() else {
+            return;
+        };
+        if let Some(r) = &self.renderer
+            && self.egl.make_current(&s).is_ok()
+        {
+            let gl = r.gl();
+            if let Some(Content::Shader(sh)) = w.content.take()
+                && let Some(t) = sh.delete(gl)
+            {
+                t.delete(gl);
+            }
+            if let LuaTimer::Ready(t) = std::mem::replace(&mut w.lua_timer, LuaTimer::Unavailable) {
+                t.delete(gl);
+            }
+            self.channels.collect(gl);
+        }
+        // Lua の画像は、使う出力がなくなったら次の描画で消える。
+        drop(w);
+        self.egl.destroy_surface(s);
+    }
+
     /// 論理サイズと出力の倍率から各サイズを決め直し、EGL surface とスクリプトに反映する。
     fn apply_size(&mut self, i: usize) {
         let w = &mut self.wallpapers[i];

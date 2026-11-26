@@ -2,6 +2,7 @@
 //!
 //! `mainImage(out vec4, in vec2)` を書いたファイルを GLSL ES 3.00 で包み、全画面に描く。
 //! 1 フレームの GPU 時間を `EXT_disjoint_timer_query` で測り、長すぎたらエラーとして止める。
+//! バッファー（Buffer A〜D）と Common を使う壁紙（#57）は、パスごとに 1 つのプログラムにする。
 
 use std::path::Path;
 use std::time::Duration;
@@ -10,6 +11,7 @@ use glow::HasContext;
 
 use crate::directive::ImageSpec;
 use crate::gl_program::{self, ProgramError};
+use crate::multipass::ShaderFiles;
 use crate::texture::{self, Texture};
 
 /// 1 フレームの GPU 時間の上限。Lua の毎フレームの制限と同じ値。
@@ -23,10 +25,13 @@ pub fn is_shader_path(path: &Path) -> bool {
     )
 }
 
-/// 壁紙のシェーダーの前に付けるもの。`#line 1` でエラーの行番号をファイルの行に合わせる。
+/// 壁紙のシェーダーの前に付けるもの。`#line` でエラーの行番号をファイルの行に合わせる（`wrap` を参照）。
+/// sampler の既定の精度は lowp なので、Shadertoy と同じく highp にする（RGBA32F のバッファーを
+/// 16 ビットの精度で読まないように。#57）。
 const PREFIX: &str = "#version 300 es
 precision highp float;
 precision highp int;
+precision highp sampler2D;
 uniform vec3 iResolution;
 uniform float iTime;
 uniform float iTimeDelta;
@@ -39,18 +44,33 @@ uniform sampler2D iChannel2;
 uniform sampler2D iChannel3;
 uniform vec3 iChannelResolution[4];
 out vec4 kagegami_FragColor;
-#line 1
 ";
 
-/// 壁紙のシェーダーの後に付けるもの。アルファは 1 に固定する（render.rs と同じく、
+/// Image のシェーダーの後に付けるもの。アルファは 1 に固定する（render.rs と同じく、
 /// アルファが 1 未満だとコンポジターが半透明として扱い、背面が透けるため）。
-const SUFFIX: &str = "
+const IMAGE_SUFFIX: &str = "
 void main() {
     vec4 kagegami_c = vec4(0.0, 0.0, 0.0, 1.0);
     mainImage(kagegami_c, gl_FragCoord.xy);
     kagegami_FragColor = vec4(kagegami_c.rgb, 1.0);
 }
 ";
+
+/// バッファーのシェーダーの後に付けるもの。アルファも含めて、書いた値をそのまま残す。
+const BUFFER_SUFFIX: &str = "
+void main() {
+    vec4 kagegami_c = vec4(0.0, 0.0, 0.0, 1.0);
+    mainImage(kagegami_c, gl_FragCoord.xy);
+    kagegami_FragColor = kagegami_c;
+}
+";
+
+/// どのパスのシェーダーか。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassKind {
+    Image,
+    Buffer,
+}
 
 /// 全画面を覆う三角形 1 つ。頂点属性を使わず gl_VertexID から作る。
 const VERT: &str = "#version 300 es
@@ -60,8 +80,18 @@ void main() {
 }
 ";
 
-pub fn wrap(src: &str) -> String {
-    format!("{PREFIX}{src}{SUFFIX}")
+/// 壁紙のシェーダーを GLSL ES 3.00 で包む。Shadertoy と同じく、uniform の宣言の後に Common、
+/// その後にパスのソースを置く。`#line 行 ソース番号` で、エラーの位置をファイルの行に合わせる。
+/// パスのソースは番号 0、Common は番号 1 にする（Mesa のエラーは `番号:行(列)` の形）。
+pub fn wrap(common: Option<&str>, src: &str, kind: PassKind) -> String {
+    let suffix = match kind {
+        PassKind::Image => IMAGE_SUFFIX,
+        PassKind::Buffer => BUFFER_SUFFIX,
+    };
+    match common {
+        Some(c) => format!("{PREFIX}#line 1 1\n{c}\n#line 1 0\n{src}{suffix}"),
+        None => format!("{PREFIX}#line 1\n{src}{suffix}"),
+    }
 }
 
 /// `iDate`: (年, 月 - 1, 日, 0 時からの秒数)。ローカル時刻。
@@ -158,7 +188,7 @@ impl Channels {
         r
     }
 
-    fn texture(&self, i: usize) -> glow::Texture {
+    pub fn texture(&self, i: usize) -> glow::Texture {
         self.images[i].as_ref().unwrap_or(&self.black).tex
     }
 
@@ -170,6 +200,73 @@ impl Channels {
     }
 }
 
+/// すべてのパスの画像。読み直すまで、すべての出力で同じものを使う。
+pub struct ShaderImages {
+    pub image: Channels,
+    /// 添字はバッファーの添字。
+    pub buffers: [Option<Channels>; 4],
+}
+
+impl ShaderImages {
+    /// 画像はそれぞれ、指定を書いたファイルのディレクトリから探す。
+    pub fn load(gl: &glow::Context, files: &ShaderFiles) -> Result<Self, String> {
+        let image = Channels::load(gl, files.image.images(), &files.image.path)?;
+        let mut buffers: [Option<Channels>; 4] = Default::default();
+        for (i, pass) in files.buffers.iter().enumerate() {
+            let Some(pass) = pass else { continue };
+            match Channels::load(gl, pass.images(), &pass.path) {
+                Ok(ch) => buffers[i] = Some(ch),
+                Err(e) => {
+                    Self { image, buffers }.delete(gl);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Self { image, buffers })
+    }
+
+    pub fn delete(self, gl: &glow::Context) {
+        self.image.delete(gl);
+        for ch in self.buffers.into_iter().flatten() {
+            ch.delete(gl);
+        }
+    }
+}
+
+/// 1 回の描画でチャンネルに渡すもの。
+pub struct Bindings {
+    pub textures: [glow::Texture; 4],
+    /// バッファーのチャンネルだけ Some（画像はテクスチャーの設定で読む）。
+    pub samplers: [Option<glow::Sampler>; 4],
+    /// `iChannelResolution`。
+    pub resolutions: [f32; 12],
+}
+
+impl Bindings {
+    pub fn images(channels: &Channels) -> Self {
+        Self {
+            textures: [0, 1, 2, 3].map(|i| channels.texture(i)),
+            samplers: [None; 4],
+            resolutions: channels.resolutions(),
+        }
+    }
+
+    /// チャンネル `i` をバッファーのテクスチャーにする。
+    pub fn set_buffer(
+        &mut self,
+        i: usize,
+        tex: glow::Texture,
+        sampler: glow::Sampler,
+        size: (u32, u32),
+    ) {
+        self.textures[i] = tex;
+        self.samplers[i] = Some(sampler);
+        self.resolutions[i * 3] = size.0 as f32;
+        self.resolutions[i * 3 + 1] = size.1 as f32;
+        self.resolutions[i * 3 + 2] = 1.0;
+    }
+}
+
 pub struct ShaderProgram {
     program: glow::Program,
     vao: glow::VertexArray,
@@ -178,8 +275,13 @@ pub struct ShaderProgram {
 
 impl ShaderProgram {
     /// コンパイルしてリンクする。エラーはドライバーのメッセージをそのまま返す。
-    pub fn new(gl: &glow::Context, src: &str) -> Result<Self, String> {
-        let frag = wrap(src);
+    pub fn new(
+        gl: &glow::Context,
+        common: Option<&str>,
+        src: &str,
+        kind: PassKind,
+    ) -> Result<Self, String> {
+        let frag = wrap(common, src, kind);
         let program = gl_program::build(
             gl,
             &[
@@ -222,7 +324,7 @@ impl ShaderProgram {
         }
     }
 
-    pub fn draw(&self, gl: &glow::Context, u: &Uniforms, channels: &Channels) {
+    pub fn draw(&self, gl: &glow::Context, u: &Uniforms, channels: &Bindings) {
         let [res, time, dt, frame, mouse, date, channel_res] = &self.loc;
         unsafe {
             gl.viewport(0, 0, u.resolution.0 as i32, u.resolution.1 as i32);
@@ -240,10 +342,11 @@ impl ShaderProgram {
             gl.uniform_4_f32(mouse.as_ref(), mx, my, mz, mw);
             let [dy, dm, dd, ds] = u.date;
             gl.uniform_4_f32(date.as_ref(), dy, dm, dd, ds);
-            gl.uniform_3_f32_slice(channel_res.as_ref(), &channels.resolutions());
+            gl.uniform_3_f32_slice(channel_res.as_ref(), &channels.resolutions);
             for i in 0..4 {
                 gl.active_texture(glow::TEXTURE0 + i as u32);
-                gl.bind_texture(glow::TEXTURE_2D, Some(channels.texture(i)));
+                gl.bind_texture(glow::TEXTURE_2D, Some(channels.textures[i]));
+                gl.bind_sampler(i as u32, channels.samplers[i]);
             }
             gl.active_texture(glow::TEXTURE0);
             gl.disable(glow::BLEND);
@@ -251,6 +354,9 @@ impl ShaderProgram {
             gl.bind_vertex_array(Some(self.vao));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             gl.bind_vertex_array(None);
+            for i in 0..4 {
+                gl.bind_sampler(i, None);
+            }
             gl.enable(glow::BLEND);
         }
     }
@@ -375,6 +481,12 @@ impl GpuTimer {
         self.running = true;
     }
 
+    pub fn delete(self, gl: &glow::Context) {
+        for q in self.queries {
+            unsafe { gl.delete_query(q) };
+        }
+    }
+
     pub fn end(&mut self, gl: &glow::Context) {
         if !self.running {
             return;
@@ -411,8 +523,13 @@ mod tests {
 
     #[test]
     fn wrap_puts_version_first_and_resets_line() {
-        let s = wrap("void mainImage(out vec4 c, in vec2 p) { c = vec4(1.0); }");
+        let s = wrap(
+            None,
+            "void mainImage(out vec4 c, in vec2 p) { c = vec4(1.0); }",
+            PassKind::Image,
+        );
         assert!(s.starts_with("#version 300 es\n"));
+        assert!(s.contains("precision highp sampler2D;\n"));
         assert!(s.contains("uniform int iFrame;"));
         assert!(s.contains("uniform sampler2D iChannel3;"));
         assert!(s.contains("uniform vec3 iChannelResolution[4];"));
@@ -421,18 +538,50 @@ mod tests {
     }
 
     #[test]
-    fn every_shader_example_names_images_that_decode() {
+    fn wrap_puts_common_between_uniforms_and_the_pass() {
+        let s = wrap(
+            Some("float k() { return 1.0; }"),
+            "void mainImage(out vec4 c, in vec2 p) {}",
+            PassKind::Buffer,
+        );
+        let uniforms = s.find("uniform vec3 iChannelResolution[4];").unwrap();
+        let common = s.find("#line 1 1\nfloat k()").unwrap();
+        let pass = s.find("#line 1 0\nvoid mainImage").unwrap();
+        assert!(uniforms < common && common < pass);
+        // バッファーはアルファも含めて書いた値を残す。
+        assert!(s.contains("kagegami_FragColor = kagegami_c;"));
+        assert!(!s.contains("kagegami_c.rgb, 1.0"));
+    }
+
+    #[test]
+    fn every_shader_example_names_files_and_images_that_load() {
+        // examples/*.glsl と、マルチパスの例 examples/<名前>/<名前>.glsl（Image のファイル）。
+        let mut images = Vec::new();
         for entry in std::fs::read_dir("examples").unwrap() {
             let path = entry.unwrap().path();
-            if !is_shader_path(&path) {
-                continue;
+            if path.is_dir() {
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                let image = path.join(format!("{name}.glsl"));
+                if image.exists() {
+                    images.push(image);
+                }
+            } else if is_shader_path(&path) {
+                images.push(path);
             }
-            let src = std::fs::read_to_string(&path).unwrap();
-            let specs = crate::directive::parse(&src, crate::directive::Syntax::Glsl)
-                .unwrap_or_else(|e| panic!("{}:{e}", path.display()));
-            for spec in specs {
-                crate::image::load(&spec.resolve(&path), 2048)
-                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
+        assert!(
+            images
+                .iter()
+                .any(|p| p.parent() != Some(Path::new("examples")))
+        );
+        for path in images {
+            let files = ShaderFiles::read(&path, &mut vec![])
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            for pass in files.passes() {
+                for spec in pass.images() {
+                    crate::image::load(&spec.resolve(&pass.path), 2048)
+                        .unwrap_or_else(|e| panic!("{}: {e}", pass.path.display()));
+                }
             }
         }
     }
