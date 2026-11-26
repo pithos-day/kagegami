@@ -8,6 +8,7 @@ mod egl;
 mod gl_program;
 mod gpu_usage;
 mod image;
+mod keyboard;
 mod lua_images;
 mod multipass;
 mod perf;

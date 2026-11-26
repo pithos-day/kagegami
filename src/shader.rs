@@ -257,6 +257,15 @@ impl Bindings {
         }
     }
 
+    /// チャンネル `i` をキーボードの入力のテクスチャーにする（#69）。
+    pub fn set_keyboard(&mut self, i: usize, t: &crate::texture::Texture) {
+        self.textures[i] = t.tex;
+        self.samplers[i] = None;
+        self.resolutions[i * 3] = t.width as f32;
+        self.resolutions[i * 3 + 1] = t.height as f32;
+        self.resolutions[i * 3 + 2] = 1.0;
+    }
+
     /// チャンネル `i` をバッファーのテクスチャーにする。
     pub fn set_buffer(
         &mut self,

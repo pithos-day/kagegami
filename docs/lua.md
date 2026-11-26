@@ -104,6 +104,41 @@ end
 座標は `mouse.x`・`mouse.y` と同じく左上が原点（`iMouse` と違い y を反転しない）。
 例は `examples/slingshot.lua`。
 
+## キーボード
+
+`keyboard.down(name)` で、そのキーを押しているかを読む。例は `examples/keys.lua`。
+
+```lua
+function update(dt)
+  if keyboard.down("space") then
+    -- ...
+  end
+end
+```
+
+キーの名前は LÖVE と同じ形。
+
+| 名前 | キー |
+|---|---|
+| `"a"`〜`"z"`、`"0"`〜`"9"` | 文字と数字のキー |
+| `";"`、`"-"`、`"@"` など | 記号のキー（キーに書かれた 1 文字） |
+| `"space"`、`"return"`、`"escape"`、`"backspace"`、`"tab"` | |
+| `"left"`、`"right"`、`"up"`、`"down"` | 矢印キー |
+| `"lshift"`、`"rshift"`、`"lctrl"`、`"rctrl"`、`"lalt"`、`"ralt"`、`"lgui"`、`"rgui"` | 修飾キー（左右を区別する。AltGr は `"ralt"`） |
+| `"insert"`、`"delete"`、`"home"`、`"end"`、`"pageup"`、`"pagedown"` | |
+| `"f1"`〜`"f24"` | ファンクションキー |
+| `"kp0"`〜`"kp9"`、`"kp."`、`"kp/"`、`"kp*"`、`"kp-"`、`"kp+"`、`"kp="`、`"kpenter"` | テンキー（NumLock に関係なく数字のキー） |
+| `"capslock"`、`"numlock"`、`"scrolllock"`、`"pause"`、`"printscreen"`、`"menu"` | |
+
+- キーはキーボードの配列に従う（キーに書かれた文字になる）。Shift などを押していても同じ名前になる（Shift+1 も `"1"`）
+- 大文字（`"A"`）や表にない名前（`"enter"` など）を渡すとエラーになる。日本語の入力のキー（変換など）は読めない
+
+キーが届くのは、壁紙にキーボードのフォーカスがあるときだけ。`keyboard.down` を初めて呼んだフレームのあとで、壁紙の layer surface を `keyboard_interactivity` の `on_demand` にして、フォーカスを受け取れるようにする（読み込みのときに呼んでもよい）。フォーカスがいつ来るか（壁紙をクリックしたときなど）はコンポジター次第。ウィンドウがフォーカスを持っている間は、キーは壁紙に届かない。
+
+- フォーカスが外れたら、押しているキーをすべて離した扱いにする
+- `keyboard.down` を呼ばない壁紙では、今までどおり `none` のままにし、フォーカスを受け取らない。読み直したときも `none` に戻し、新しいスクリプトが呼んだら、また `on_demand` にする
+- コンポジターの wlr-layer-shell がバージョン 4 より古く `on_demand` を使えなければ、警告を出してキーを使えないままにする（`keyboard.down` は常に `false`）
+
 ## サンドボックス
 
 壁紙のスクリプトが使えるのは `math`、`string`、`table`、`bit` と基本関数だけ。

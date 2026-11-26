@@ -26,6 +26,15 @@ impl PassFile {
         refs
     }
 
+    /// キーボードの入力を渡すチャンネル（#69）。
+    pub fn keyboard_channels(&self) -> [bool; 4] {
+        let mut ch = [false; 4];
+        for r in &self.header.keyboard_refs {
+            ch[r.channel] = true;
+        }
+        ch
+    }
+
     pub fn images(&self) -> &[ImageSpec] {
         &self.header.images
     }
@@ -149,6 +158,11 @@ impl ShaderFiles {
     /// Image と、宣言されたバッファーのパス。
     pub fn passes(&self) -> impl Iterator<Item = &PassFile> {
         std::iter::once(&self.image).chain(self.buffers.iter().flatten())
+    }
+
+    /// どれかのパスがキーボードの入力を読むか。
+    pub fn uses_keyboard(&self) -> bool {
+        self.passes().any(|p| !p.header.keyboard_refs.is_empty())
     }
 
     pub fn has_buffers(&self) -> bool {
