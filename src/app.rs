@@ -43,6 +43,7 @@ use crate::pointer::{self, Drag};
 use crate::render::Renderer;
 use crate::script::{self, MouseState, Script};
 use crate::shader::{self, Bindings, Channels, GpuTimer, PassKind, ShaderImages, ShaderProgram};
+use crate::source::Source;
 use crate::stderr::elog;
 
 /// 出力ごとに違う乱数の種を作る。
@@ -385,6 +386,8 @@ pub struct App {
     /// 見張るファイル（壁紙のファイルと、指定された画像）。変わったら `watch_changed` を立てる。
     watch: Vec<PathBuf>,
     watch_changed: bool,
+    /// 壁紙のファイルの在りか（ファイル・ディレクトリ・zip ファイル）。
+    source: Source,
     args: Args,
     frame_period: Duration,
     wallpapers: Vec<Wallpaper>,
@@ -488,6 +491,7 @@ impl App {
         globals: &GlobalList,
         qh: &QueueHandle<Self>,
         args: Args,
+        source: Source,
     ) -> Result<Self, String> {
         let compositor =
             CompositorState::bind(globals, qh).map_err(|e| format!("wl_compositor: {e}"))?;
@@ -518,8 +522,9 @@ impl App {
             float_linear_warned: false,
             channels: AssetCache::default(),
             lua_images: AssetCache::default(),
-            watch: vec![args.script.clone()],
+            watch: vec![source.watched_entry()],
             watch_changed: false,
+            source,
             frame_period: Duration::from_secs_f64(1.0 / args.fps),
             perf: args.perf.then(|| PerfState {
                 tty: std::io::IsTerminal::is_terminal(&std::io::stderr()),
@@ -592,15 +597,15 @@ impl App {
     }
 
     fn is_shader(&self) -> bool {
-        shader::is_shader_path(&self.args.script)
+        self.source.is_shader()
     }
 
     /// シェーダーのファイル（とバッファー・Common のファイル）を読んでコンパイルし、i 番目の出力の壁紙にする。
     /// 失敗したら、それまでのシェーダーをそのまま残してエラーを返す（Lua の読み直しと同じ）。
     fn load_shader(&mut self, i: usize) -> Result<(), String> {
-        let script = &self.args.script.clone();
-        let mut watch = vec![script.clone()];
-        let files = ShaderFiles::read(script, &mut watch);
+        let script = self.source.entry();
+        let mut watch = vec![script.to_path_buf()];
+        let files = ShaderFiles::read(&self.source, script, &mut watch);
         self.set_watch_paths(watch);
         let files = files?;
         let es = self.wallpapers[i]
@@ -624,9 +629,9 @@ impl App {
         };
         // コンパイルできないシェーダーのために画像を読まないように、先にコンパイルする。
         let passes = Passes::compile(gl, &files)?;
-        let images = self
-            .channels
-            .get(&files.cache_key(), || ShaderImages::load(gl, &files));
+        let images = self.channels.get(&files.cache_key(), || {
+            ShaderImages::load(gl, &self.source, &files)
+        });
         // 読み直しに失敗し続けても、どの出力も使っていない画像が溜まらないようにする。
         self.channels.collect(gl);
         let images = match images {
@@ -693,13 +698,16 @@ impl App {
         if self.is_shader() {
             return self.load_shader(i);
         }
-        let path = &self.args.script.clone();
-        let src = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let path = &self.source.entry().to_path_buf();
+        let src = self.source.read_to_string(path)?;
         let specs =
             directive::parse(&src, Syntax::Lua).map_err(|e| format!("{}:{e}", path.display()))?;
         self.set_watch(&specs);
         // テクスチャーにするのは最初に描くとき。使われなくなった画像は render で消す。
-        let images = self.lua_images.get(&src, || Images::load(&specs, path))?;
+        let source = &self.source;
+        let images = self
+            .lua_images
+            .get(&src, || Images::load(source, &specs, path))?;
         let w = &mut self.wallpapers[i];
         let script = Script::with_images(
             &src,
@@ -716,13 +724,14 @@ impl App {
     /// 見張るファイルを、壁紙のファイルと指定された画像にする。
     /// 画像が読めなくても見張る（直して保存したら読み直すため）。
     fn set_watch(&mut self, specs: &[directive::ImageSpec]) {
-        let script = &self.args.script;
-        let mut watch = vec![script.clone()];
+        let script = self.source.entry();
+        let mut watch = vec![script.to_path_buf()];
         watch.extend(specs.iter().map(|s| s.resolve(script)));
         self.set_watch_paths(watch);
     }
 
     fn set_watch_paths(&mut self, watch: Vec<PathBuf>) {
+        let watch = self.source.watch_paths(watch);
         if watch != self.watch {
             self.watch = watch;
             self.watch_changed = true;
@@ -747,6 +756,7 @@ impl App {
     /// 壁紙のファイルを読み直す。読み込めた出力だけ新しい壁紙に切り替える。
     pub fn reload(&mut self) {
         elog!("kagegami: reloading {}", self.args.script.display());
+        self.source.reload();
         self.channels.stale = true;
         self.lua_images.stale = true;
         for i in 0..self.wallpapers.len() {
@@ -803,7 +813,7 @@ impl App {
         }
         let elapsed = now.duration_since(p.last);
         p.last = now;
-        let shader_file = shader::is_shader_path(&self.args.script);
+        let shader_file = self.source.is_shader();
         let mut lua_bytes = None;
         let rows: Vec<_> = self
             .wallpapers

@@ -39,6 +39,7 @@ impl Image {
 /// 指定された画像を、画像ごとに別のスレッドで並べてデコードする。`vflip` の指定もここで行う。
 /// 結果は `specs` と同じ順に並ぶ。
 pub fn load_all(
+    source: &crate::source::Source,
     specs: &[crate::directive::ImageSpec],
     wallpaper: &Path,
     max_size: u32,
@@ -48,7 +49,7 @@ pub fn load_all(
             .iter()
             .map(|spec| {
                 s.spawn(move || {
-                    let mut img = load(&spec.resolve(wallpaper), max_size)?;
+                    let mut img = load(source, &spec.resolve(wallpaper), max_size)?;
                     if spec.sampler.vflip {
                         img.flip_rows();
                     }
@@ -67,8 +68,8 @@ pub fn load_all(
 }
 
 /// ファイルを読んでデコードする。縦横のどちらかが `max_size` を超えたら、画素をデコードする前にエラーにする。
-pub fn load(path: &Path, max_size: u32) -> Result<Image, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+pub fn load(source: &crate::source::Source, path: &Path, max_size: u32) -> Result<Image, String> {
+    let bytes = source.read(path)?;
     decode(&bytes, max_size).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -415,7 +416,12 @@ mod tests {
 
     #[test]
     fn missing_file_names_the_path() {
-        let e = load(Path::new("/nonexistent/kagegami.png"), 16).unwrap_err();
+        let e = load(
+            &crate::source::Source::disk(),
+            Path::new("/nonexistent/kagegami.png"),
+            16,
+        )
+        .unwrap_err();
         assert!(e.starts_with("/nonexistent/kagegami.png:"), "{e}");
     }
 }
