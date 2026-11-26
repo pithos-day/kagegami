@@ -5,6 +5,7 @@ Lua で書けるライブ壁紙。Wayland（wlr-layer-shell）の背景レイヤ
 Lua の壁紙は、点や線などの図形を「1 フレームに一度だけ計算して、図形として GPU に送る」ので、
 全ピクセルで同じ計算を繰り返すシェーダー方式の壁紙より GPU の負荷が小さい。
 Shadertoy 形式の GLSL のシェーダーも、そのまま壁紙にできる。
+詳しくは [使い方の詳細](docs/usage.md)・[Lua の壁紙](docs/lua.md)・[シェーダーの壁紙](docs/shader.md) を参照。
 
 ## ビルド
 
