@@ -37,10 +37,7 @@ struct Zip {
 
 impl Zip {
     fn read(path: &Path) -> Self {
-        let archive = std::fs::read(path)
-            .map_err(|e| e.to_string())
-            .and_then(Archive::parse)
-            .map_err(|e| format!("{}: {e}", path.display()));
+        let archive = Archive::open(path).map_err(|e| format!("{}: {e}", path.display()));
         Self {
             archive,
             extracted: Mutex::new(HashMap::new()),
@@ -477,7 +474,13 @@ pub mod tests {
             vec![d.0.join("w.zip")]
         );
         d.write("w.zip", &build(&[File::new("main.glsl", b"v2")]));
-        assert_eq!(s.read(s.entry()).unwrap(), b"v1");
+        // 中身は展開するときに zip ファイルから読む。読み直す前に置き換えられた zip は、前の中央
+        // ディレクトリと合わずにエラーになる（見張っているので、すぐに読み直す）。
+        assert!(
+            s.read(s.entry())
+                .unwrap_err()
+                .contains("CRC does not match")
+        );
         s.reload();
         assert_eq!(s.read(s.entry()).unwrap(), b"v2");
         // 保存の途中で壊れていても、入口の場所は変えずにエラーを返す。
