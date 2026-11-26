@@ -104,6 +104,11 @@ impl Buffer {
                 }
                 gl.clear_color(0.0, 0.0, 0.0, 0.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
+                // tex_storage_2d の中身は不定なので、ミップマップの段も 0 にしておく
+                // （最初のフレームで自分を mipmap で読んだときに、不定な値が残り続けないように）。
+                if levels > 1 {
+                    gl.generate_mipmap(glow::TEXTURE_2D);
+                }
             }
             // VRAM が足りないときなど。
             match gl.get_error() {
