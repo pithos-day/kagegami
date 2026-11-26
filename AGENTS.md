@@ -38,4 +38,5 @@ Rust（edition 2024）+ LuaJIT（mlua）の Wayland ライブ壁紙。wlr-layer-
 - 壁紙スクリプトのサンドボックスを保つ。使えるのは `math`・`string`・`table`・`bit` と基本関数だけで、`io`・`os`・`require`・`load` 系・`debug`・`ffi`・`jit`・`coroutine`・`getfenv` / `setfenv`・`string.dump` とバイトコードの読み込みは使えない。`ffi` は描画関数の内側に閉じ込め、スクリプトから触れさせない
 - 暴走したスクリプトへの制限を保つ（読み込み 2 秒・毎フレーム 0.25 秒・1 フレーム 100 万図形、5 秒戻らなければ終了コード 3 で終了）
 - シェーダーの壁紙は、1 フレームの GPU 時間が 0.25 秒を超えたら止める（`GL_EXT_disjoint_timer_query` で測る）
+- 仕様（コマンドのオプション・Lua の API・シェーダーの uniform と指定・制限・サンドボックス・エラーの扱い）を変えたら、`docs/` の該当ファイル（`usage.md`・`lua.md`・`shader.md`）も同じ PR で合わせて変える。ファイルや節を足したら、一覧の `docs/README.md` も変える
 - 性能の変更は `--features gpu-bench` で改善前と改善後を測り、「計測記録」に残す
