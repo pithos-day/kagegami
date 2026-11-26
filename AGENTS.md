@@ -28,6 +28,7 @@
 - 計測は、改善前の版を残してから始める。数値を推測で書かない
 - 誤りが見つかったら、`誤りの修正` ラベルで「誤っていた内容 → 根拠 → 修正 → 修正前後の検証」を残す
 - コミットは Conventional Commits。Issue・PR・ドキュメントは日本語で書く
+- 作業は Issue ごとに git worktree を作って行う。新しいブランチは `git fetch origin` の後に `origin/main` から切る（`git worktree add ../kagegami-<topic> -b <branch> origin/main`）。メインのチェックアウトでブランチを切り替えない。マージした後は `git worktree remove` で消す（#66）
 
 ## kagegami
 
