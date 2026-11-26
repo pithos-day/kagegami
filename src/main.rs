@@ -10,6 +10,7 @@ mod gpu_usage;
 mod image;
 mod lua_images;
 mod multipass;
+mod noise;
 mod perf;
 mod pointer;
 mod render;
