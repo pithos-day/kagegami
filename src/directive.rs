@@ -106,6 +106,18 @@ pub struct BufferRef {
     pub line: usize,
 }
 
+/// チャンネルにキーボードの入力を渡す指定の名前（#69）。
+pub const KEYBOARD: &str = "keyboard";
+
+/// `@iChannelN keyboard` のように、チャンネルにキーボードの入力を渡す指定。設定は書けない
+/// （Shadertoy と同じく nearest・clamp で読む）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyboardRef {
+    /// チャンネルの番号（0〜3）。
+    pub channel: usize,
+    pub line: usize,
+}
+
 /// 組み込みの 3D ノイズの名前（#70）。
 pub const NOISE_NAMES: [(&str, Noise); 2] =
     [("noise3d-grey", Noise::Grey), ("noise3d-rgba", Noise::Rgba)];
@@ -140,6 +152,7 @@ impl FileDecl {
 pub struct GlslHeader {
     pub images: Vec<ImageSpec>,
     pub buffer_refs: Vec<BufferRef>,
+    pub keyboard_refs: Vec<KeyboardRef>,
     pub noise_refs: Vec<NoiseRef>,
     /// `@bufferA`〜`@bufferD`。添字はバッファーの添字。
     pub buffers: [Option<FileDecl>; 4],
@@ -157,17 +170,19 @@ impl GlslHeader {
         buffers.chain(common).min_by_key(|(line, _)| *line)
     }
 
-    /// 画像・バッファー・ノイズの指定のうち、最初に書かれた行。どれもなければ None。
+    /// 画像・バッファー・ノイズ・キーボードの指定のうち、最初に書かれた行。どれもなければ None。
     pub fn first_channel(&self) -> Option<(usize, usize)> {
         let images = self
             .images
             .iter()
             .map(|s| (s.line, s.name.parse().unwrap_or(0)));
         let refs = self.buffer_refs.iter().map(|r| (r.line, r.channel));
+        let keyboard = self.keyboard_refs.iter().map(|r| (r.line, r.channel));
         let noise = self.noise_refs.iter().map(|r| (r.line, r.channel));
         images
             .chain(refs)
             .chain(noise)
+            .chain(keyboard)
             .min_by_key(|(line, _)| *line)
     }
 }
@@ -176,6 +191,7 @@ impl GlslHeader {
 enum Item {
     Image(ImageSpec),
     BufferRef(BufferRef),
+    KeyboardRef(KeyboardRef),
     NoiseRef(NoiseRef),
     Buffer(usize, FileDecl),
     Common(FileDecl),
@@ -203,6 +219,10 @@ pub fn parse(src: &str, syntax: Syntax) -> Result<Vec<ImageSpec>, String> {
             Item::BufferRef(r) => {
                 return Err(format!("{}: buffers can only be used in shaders", r.line));
             }
+            // Lua の指定は @image だけなので、ここには来ない。
+            Item::KeyboardRef(r) => {
+                return Err(format!("{}: keyboard can only be used in shaders", r.line));
+            }
             Item::NoiseRef(r) => {
                 return Err(format!("{}: noise can only be used in shaders", r.line));
             }
@@ -221,6 +241,7 @@ pub fn parse_glsl(src: &str) -> Result<GlslHeader, String> {
         match item {
             Item::Image(spec) => h.images.push(spec),
             Item::BufferRef(r) => h.buffer_refs.push(r),
+            Item::KeyboardRef(r) => h.keyboard_refs.push(r),
             Item::NoiseRef(r) => h.noise_refs.push(r),
             Item::Buffer(i, d) => {
                 if h.buffers[i].is_some() {
@@ -286,6 +307,7 @@ fn items(src: &str, syntax: Syntax) -> Result<Vec<Item>, String> {
                     let name = match &item {
                         Item::Image(spec) => Some(spec.name.clone()),
                         Item::BufferRef(r) => Some(r.channel.to_string()),
+                        Item::KeyboardRef(r) => Some(r.channel.to_string()),
                         Item::NoiseRef(r) => Some(r.channel.to_string()),
                         _ => None,
                     };
@@ -461,6 +483,25 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<Item>,
         Syntax::Glsl => noise_name(&path).map_err(|e| err(format!("{label}: {e}")))?,
         Syntax::Lua => None,
     };
+    if syntax == Syntax::Glsl && buffer.is_none() && noise.is_none() {
+        if path == KEYBOARD {
+            if let Some(opt) = args.next() {
+                return Err(err(format!(
+                    "{label}: keyboard takes no options, got {opt:?}"
+                )));
+            }
+            return Ok(Some(Item::KeyboardRef(KeyboardRef {
+                channel: spec_name.parse().unwrap_or(0),
+                line,
+            })));
+        }
+        // `Keyboard` のような書き間違いは、画像のファイルとして探さずにエラーにする。
+        if path.eq_ignore_ascii_case(KEYBOARD) {
+            return Err(err(format!(
+                "{label}: unknown channel {path:?} (write {KEYBOARD}; use ./{path} for a file)"
+            )));
+        }
+    }
     // Lua の画像は 1 枚の絵として置くことが多いので、拡大したときに反対側の端が縁に混ざらないよう
     // clamp を既定にする（#36）。
     let mut sampler = match buffer {
@@ -812,6 +853,50 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reads_keyboard_channels() {
+        let h = parse_glsl("// @iChannel0 photo.png\n// @iChannel3 keyboard\n").unwrap();
+        assert_eq!(
+            h.keyboard_refs,
+            [KeyboardRef {
+                channel: 3,
+                line: 2
+            }]
+        );
+        assert_eq!(h.images.len(), 1);
+        assert_eq!(h.first_channel(), Some((1, 0)));
+        let h = parse_glsl("// @iChannel1 keyboard\n").unwrap();
+        assert_eq!(h.first_channel(), Some((1, 1)));
+        // ./keyboard は画像のファイル。
+        let h = parse_glsl("// @iChannel0 ./keyboard\n").unwrap();
+        assert!(h.keyboard_refs.is_empty());
+        assert_eq!(h.images[0].path, "./keyboard");
+        for (src, want) in [
+            (
+                "// @iChannel0 keyboard filter=nearest",
+                "1: @iChannel0: keyboard takes no options, got \"filter=nearest\"",
+            ),
+            (
+                "// @iChannel0 Keyboard",
+                "1: @iChannel0: unknown channel \"Keyboard\" (write keyboard; use ./Keyboard for a file)",
+            ),
+            (
+                "// @iChannel0 keyboard\n// @iChannel0 a.png",
+                "2: @iChannel0 is specified twice",
+            ),
+            (
+                "void f() {}\n// @iChannel0 keyboard",
+                "2: @iChannel0 must be in the comments at the top",
+            ),
+        ] {
+            let e = parse_glsl(src).unwrap_err();
+            assert!(e.starts_with(want), "{src:?}: {e}");
+        }
+        // Lua の @image に keyboard と書いたら、keyboard という名前の画像のファイル。
+        let specs = lua("-- @image k keyboard\n").unwrap();
+        assert_eq!(specs[0].path, "keyboard");
     }
 
     #[test]

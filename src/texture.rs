@@ -170,3 +170,59 @@ pub fn black(gl: &glow::Context) -> Result<Texture, String> {
         },
     )
 }
+
+/// キーボードの入力のテクスチャー（#69）。Shadertoy と同じ R8 の 256×3 で、nearest・clamp で読む。
+pub fn keyboard(gl: &glow::Context) -> Result<Texture, String> {
+    use crate::keyboard::{TEXTURE_HEIGHT, TEXTURE_WIDTH};
+    unsafe {
+        let tex = gl.create_texture()?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::R8 as i32,
+            TEXTURE_WIDTH as i32,
+            TEXTURE_HEIGHT as i32,
+            0,
+            glow::RED,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(Some(&[0u8; TEXTURE_WIDTH * TEXTURE_HEIGHT])),
+        );
+        for (p, v) in [
+            (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
+            (glow::TEXTURE_MAG_FILTER, glow::NEAREST),
+            (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+            (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+        ] {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, p, v as i32);
+        }
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        Ok(Texture {
+            tex,
+            width: TEXTURE_WIDTH as u32,
+            height: TEXTURE_HEIGHT as u32,
+            depth: 1,
+        })
+    }
+}
+
+/// キーボードの入力のテクスチャーを、`keyboard::Keys::texture` の中身にする。
+pub fn update_keyboard(gl: &glow::Context, t: &Texture, data: &[u8]) {
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(t.tex));
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        gl.tex_sub_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            0,
+            0,
+            t.width as i32,
+            t.height as i32,
+            glow::RED,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(Some(data)),
+        );
+        gl.bind_texture(glow::TEXTURE_2D, None);
+    }
+}
