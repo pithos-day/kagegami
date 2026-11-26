@@ -277,7 +277,9 @@ mod tests {
     #[test]
     fn errors_name_the_file_and_line() {
         let d = Dir::new("err");
-        let cases: &[(&str, &[(&str, &str)], &str)] = &[
+        // (Image のファイルの先頭, ほかのファイルの (名前, 先頭), 期待するエラー)
+        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+        let cases: &[Case] = &[
             (
                 "// @iChannel0 bufferB\n",
                 &[],
