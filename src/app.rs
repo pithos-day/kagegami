@@ -313,7 +313,7 @@ impl ShaderState {
     }
 }
 
-/// Lua の `update` に渡す `dt` の上限（秒）。README の `update(dt)` の説明と合わせて変える。
+/// Lua の `update` に渡す `dt` の上限（秒）。
 const MAX_LUA_DT: f64 = 0.25;
 
 /// 壁紙の中身を 1 フレーム描く。`dt` は前のフレームからの秒数。読み込めていないときや、
@@ -753,7 +753,7 @@ impl App {
             if !self.can_load(i) {
                 continue;
             }
-            // 読み直すたびに新しい種を使う（#26）。README の「壁紙の書き方」と合わせて変える。
+            // 読み直すたびに新しい種を使う（#26）。
             let seed = seed_for(&self.wallpapers[i].seed);
             match self.load_content(i, seed) {
                 Ok(()) => {

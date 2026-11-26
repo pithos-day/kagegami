@@ -2,7 +2,6 @@
 //!
 //! 壁紙を作りながら、制限（Lua の時間・図形の数・シェーダーの GPU 時間）に対する余裕を見るためのもの。
 //! 測ることで描画を変えないように、`glFinish` は使わず、GPU 時間は timer query で測る。
-//! 書式は README の「負荷を見る」と合わせて変える。
 
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
