@@ -1,4 +1,4 @@
-// examples/ink/ink.glsl の Buffer A。前のフレームのインクを流れに沿って運び、
+// examples/ink/main.glsl の Buffer A。前のフレームのインクを流れに沿って運び、
 // 渦の中心から色を足す。ドラッグした場所には白いインクを足す。
 // @iChannel0 bufferA
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {

@@ -752,7 +752,7 @@ mod tests {
                 // App と同じ関数で画像を読む。
                 let specs = crate::directive::parse(&src, crate::directive::Syntax::Lua)
                     .unwrap_or_else(|e| panic!("{name}:{e}"));
-                let images = Images::load(&specs, &path)
+                let images = Images::load(&crate::source::Source::disk(), &specs, &path)
                     .unwrap_or_else(|e| panic!("{name} の画像を読めない: {e}"));
                 let s = Script::with_images(&src, &name, "A", 1, (1920, 1080), Rc::new(images))
                     .unwrap_or_else(|e| panic!("{name} を読み込めない: {e}"));

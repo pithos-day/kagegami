@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-pub const USAGE: &str = "usage: kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] [-p] <wallpaper.lua|wallpaper.glsl>";
+pub const USAGE: &str = "usage: kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] [-p] <wallpaper.lua|wallpaper.glsl|directory|wallpaper.zip>";
 
 /// `--scale` で受け付ける範囲。
 pub const SCALE_MIN: f64 = 0.25;

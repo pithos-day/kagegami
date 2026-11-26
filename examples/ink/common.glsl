@@ -1,4 +1,4 @@
-// examples/ink/ink.glsl の Common。Buffer A（sim.glsl）と Image の両方の先頭に入る。
+// examples/ink/main.glsl の Common。Buffer A（sim.glsl）と Image の両方の先頭に入る。
 
 // p を中心 c のまわりに回す渦。中心から離れるほど弱くなる。
 vec2 swirl(vec2 p, vec2 c, float strength) {

@@ -175,9 +175,11 @@ dependencies = [
 name = "kagegami"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "glow",
  "khronos-egl",
  "libc",
+ "miniz_oxide 0.8.9",
  "mlua",
  "png",
  "smithay-client-toolkit",

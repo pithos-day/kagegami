@@ -15,9 +15,11 @@ mod pointer;
 mod render;
 mod script;
 mod shader;
+mod source;
 mod stderr;
 mod texture;
 mod watcher;
+mod zipfile;
 
 use std::os::fd::AsRawFd;
 use std::process::ExitCode;
@@ -51,16 +53,16 @@ fn main() -> ExitCode {
 const WATCHDOG_LIMIT: Duration = Duration::from_secs(5);
 
 fn run(args: cli::Args) -> Result<(), String> {
-    check_readable(&args.script)?;
+    let source = source::Source::open(&args.script)?;
+    let watched = source.watched_entry();
     let conn =
         Connection::connect_to_env().map_err(|e| format!("cannot connect to Wayland: {e}"))?;
     let (globals, mut queue) = registry_queue_init(&conn).map_err(|e| e.to_string())?;
     let qh = queue.handle();
-    let script_path = args.script.clone();
-    let mut app = app::App::new(&conn, &globals, &qh, args)?;
+    let mut app = app::App::new(&conn, &globals, &qh, args, source)?;
 
     script::spawn_watchdog(WATCHDOG_LIMIT);
-    let mut watcher = watcher::FileWatcher::new(script_path);
+    let mut watcher = watcher::FileWatcher::new(watched);
     loop {
         queue
             .dispatch_pending(&mut app)
@@ -85,16 +87,6 @@ fn run(args: cli::Args) -> Result<(), String> {
             .fold(watcher.until_next(now), Duration::min);
         wait_and_read(guard, timeout)?;
     }
-}
-
-/// 起動時に壁紙のファイルを読めるか確かめる（#37）。
-/// 起動時に読めないのはパスの打ち間違いがほとんどなので、Wayland に接続する前に終了する。
-/// 実行中に消えた場合は保存の途中とみなして待つ（`watcher` を参照）。
-fn check_readable(path: &std::path::Path) -> Result<(), String> {
-    // ディレクトリも File::open では開けてしまうので、読んで確かめる。
-    std::fs::read(path)
-        .map(|_| ())
-        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Wayland の接続にイベントが届くか `timeout` が過ぎるまで待ち、届いたイベントを読む。
@@ -124,30 +116,6 @@ fn poll_timeout_ms(timeout: Duration) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn missing_script_is_an_error() {
-        let path =
-            std::env::temp_dir().join(format!("kagegami-main-{}-missing.lua", std::process::id()));
-        let e = check_readable(&path).unwrap_err();
-        assert!(e.contains(&path.display().to_string()), "{e}");
-        assert!(e.contains("No such file or directory"), "{e}");
-    }
-
-    #[test]
-    fn directory_is_an_error() {
-        assert!(check_readable(&std::env::temp_dir()).is_err());
-    }
-
-    #[test]
-    fn existing_script_is_readable() {
-        let path =
-            std::env::temp_dir().join(format!("kagegami-main-{}-existing.lua", std::process::id()));
-        std::fs::write(&path, "").unwrap();
-        let r = check_readable(&path);
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(r, Ok(()));
-    }
 
     #[test]
     fn poll_timeout_rounds_up_to_milliseconds() {

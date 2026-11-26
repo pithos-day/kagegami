@@ -20,10 +20,11 @@ cp target/release/kagegami ~/.local/bin/
 ## 使い方
 
 ```sh
-kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] [-p] <wallpaper.lua|wallpaper.glsl>
+kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] [-p] <wallpaper.lua|wallpaper.glsl|directory|wallpaper.zip>
 ```
 
 - 拡張子が `.glsl` か `.frag` のファイルはシェーダーの壁紙、それ以外は Lua の壁紙として読む
+- ディレクトリか zip ファイルを渡すと、その中の `main.glsl`・`main.frag`・`main.lua` のどれか 1 つを壁紙のファイルとして読む
 
 - `-o`, `--output`: 描画する出力の名前（`niri msg outputs` などで出る `DP-1` など）。省略すると全出力
 - `-f`, `--fps`: フレームレートの上限（既定 60）
@@ -38,7 +39,8 @@ kagegami [-o OUTPUT] [-f FPS] [-s SCALE] [-l background|bottom|top|overlay] [-p]
 kagegami examples/geometry.lua          # 全出力に描画する
 kagegami -o DP-1 examples/geometry.lua  # DP-1 だけに描画する
 kagegami examples/waves.glsl            # シェーダーの壁紙
-kagegami examples/ink/ink.glsl          # バッファーを使うシェーダーの壁紙
+kagegami examples/ink                   # バッファーを使うシェーダーの壁紙（ディレクトリ）
+kagegami ink.zip                        # 同じものを zip にしたもの
 ```
 
 ## 開発

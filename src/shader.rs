@@ -12,6 +12,7 @@ use glow::HasContext;
 use crate::directive::ImageSpec;
 use crate::gl_program::{self, ProgramError};
 use crate::multipass::ShaderFiles;
+use crate::source::Source;
 use crate::texture::{self, Texture};
 
 /// 1 フレームの GPU 時間の上限。Lua の毎フレームの制限と同じ値。
@@ -148,9 +149,14 @@ impl Channels {
     /// 指定された画像をデコードしてテクスチャーにする。デコードは画像ごとに別のスレッドで並べて行う。
     /// どれか 1 つでも読めなければ、作ったテクスチャーを消してエラーを返す。
     /// エラーは `<壁紙のファイル>:<行>: <画像のパス>: <内容>` の形。
-    pub fn load(gl: &glow::Context, specs: &[ImageSpec], wallpaper: &Path) -> Result<Self, String> {
+    pub fn load(
+        gl: &glow::Context,
+        source: &Source,
+        specs: &[ImageSpec],
+        wallpaper: &Path,
+    ) -> Result<Self, String> {
         let max = texture::max_size(gl);
-        let decoded = crate::image::load_all(specs, wallpaper, max);
+        let decoded = crate::image::load_all(source, specs, wallpaper, max);
         let mut images: [Option<Texture>; 4] = Default::default();
         let mut result = Ok(());
         for (spec, img) in specs.iter().zip(decoded) {
@@ -209,12 +215,12 @@ pub struct ShaderImages {
 
 impl ShaderImages {
     /// 画像はそれぞれ、指定を書いたファイルのディレクトリから探す。
-    pub fn load(gl: &glow::Context, files: &ShaderFiles) -> Result<Self, String> {
-        let image = Channels::load(gl, files.image.images(), &files.image.path)?;
+    pub fn load(gl: &glow::Context, source: &Source, files: &ShaderFiles) -> Result<Self, String> {
+        let image = Channels::load(gl, source, files.image.images(), &files.image.path)?;
         let mut buffers: [Option<Channels>; 4] = Default::default();
         for (i, pass) in files.buffers.iter().enumerate() {
             let Some(pass) = pass else { continue };
-            match Channels::load(gl, pass.images(), &pass.path) {
+            match Channels::load(gl, source, pass.images(), &pass.path) {
                 Ok(ch) => buffers[i] = Some(ch),
                 Err(e) => {
                     Self { image, buffers }.delete(gl);
@@ -555,31 +561,22 @@ mod tests {
 
     #[test]
     fn every_shader_example_names_files_and_images_that_load() {
-        // examples/*.glsl と、マルチパスの例 examples/<名前>/<名前>.glsl（Image のファイル）。
-        let mut images = Vec::new();
+        // examples/*.glsl と、マルチパスの例のディレクトリ examples/<名前>/（入口は main.glsl）。
+        let mut args = Vec::new();
         for entry in std::fs::read_dir("examples").unwrap() {
             let path = entry.unwrap().path();
-            if path.is_dir() {
-                let name = path.file_name().unwrap().to_str().unwrap().to_string();
-                let image = path.join(format!("{name}.glsl"));
-                if image.exists() {
-                    images.push(image);
-                }
-            } else if is_shader_path(&path) {
-                images.push(path);
+            if (path.is_dir() && path.join("main.glsl").exists()) || is_shader_path(&path) {
+                args.push(path);
             }
         }
-        assert!(
-            images
-                .iter()
-                .any(|p| p.parent() != Some(Path::new("examples")))
-        );
-        for path in images {
-            let files = ShaderFiles::read(&path, &mut vec![])
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(args.iter().any(|p| p.is_dir()));
+        for arg in args {
+            let source = Source::open(&arg).unwrap_or_else(|e| panic!("{e}"));
+            let files = ShaderFiles::read(&source, source.entry(), &mut vec![])
+                .unwrap_or_else(|e| panic!("{}: {e}", arg.display()));
             for pass in files.passes() {
                 for spec in pass.images() {
-                    crate::image::load(&spec.resolve(&pass.path), 2048)
+                    crate::image::load(&source, &spec.resolve(&pass.path), 2048)
                         .unwrap_or_else(|e| panic!("{}: {e}", pass.path.display()));
                 }
             }

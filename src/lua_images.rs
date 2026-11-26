@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::directive::{ImageSpec, Sampler};
 use crate::image::Image;
+use crate::source::Source;
 use crate::texture::{self, Texture};
 
 /// デコードする画像の縦横の上限。GPU の上限は、テクスチャーにするときに確かめる。
@@ -36,8 +37,13 @@ struct Entry {
 impl Images {
     /// 指定された画像をデコードする。どれか 1 つでも読めなければエラーを返す。
     /// エラーは `<壁紙のファイル>:<行>: <画像のパス>: <内容>` の形。
-    pub fn load(specs: &[ImageSpec], wallpaper: &Path) -> Result<Self, String> {
-        let decoded = crate::image::load_all(specs, wallpaper, MAX_DECODE_SIZE);
+    pub fn load(source: &Source, specs: &[ImageSpec], wallpaper: &Path) -> Result<Self, String> {
+        for spec in specs {
+            source
+                .check_path(&spec.path)
+                .map_err(|e| format!("{}:{}: {e}", wallpaper.display(), spec.line))?;
+        }
+        let decoded = crate::image::load_all(source, specs, wallpaper, MAX_DECODE_SIZE);
         let mut list = Vec::with_capacity(specs.len());
         for (spec, img) in specs.iter().zip(decoded) {
             let img = img.map_err(|e| format!("{}:{}: {e}", wallpaper.display(), spec.line))?;
@@ -170,7 +176,7 @@ mod tests {
     fn load_reports_the_line_and_path_of_a_missing_image() {
         let src = "-- @image a images/plasma.jpg\n-- @image b images/missing.png\n";
         let specs = parse(src, Syntax::Lua).unwrap();
-        let e = Images::load(&specs, Path::new("examples/x.lua"))
+        let e = Images::load(&Source::disk(), &specs, Path::new("examples/x.lua"))
             .err()
             .unwrap();
         assert!(
@@ -182,8 +188,36 @@ mod tests {
     #[test]
     fn load_keeps_the_order_and_sizes() {
         let specs = parse("-- @image p images/plasma.jpg\n", Syntax::Lua).unwrap();
-        let images = Images::load(&specs, Path::new("examples/x.lua")).unwrap();
+        let images = Images::load(&Source::disk(), &specs, Path::new("examples/x.lua")).unwrap();
         assert_eq!(images.sizes().collect::<Vec<_>>(), [("p", 512, 512)]);
+    }
+
+    #[test]
+    fn load_reads_images_from_a_zip() {
+        use crate::source::tests::Dir;
+        use crate::zipfile::test_zip::{File, build};
+        let jpg = std::fs::read("examples/images/plasma.jpg").unwrap();
+        let src = "-- @image p images/plasma.jpg\n";
+        let d = Dir::new("lua-zip");
+        let zip = d.write(
+            "w.zip",
+            &build(&[
+                File::new("w/main.lua", src.as_bytes()),
+                File::new("w/images/plasma.jpg", &jpg).stored(),
+            ]),
+        );
+        let source = Source::open(&zip).unwrap();
+        assert!(!source.is_shader());
+        let specs = parse(src, Syntax::Lua).unwrap();
+        let images = Images::load(&source, &specs, source.entry()).unwrap();
+        assert_eq!(images.sizes().collect::<Vec<_>>(), [("p", 512, 512)]);
+
+        let specs = parse("\n-- @image p ~/plasma.jpg\n", Syntax::Lua).unwrap();
+        let e = Images::load(&source, &specs, source.entry()).err().unwrap();
+        assert!(
+            e.ends_with("w.zip/w/main.lua:2: ~/plasma.jpg: absolute paths and ~/ cannot be used in a zip file"),
+            "{e}"
+        );
     }
 
     #[test]
