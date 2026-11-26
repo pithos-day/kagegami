@@ -481,6 +481,12 @@ impl GpuTimer {
         self.running = true;
     }
 
+    pub fn delete(self, gl: &glow::Context) {
+        for q in self.queries {
+            unsafe { gl.delete_query(q) };
+        }
+    }
+
     pub fn end(&mut self, gl: &glow::Context) {
         if !self.running {
             return;

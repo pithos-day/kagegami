@@ -243,6 +243,15 @@ struct ShaderState {
 }
 
 impl ShaderState {
+    /// プログラムとバッファーを消し、タイマーを返す。画像は使う出力がなくなったら `AssetCache::collect` で消える。
+    fn delete(self, gl: &glow::Context) -> Option<GpuTimer> {
+        self.passes.delete(gl);
+        if let Some(set) = self.buffers {
+            set.delete(gl);
+        }
+        self.timer
+    }
+
     /// 1 フレーム描く。前のフレームまでに測れた GPU 時間が上限を超えていたら、描かずにエラーを返す。
     fn draw(
         &mut self,
@@ -647,13 +656,9 @@ impl App {
         };
         let timer = match old {
             Some(old) => {
-                old.passes.delete(gl);
-                if let Some(set) = old.buffers {
-                    set.delete(gl);
-                }
-                drop(old.images);
+                let timer = old.delete(gl);
                 self.channels.collect(gl);
-                old.timer.map(|mut t| {
+                timer.map(|mut t| {
                     // 前のシェーダーの結果で、直したシェーダーを止めないようにする。
                     t.reset();
                     t
@@ -1028,11 +1033,8 @@ impl OutputHandler for App {
         output: wl_output::WlOutput,
     ) {
         if let Some(i) = self.wallpapers.iter().position(|w| w.output == output) {
-            let mut w = self.wallpapers.remove(i);
-            elog!("kagegami: output {} removed", w.name);
-            if let Some(s) = w.egl_surface.take() {
-                self.egl.destroy_surface(s);
-            }
+            elog!("kagegami: output {} removed", self.wallpapers[i].name);
+            self.remove_wallpaper(i);
         }
     }
 }
@@ -1040,10 +1042,7 @@ impl OutputHandler for App {
 impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
         if let Some(i) = self.wallpapers.iter().position(|w| &w.layer == layer) {
-            let mut w = self.wallpapers.remove(i);
-            if let Some(s) = w.egl_surface.take() {
-                self.egl.destroy_surface(s);
-            }
+            self.remove_wallpaper(i);
         }
     }
 
@@ -1068,6 +1067,32 @@ impl LayerShellHandler for App {
 }
 
 impl App {
+    /// i 番目の出力の壁紙を消す。GL のもの（シェーダーのプログラム・バッファー・タイマー）は、
+    /// コンテキストを共有しているので、ほかの出力が残っていても消えない。ここで消す（#57）。
+    fn remove_wallpaper(&mut self, i: usize) {
+        let mut w = self.wallpapers.remove(i);
+        let Some(s) = w.egl_surface.take() else {
+            return;
+        };
+        if let Some(r) = &self.renderer
+            && self.egl.make_current(&s).is_ok()
+        {
+            let gl = r.gl();
+            if let Some(Content::Shader(sh)) = w.content.take()
+                && let Some(t) = sh.delete(gl)
+            {
+                t.delete(gl);
+            }
+            if let LuaTimer::Ready(t) = std::mem::replace(&mut w.lua_timer, LuaTimer::Unavailable) {
+                t.delete(gl);
+            }
+            self.channels.collect(gl);
+        }
+        // Lua の画像は、使う出力がなくなったら次の描画で消える。
+        drop(w);
+        self.egl.destroy_surface(s);
+    }
+
     /// 論理サイズと出力の倍率から各サイズを決め直し、EGL surface とスクリプトに反映する。
     fn apply_size(&mut self, i: usize) {
         let w = &mut self.wallpapers[i];
