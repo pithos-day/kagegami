@@ -210,7 +210,7 @@ pub const TEXTURE_WIDTH: usize = 256;
 pub const TEXTURE_HEIGHT: usize = 3;
 
 /// 1 つの出力のキーの状態。押したフレームだけの印（2 行目）を、出力ごとに描いたときに消すため、
-/// 出力ごとに持つ。キーのイベントはすべての出力に渡す。
+/// 出力ごとに持つ。キーのイベントは、キーボードのフォーカスを持っている出力にだけ渡す。
 #[derive(Clone, Debug, Default)]
 pub struct Keys {
     /// 押しているキー（`wl_keyboard` のキーの番号と、押したときに決めたキー）。

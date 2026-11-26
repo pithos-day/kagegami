@@ -128,7 +128,7 @@ pub struct Wallpaper {
     mouse: MouseState,
     /// シェーダーの `iMouse` と、Lua の `mouse.press_x`・`press_y`・`dragging`。
     drag: Drag,
-    /// キーボードの入力（#69）。キーのイベントは、どの出力にフォーカスがあっても全部の出力に渡す。
+    /// キーボードの入力（#69）。キーのイベントは、キーボードのフォーカスを持っている出力にだけ渡す（マウスと同じ）。
     keys: Keys,
     /// `--perf` で出す負荷の集計。
     stats: OutputStats,
@@ -403,6 +403,8 @@ pub struct App {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     /// キーボードを持つ seat。
     keyboard_seat: Option<wl_seat::WlSeat>,
+    /// キーボードのフォーカスを持っている壁紙の surface。
+    keyboard_focus: Option<wl_surface::WlSurface>,
     /// キーの番号から記号を引く、キーボードの配列。
     layout: keyboard::Layout,
     /// 壁紙の layer surface を `KeyboardInteractivity::OnDemand` にしているか（#69）。
@@ -553,6 +555,7 @@ impl App {
             pointer: None,
             keyboard: None,
             keyboard_seat: None,
+            keyboard_focus: None,
             layout: keyboard::Layout::default(),
             keyboard_on: false,
             keyboard_warned: false,
@@ -913,6 +916,7 @@ impl App {
         if let Some(k) = self.keyboard.take() {
             k.release();
         }
+        self.keyboard_focus = None;
         self.layout = keyboard::Layout::default();
         for w in &mut self.wallpapers {
             w.keys.release_all();
@@ -1391,14 +1395,19 @@ impl KeyboardHandler for App {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _: u32,
         raw: &[u32],
         keysyms: &[Keysym],
     ) {
-        for (&r, &sym) in raw.iter().zip(keysyms) {
-            let key = self.layout.key(r, sym);
-            for w in &mut self.wallpapers {
+        self.keyboard_focus = Some(surface.clone());
+        let keys: Vec<_> = raw
+            .iter()
+            .zip(keysyms)
+            .map(|(&r, &sym)| (r, self.layout.key(r, sym)))
+            .collect();
+        if let Some(w) = self.find(surface) {
+            for (r, key) in keys {
                 w.keys.hold(r, key);
             }
         }
@@ -1412,6 +1421,8 @@ impl KeyboardHandler for App {
         _: &wl_surface::WlSurface,
         _: u32,
     ) {
+        // フォーカスが外れた出力のキーを離した扱いにする。ほかの出力は押していないので、全部に行ってよい。
+        self.keyboard_focus = None;
         self.release_all_keys();
     }
 
@@ -1424,7 +1435,10 @@ impl KeyboardHandler for App {
         event: KeyEvent,
     ) {
         let key = self.layout.key(event.raw_code, event.keysym);
-        for w in &mut self.wallpapers {
+        let Some(surface) = self.keyboard_focus.clone() else {
+            return;
+        };
+        if let Some(w) = self.find(&surface) {
             w.keys.press(event.raw_code, key);
         }
     }
@@ -1448,6 +1462,7 @@ impl KeyboardHandler for App {
         _: u32,
         event: KeyEvent,
     ) {
+        // 押していない出力では何も変わらないので、全部の出力で離す。
         for w in &mut self.wallpapers {
             w.keys.release(event.raw_code);
         }
