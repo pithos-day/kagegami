@@ -19,10 +19,10 @@ GLSL ES 3.00（`#version 300 es`）として、出力ごとにコンパイルす
 | `int iFrame` | 読み込んでからのフレーム数 |
 | `vec4 iMouse` | マウス（下を参照） |
 | `vec4 iDate` | (年, 月 - 1, 日, 0 時からの秒数)。ローカル時刻 |
-| `sampler2D iChannel0`〜`3` | 画像（下の「画像」を参照）、バッファー（下の「バッファーと Common」を参照）、キーボード（下の「キーボード」を参照）。指定していないチャンネルは黒 |
-| `vec3 iChannelResolution[4]` | 画像・バッファー・キーボードのピクセルサイズ（z は 1）。指定していないチャンネルは (0, 0, 0) |
+| `sampler2D iChannel0`〜`3` | 画像（下の「画像」を参照）、バッファー（下の「バッファーと Common」を参照）、キーボード（下の「キーボード」を参照）。指定していないチャンネルは黒。3D ノイズを指定したチャンネルだけ `sampler3D`（下の「3D ノイズ」を参照） |
+| `vec3 iChannelResolution[4]` | 画像・バッファー・キーボードのピクセルサイズ（z は 1）。3D ノイズは (32, 32, 32)。指定していないチャンネルは (0, 0, 0) |
 
-`iChannel0`〜`3` に渡せるのは、画像（PNG・JPEG）、バッファー（Buffer A〜D）、キーボード。音声・キューブマップ・動画は使えない。
+`iChannel0`〜`3` に渡せるのは、画像（PNG・JPEG）、バッファー（Buffer A〜D）、組み込みの 3D ノイズ、キーボード。音声・キューブマップ・動画は使えない。
 
 ## 画像
 
@@ -94,6 +94,31 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 - GPU が `GL_OES_texture_float_linear` に対応していなければ、起動時に警告を出し、`linear`・`mipmap` を `nearest` として読む（Shadertoy と同じ）
 - Common のエラーは、行番号の前の数字が 1 になる（Mesa では `1:行(列)`。パスのファイルは `0:行(列)`）。Common の中で閉じていない括弧などは、続くパスのファイルの位置でエラーになることがある
 - VRAM: 1 つのバッファーにつき、RGBA32F のテクスチャーを 2 枚（前のフレームの結果と、今描いている方）、出力ごとに持つ。1 枚は 横 × 縦 × 16 バイト。#58 の計測では、バッファーを使わない壁紙と比べて、1920×1080 でバッファー 1 つが約 66MiB、4 つが約 255MiB、3840×2160 で 4 つが約 1.0GiB 増えた（1 つの出力あたり）。`filter=mipmap` で読むバッファーは、計算ではさらに約 1/3 増える（測っていない）。`--scale 0.5` で約 1/4 になる
+
+## 3D ノイズ
+
+`@iChannel0`〜`@iChannel3` に `noise3d-grey` か `noise3d-rgba` と書くと、kagegami が作る 32×32×32 のノイズを `sampler3D` で読める。Shadertoy の組み込みの 3D ノイズ（グレーと RGBA の 2 種類）の代わりに使う。例は `examples/fog.glsl`。
+
+```glsl
+// @iChannel0 noise3d-grey
+// @iChannel1 noise3d-rgba filter=nearest
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec3 p = vec3(fragCoord / iResolution.y, iTime * 0.1);
+    fragColor = vec4(vec3(texture(iChannel0, p).r), 1.0);
+}
+```
+
+| 名前 | 形式 | 中身 |
+|---|---|---|
+| `noise3d-grey` | R8（`.r` だけが値で、`.gba` は (0, 0, 1)） | `noise3d-rgba` のバイト列の先頭 32³ バイト |
+| `noise3d-rgba` | RGBA8 | ボクセルごと・チャンネルごとに 0〜1 の一様な乱数 |
+
+- 中身は Shadertoy のファイルとは違う。どちらも、隣り合うボクセルやチャンネルの間に相関のない一様な乱数（#70）
+- 乱数の種は固定なので、起動ごと・出力ごと・読み直すごとに同じノイズになる
+- オプションは `filter`（`nearest` / `linear` / `mipmap`、既定 `mipmap`）と `wrap`（`clamp` / `repeat`、既定 `repeat`）。`wrap` は 3 軸（s・t・r）すべてにかかる。`vflip` は書けない（エラーになる）
+- 名前は大文字・小文字も含めて正確に書く。`noise3d` で始まるほかの名前（`noise3d-gray`・`Noise3D-rgba` など）はエラーになる。`noise3d` で始まる名前の画像のファイルは `./noise3d-rgba.png` のように書く
+- 3D ノイズを指定したチャンネルは `sampler3D` になるので、`texture(iChannelN, vec3)` で読む。`vec2` で読むとコンパイルエラーになる
+- ノイズは最初に使うときに 1 回だけ作る（#70 の計測で、作るのに約 35µs、GPU に送るのに 1 枚あたり約 2ms 以下）
 
 ## キーボード
 

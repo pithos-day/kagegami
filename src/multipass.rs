@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::directive::{self, BUFFER_NAMES, BufferRef, GlslHeader, ImageSpec};
+use crate::directive::{self, BUFFER_NAMES, BufferRef, GlslHeader, ImageSpec, NoiseRef};
 use crate::source::Source;
 
 /// 1 つのパスのファイル。
@@ -37,6 +37,19 @@ impl PassFile {
 
     pub fn images(&self) -> &[ImageSpec] {
         &self.header.images
+    }
+
+    pub fn noise_refs(&self) -> &[NoiseRef] {
+        &self.header.noise_refs
+    }
+
+    /// チャンネルごとの、シェーダーで宣言する sampler の型。ノイズのチャンネルだけ 3D にする。
+    pub fn channel_dims(&self) -> [crate::shader::Dim; 4] {
+        let mut dims = [crate::shader::Dim::D2; 4];
+        for r in &self.header.noise_refs {
+            dims[r.channel] = crate::shader::Dim::D3;
+        }
+        dims
     }
 }
 

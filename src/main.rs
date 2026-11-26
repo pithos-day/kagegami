@@ -11,6 +11,7 @@ mod image;
 mod keyboard;
 mod lua_images;
 mod multipass;
+mod noise;
 mod perf;
 mod pointer;
 mod render;
