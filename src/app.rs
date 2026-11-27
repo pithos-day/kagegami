@@ -1657,8 +1657,8 @@ void mainImage(out vec4 c, in vec2 p) {
         let files = ShaderFiles::read(&source, source.entry(), &mut vec![]).unwrap();
         cubemap_pass::check_support(&gl).unwrap();
         let float_linear = buffers::check_support(&gl).unwrap();
-        // 出力は正方形でなく、面のサイズとも違う大きさにする（iResolution と viewport の取り違えを見つけるため）。
-        let (size, face) = ((40u32, 24u32), 16u32);
+        // 出力は正方形でなく、縦は面のサイズの半分より小さくする（iResolution と viewport の取り違えを見つけるため）。
+        let (size, face) = ((40u32, 4u32), 16u32);
         let passes = Passes::compile(&gl, &files).unwrap();
         let images = Rc::new(ShaderImages::load(&gl, &source, &files).unwrap());
         let declared = files.buffers.each_ref().map(Option::is_some);
@@ -1704,7 +1704,7 @@ void mainImage(out vec4 c, in vec2 p) {
         // Image から読むと今のフレーム（差 0）、Buffer A と Cubemap A 自身からは前のフレーム（差 1）。rayOri は原点。
         assert_eq!(px(6), [0, 1, 1]);
         // Cubemap A の中の iResolution は出力のサイズ、読む側の iChannelResolution は面のサイズ。
-        assert_eq!(px(7), [40, 24, 16]);
+        assert_eq!(px(7), [40, 4, 16]);
         state.delete(&gl);
         Rc::try_unwrap(images).ok().unwrap().delete(&gl);
         let _ = std::fs::remove_dir_all(&dir);
