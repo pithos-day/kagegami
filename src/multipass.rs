@@ -34,11 +34,15 @@ impl PassFile {
         &self.header.noise_refs
     }
 
-    /// チャンネルごとの、シェーダーで宣言する sampler の型。ノイズのチャンネルだけ 3D にする。
+    /// チャンネルごとの、シェーダーで宣言する sampler の型。ノイズのチャンネルは 3D、
+    /// キューブマップのチャンネルは Cube にする。
     pub fn channel_dims(&self) -> [crate::shader::Dim; 4] {
         let mut dims = [crate::shader::Dim::D2; 4];
         for r in &self.header.noise_refs {
             dims[r.channel] = crate::shader::Dim::D3;
+        }
+        for s in self.header.images.iter().filter(|s| s.cubemap) {
+            dims[s.name.parse::<usize>().unwrap_or(0)] = crate::shader::Dim::Cube;
         }
         dims
     }

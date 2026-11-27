@@ -3,7 +3,8 @@
 //! `mainImage(out vec4, in vec2)` を書いたファイルを GLSL ES 3.00 で包み、全画面に描く。
 //! 1 フレームの GPU 時間を `EXT_disjoint_timer_query` で測り、長すぎたらエラーとして止める。
 //! バッファー（Buffer A〜D）と Common を使う壁紙（#57）は、パスごとに 1 つのプログラムにする。
-//! 組み込みの 3D ノイズ（#70）を渡すチャンネルは `sampler3D` で宣言する。
+//! 組み込みの 3D ノイズ（#70）を渡すチャンネルは `sampler3D`、キューブマップ（#68）を渡すチャンネルは
+//! `samplerCube` で宣言する。
 
 use std::path::Path;
 use std::time::Duration;
@@ -56,20 +57,28 @@ pub enum Dim {
     D2,
     /// `sampler3D`（組み込みの 3D ノイズ）。
     D3,
+    /// `samplerCube`（キューブマップ）。
+    Cube,
 }
 
-/// 壁紙のシェーダーの前に付けるもの。3D のチャンネルがなければ、ノイズを足す前と同じ文字列になる。
+/// 壁紙のシェーダーの前に付けるもの。3D とキューブマップのチャンネルがなければ、ノイズを足す前と
+/// 同じ文字列になる。
 fn prefix(dims: [Dim; 4]) -> String {
     let mut s = String::from(PREFIX_HEAD);
     // sampler3D には既定の精度がないので、使うときだけ宣言する。
     if dims.contains(&Dim::D3) {
         s.push_str("precision highp sampler3D;\n");
     }
+    // samplerCube の既定の精度は lowp なので、sampler2D と同じく highp にする。
+    if dims.contains(&Dim::Cube) {
+        s.push_str("precision highp samplerCube;\n");
+    }
     s.push_str(PREFIX_UNIFORMS);
     for (i, d) in dims.iter().enumerate() {
         let ty = match d {
             Dim::D2 => "sampler2D",
             Dim::D3 => "sampler3D",
+            Dim::Cube => "samplerCube",
         };
         s.push_str(&format!("uniform {ty} iChannel{i};\n"));
     }
@@ -170,7 +179,8 @@ pub struct Uniforms {
     pub date: [f32; 4],
 }
 
-/// `iChannel0`〜`3` に渡す画像と 3D ノイズ。どちらも指定していないチャンネルは黒い 1×1 のテクスチャーにする。
+/// `iChannel0`〜`3` に渡す画像・キューブマップ・3D ノイズ。どれも指定していないチャンネルは
+/// 黒い 1×1 のテクスチャーにする。
 pub struct Channels {
     images: [Option<Texture>; 4],
     black: Texture,
@@ -193,7 +203,19 @@ impl Channels {
         let mut images: [Option<Texture>; 4] = Default::default();
         let mut result = Ok(());
         for (spec, img) in specs.iter().zip(decoded) {
-            let tex = img.and_then(|img| texture::upload(gl, &img, spec.sampler));
+            let tex = img.and_then(|img| {
+                if spec.cubemap {
+                    let face = texture::cubemap_face_size(
+                        img.width,
+                        img.height,
+                        texture::max_cube_size(gl),
+                    )
+                    .map_err(|e| format!("{}: {e}", spec.resolve(wallpaper).display()))?;
+                    texture::upload_cubemap(gl, &img, face, spec.sampler)
+                } else {
+                    texture::upload(gl, &img, spec.sampler)
+                }
+            });
             match tex {
                 Ok(t) => images[spec.name.parse::<usize>().unwrap_or(0)] = Some(t),
                 Err(e) => {
@@ -225,8 +247,8 @@ impl Channels {
         }
     }
 
-    /// `iChannelResolution`。画像は (幅, 高さ, 1)、ノイズは (32, 32, 32)。
-    /// どちらも指定していないチャンネルは (0, 0, 0)。
+    /// `iChannelResolution`。画像は (幅, 高さ, 1)、キューブマップは (面のサイズ, 面のサイズ, 1)、
+    /// ノイズは (32, 32, 32)。どれも指定していないチャンネルは (0, 0, 0)。
     pub fn resolutions(&self) -> [f32; 12] {
         let mut r = [0.0; 12];
         for (i, t) in self.images.iter().enumerate() {
@@ -242,7 +264,7 @@ impl Channels {
     /// (ターゲット, テクスチャー)。
     pub fn texture(&self, i: usize) -> (u32, glow::Texture) {
         let t = self.images[i].as_ref().unwrap_or(&self.black);
-        (t.target(), t.tex)
+        (t.target, t.tex)
     }
 
     pub fn delete(self, gl: &glow::Context) {
@@ -294,7 +316,7 @@ impl ShaderImages {
 
 /// 1 回の描画でチャンネルに渡すもの。
 pub struct Bindings {
-    /// (ターゲット, テクスチャー)。ノイズのチャンネルだけ `TEXTURE_3D`。
+    /// (ターゲット, テクスチャー)。ノイズのチャンネルは `TEXTURE_3D`、キューブマップは `TEXTURE_CUBE_MAP`。
     pub textures: [(u32, glow::Texture); 4],
     /// バッファーのチャンネルだけ Some（画像はテクスチャーの設定で読む）。
     pub samplers: [Option<glow::Sampler>; 4],
@@ -633,6 +655,18 @@ out vec4 kagegami_FragColor;
         assert!(s.contains("uniform sampler3D iChannel3;\n"));
         // 精度の宣言は、使う前に置く。
         assert!(s.find("sampler3D;").unwrap() < s.find("uniform sampler3D").unwrap());
+    }
+
+    #[test]
+    fn cubemap_channels_are_sampler_cube() {
+        let s = prefix([Dim::Cube, Dim::D2, Dim::D3, Dim::D2]);
+        assert!(s.contains("precision highp samplerCube;\n"));
+        assert!(s.contains("uniform samplerCube iChannel0;\n"));
+        assert!(s.contains("uniform sampler2D iChannel1;\n"));
+        assert!(s.contains("uniform sampler3D iChannel2;\n"));
+        assert!(s.find("samplerCube;").unwrap() < s.find("uniform samplerCube").unwrap());
+        // キューブマップを使わなければ、精度の宣言も足さない。
+        assert!(!prefix([Dim::D2; 4]).contains("samplerCube"));
     }
 
     #[test]

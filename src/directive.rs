@@ -7,6 +7,7 @@
 //! // @common common.glsl
 //! // @iChannel2 bufferA filter=nearest
 //! // @iChannel3 noise3d-rgba
+//! // @iChannel0 sky.jpg type=cubemap
 //! ```
 //!
 //! ```lua
@@ -80,6 +81,9 @@ pub struct ImageSpec {
     /// 書かれたままのパス。
     pub path: String,
     pub sampler: Sampler,
+    /// `type=cubemap`: 正距円筒図法の画像からキューブマップを作り、`samplerCube` で読む（#68）。
+    /// シェーダーの壁紙だけ。
+    pub cubemap: bool,
     /// 指定を書いた行（1 始まり）。
     pub line: usize,
 }
@@ -484,6 +488,10 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<Item>,
             ..Sampler::default()
         },
     };
+    let mut cubemap = false;
+    // キューブマップでは wrap と vflip を書けない。オプションの順番を問わないように、最後に確かめる。
+    let mut wrote_wrap = false;
+    let mut wrote_vflip = false;
     for opt in args {
         let (key, value) = opt
             .split_once('=')
@@ -499,6 +507,7 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<Item>,
                 }
             }
             "wrap" => {
+                wrote_wrap = true;
                 sampler.wrap = match value {
                     "clamp" => Wrap::Clamp,
                     "repeat" => Wrap::Repeat,
@@ -512,14 +521,40 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<Item>,
                 return Err(err(format!("{label}: vflip cannot be used with noise")));
             }
             "vflip" if syntax == Syntax::Glsl => {
+                wrote_vflip = true;
                 sampler.vflip = match value {
                     "true" => true,
                     "false" => false,
                     _ => return Err(bad()),
                 }
             }
+            "type" if buffer.is_some() => {
+                return Err(err(format!("{label}: type cannot be used with a buffer")));
+            }
+            "type" if noise.is_some() => {
+                return Err(err(format!("{label}: type cannot be used with noise")));
+            }
+            "type" if syntax == Syntax::Glsl => {
+                cubemap = match value {
+                    "cubemap" => true,
+                    _ => return Err(bad()),
+                }
+            }
             _ => return Err(err(format!("{label}: unknown option {key:?}"))),
         }
+    }
+    if cubemap {
+        // 面の境目は常につながる（GLES 3.0）ので wrap は描画に影響しない。vflip は Shadertoy の
+        // キューブマップにない。どちらも、書いたら値によらずエラーにする（#68）。
+        if wrote_wrap {
+            return Err(err(format!("{label}: wrap cannot be used with a cubemap")));
+        }
+        if wrote_vflip {
+            return Err(err(format!("{label}: vflip cannot be used with a cubemap")));
+        }
+        // 画像の上を +Y にする向きは、変換のシェーダーで決める。デコードした画像は反転しない。
+        sampler.wrap = Wrap::Clamp;
+        sampler.vflip = false;
     }
     if let Some(buffer) = buffer {
         return Ok(Some(Item::BufferRef(BufferRef {
@@ -541,6 +576,7 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<Item>,
         name: spec_name,
         path,
         sampler,
+        cubemap,
         line,
     })))
 }
@@ -886,6 +922,71 @@ mod tests {
             let e = parse_glsl(src).unwrap_err();
             assert!(e.contains(want), "{src}: {e}");
         }
+    }
+
+    #[test]
+    fn reads_cubemap_channels() {
+        let s = glsl(
+            "// @iChannel0 sky.jpg type=cubemap\n\
+             // @iChannel1 b.png filter=nearest type=cubemap\n\
+             // @iChannel2 photo.jpg\n",
+        )
+        .unwrap();
+        assert!(s[0].cubemap);
+        // 既定は Shadertoy でキューブマップを選んだときと同じ mipmap。画像は反転しない。
+        assert_eq!(
+            s[0].sampler,
+            Sampler {
+                filter: Filter::Mipmap,
+                wrap: Wrap::Clamp,
+                vflip: false
+            }
+        );
+        // type はどの順番でも書ける。
+        assert!(s[1].cubemap);
+        assert_eq!(s[1].sampler.filter, Filter::Nearest);
+        assert!(!s[2].cubemap);
+    }
+
+    #[test]
+    fn bad_cubemap_directives_are_errors() {
+        for (src, want) in [
+            (
+                "// @iChannel0 sky.jpg type=cubemap wrap=clamp",
+                "@iChannel0: wrap cannot be used with a cubemap",
+            ),
+            // 順番が逆でも、既定と同じ値でもエラー。
+            (
+                "// @iChannel0 sky.jpg wrap=repeat type=cubemap",
+                "@iChannel0: wrap cannot be used with a cubemap",
+            ),
+            (
+                "// @iChannel0 sky.jpg vflip=false type=cubemap",
+                "@iChannel0: vflip cannot be used with a cubemap",
+            ),
+            (
+                "// @iChannel0 sky.jpg type=cube",
+                "unknown value \"cube\" for type",
+            ),
+            (
+                "// @iChannel0 sky.jpg type=2d",
+                "unknown value \"2d\" for type",
+            ),
+            (
+                "// @iChannel0 bufferA type=cubemap",
+                "@iChannel0: type cannot be used with a buffer",
+            ),
+            (
+                "// @iChannel0 noise3d-rgba type=cubemap",
+                "@iChannel0: type cannot be used with noise",
+            ),
+        ] {
+            let e = parse_glsl(src).unwrap_err();
+            assert!(e.contains(want), "{src}: {e}");
+        }
+        // Lua の壁紙ではキューブマップを扱わない。
+        let e = lua("-- @image sky a.jpg type=cubemap").unwrap_err();
+        assert!(e.contains("unknown option \"type\""), "{e}");
     }
 
     #[test]
