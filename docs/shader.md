@@ -97,7 +97,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
 ## キューブマップ
 
-画像の指定に `type=cubemap` を付けると、正距円筒図法（縦横比 2:1 のパノラマ）の画像からキューブマップを作り、`samplerCube` で読める。360° 写真や HDRI のパノラマをそのまま使える（#68）。
+画像の指定に `type=cubemap` を付けると、正距円筒図法（縦横比 2:1 のパノラマ）の画像からキューブマップを作り、`samplerCube` で読める。360° 写真などのパノラマを、PNG か JPEG でそのまま使える（#68）。
 
 ```glsl
 // @iChannel0 sky.jpg type=cubemap
@@ -114,7 +114,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 - オプションは `filter`（`nearest` / `linear` / `mipmap`、既定 `mipmap`。Shadertoy と同じ）だけ。`wrap` は面の境目が常につながるので意味がなく、`vflip` は Shadertoy のキューブマップにない。どちらも書くとエラーになる
 - `textureSize(iChannelN, 0)` は面のサイズを返す（Shadertoy では常に 1 になる）
 - 読み込むときに 1 回だけ、GPU で画像を 6 面に写す。`filter=mipmap` なら、その後にミップマップを作る
-- VRAM: 幅 W の画像で、キューブマップ（mipmap 付き）は約 2W² バイト（同じ画像を普通の画像として mipmap 付きで読むと約 2.7W² バイト）。写す間だけ、元の画像のテクスチャー（2W² バイト）も持つ
+- VRAM: 計算では、幅 W の画像で、キューブマップ（mipmap 付き）は約 2W² バイト（同じ画像を普通の画像として mipmap 付きで読むと約 2.7W² バイト）。写す間だけ、元の画像のテクスチャー（2W² バイト）も持つ（どちらも測っていない）
 - Lua の壁紙では使えない
 
 ## 3D ノイズ
