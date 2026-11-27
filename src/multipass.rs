@@ -1,11 +1,15 @@
 //! シェーダーの壁紙のマルチパス（#57）: Image のファイルと、そこから指定された
-//! バッファー（`@bufferA`〜`@bufferD`）・Common（`@common`）のファイルを読み、指定を確かめる。
+//! バッファー（`@bufferA`〜`@bufferD`）・Common（`@common`）・Cubemap A（`@cubemapA`、#72）のファイルを読み、
+//! 指定を確かめる。
 //!
-//! GPU には触れない。描くのは `shader.rs`、バッファーのテクスチャーは `buffers.rs`。
+//! GPU には触れない。描くのは `shader.rs`、バッファーのテクスチャーは `buffers.rs`、Cubemap A のテクスチャーは
+//! `cubemap_pass.rs`。
 
 use std::path::{Path, PathBuf};
 
-use crate::directive::{self, BUFFER_NAMES, BufferRef, GlslHeader, ImageSpec, NoiseRef};
+use crate::directive::{
+    self, BUFFER_NAMES, BufferRef, CUBEMAP_NAME, CubemapRef, GlslHeader, ImageSpec, NoiseRef,
+};
 use crate::source::Source;
 
 /// 1 つのパスのファイル。
@@ -21,6 +25,15 @@ impl PassFile {
     pub fn buffer_refs(&self) -> [Option<&BufferRef>; 4] {
         let mut refs = [None; 4];
         for r in &self.header.buffer_refs {
+            refs[r.channel] = Some(r);
+        }
+        refs
+    }
+
+    /// チャンネルの番号ごとの、Cubemap A の指定（#72）。
+    pub fn cubemap_refs(&self) -> [Option<&CubemapRef>; 4] {
+        let mut refs = [None; 4];
+        for r in &self.header.cubemap_refs {
             refs[r.channel] = Some(r);
         }
         refs
@@ -44,7 +57,7 @@ impl PassFile {
     }
 
     /// チャンネルごとの、シェーダーで宣言する sampler の型。ノイズのチャンネルは 3D、
-    /// キューブマップのチャンネルは Cube にする。
+    /// キューブマップと Cubemap A のチャンネルは Cube にする。
     pub fn channel_dims(&self) -> [crate::shader::Dim; 4] {
         let mut dims = [crate::shader::Dim::D2; 4];
         for r in &self.header.noise_refs {
@@ -52,6 +65,9 @@ impl PassFile {
         }
         for s in self.header.images.iter().filter(|s| s.cubemap) {
             dims[s.name.parse::<usize>().unwrap_or(0)] = crate::shader::Dim::Cube;
+        }
+        for r in &self.header.cubemap_refs {
+            dims[r.channel] = crate::shader::Dim::Cube;
         }
         dims
     }
@@ -64,13 +80,20 @@ pub struct ShaderFiles {
     /// 添字はバッファーの添字（A = 0〜D = 3）。
     pub buffers: [Option<PassFile>; 4],
     pub common: Option<(PathBuf, String)>,
+    /// `@cubemapA` のファイル（#72）。
+    pub cubemap: Option<PassFile>,
 }
 
 /// `path` のファイルの中身 `src` の、先頭のコメントの指定を読む。指定のパスがこの壁紙で使えるかも
 /// 確かめる（zip の中では `~/` と絶対パスを使えない）。
 fn parse(source: &Source, path: &Path, src: &str) -> Result<GlslHeader, String> {
     let header = directive::parse_glsl(src).map_err(|e| format!("{}:{e}", path.display()))?;
-    let decls = header.buffers.iter().flatten().chain(&header.common);
+    let decls = header
+        .buffers
+        .iter()
+        .flatten()
+        .chain(&header.common)
+        .chain(&header.cubemap);
     let paths = decls
         .map(|d| (d.line, &d.path))
         .chain(header.images.iter().map(|s| (s.line, &s.path)));
@@ -125,6 +148,32 @@ impl ShaderFiles {
             buffers[i] = Some(pass);
         }
 
+        let cubemap = match &image.header.cubemap {
+            Some(decl) => {
+                let p = decl.resolve(path);
+                watch.push(p.clone());
+                let src = source.read_to_string(&p).map_err(|e| {
+                    format!("{}:{}: @{CUBEMAP_NAME}: {e}", path.display(), decl.line)
+                })?;
+                let header = parse(source, &p, &src)?;
+                if let Some((line, name)) = header.first_pass_decl() {
+                    return Err(format!(
+                        "{}:{line}: {name} can only be written in the Image file ({})",
+                        p.display(),
+                        path.display()
+                    ));
+                }
+                let pass = PassFile {
+                    path: p,
+                    src,
+                    header,
+                };
+                watch_images(&pass, watch);
+                Some(pass)
+            }
+            None => None,
+        };
+
         let common = match &image.header.common {
             Some(decl) => {
                 let p = decl.resolve(path);
@@ -154,6 +203,7 @@ impl ShaderFiles {
             image,
             buffers,
             common,
+            cubemap,
         };
         for pass in files.passes() {
             for r in &pass.header.buffer_refs {
@@ -168,13 +218,25 @@ impl ShaderFiles {
                     ));
                 }
             }
+            if let (Some(r), None) = (pass.header.cubemap_refs.first(), &files.cubemap) {
+                return Err(format!(
+                    "{}:{}: @iChannel{}: {CUBEMAP_NAME} is not declared \
+                     (write // @{CUBEMAP_NAME} <file> in {})",
+                    pass.path.display(),
+                    r.line,
+                    r.channel,
+                    files.image.path.display()
+                ));
+            }
         }
         Ok(files)
     }
 
-    /// Image と、宣言されたバッファーのパス。
+    /// Image と、宣言されたバッファー・Cubemap A のパス。
     pub fn passes(&self) -> impl Iterator<Item = &PassFile> {
-        std::iter::once(&self.image).chain(self.buffers.iter().flatten())
+        std::iter::once(&self.image)
+            .chain(self.buffers.iter().flatten())
+            .chain(&self.cubemap)
     }
 
     /// どれかのパスがキーボードの入力を読むか。
@@ -197,6 +259,16 @@ impl ShaderFiles {
             }
         }
         m
+    }
+
+    /// どれかのパスが Cubemap A を mipmap で読むか。
+    pub fn mipmapped_cubemap(&self) -> bool {
+        self.passes().any(|p| {
+            p.header
+                .cubemap_refs
+                .iter()
+                .any(|r| r.sampler.filter == directive::Filter::Mipmap)
+        })
     }
 
     /// どれかのパスがバッファーを linear か mipmap で読むか。
@@ -368,6 +440,41 @@ mod tests {
                 "main.glsl:3: @bufferD: ",
             ),
             ("// @common missing.glsl\n", &[], "main.glsl:1: @common: "),
+            (
+                "// @iChannel3 cubemapA\n",
+                &[],
+                "main.glsl:1: @iChannel3: cubemapA is not declared (write // @cubemapA <file> in",
+            ),
+            (
+                "// @bufferA a.glsl\n",
+                &[("a.glsl", "// @iChannel0 cubemapA\n")],
+                "a.glsl:1: @iChannel0: cubemapA is not declared",
+            ),
+            (
+                "// @cubemapA cube.glsl\n",
+                &[("cube.glsl", "// @bufferA a.glsl\n")],
+                "cube.glsl:1: @bufferA can only be written in the Image file",
+            ),
+            (
+                "// @bufferA a.glsl\n",
+                &[("a.glsl", "// @cubemapA cube.glsl\n")],
+                "a.glsl:1: @cubemapA can only be written in the Image file",
+            ),
+            (
+                "// @common c.glsl\n",
+                &[("c.glsl", "// @cubemapA cube.glsl\n")],
+                "c.glsl:1: @cubemapA cannot be written in the Common file",
+            ),
+            (
+                "// @common c.glsl\n",
+                &[("c.glsl", "// @iChannel2 cubemapA\n")],
+                "c.glsl:1: @iChannel2 cannot be written in the Common file",
+            ),
+            (
+                "\n// @cubemapA missing.glsl\n",
+                &[],
+                "main.glsl:2: @cubemapA: ",
+            ),
         ];
         for (main, others, want) in cases {
             for (name, src) in *others {
@@ -380,6 +487,73 @@ mod tests {
                 std::fs::remove_file(d.0.join(name)).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn reads_the_cubemap_pass() {
+        let d = Dir::new("cube");
+        d.write(
+            "cube.glsl",
+            "// @iChannel0 cubemapA filter=mipmap\n// @iChannel1 sky.png\n\
+             void mainCubemap(out vec4 c, in vec2 p, in vec3 o, in vec3 d) { c = vec4(d, 1.0); }\n",
+        );
+        d.write(
+            "a.glsl",
+            &format!("// @iChannel2 cubemapA filter=nearest\n{MAIN}"),
+        );
+        let image = d.write(
+            "main.glsl",
+            &format!("// @bufferA a.glsl\n// @cubemapA cube.glsl\n// @iChannel1 cubemapA\n{MAIN}"),
+        );
+        let mut watch = vec![];
+        let f = read(&image, &mut watch).unwrap();
+        let cube = f.cubemap.as_ref().unwrap();
+        assert_eq!(cube.path, d.0.join("cube.glsl"));
+        assert_eq!(f.passes().count(), 3);
+        assert!(f.mipmapped_cubemap());
+        use crate::shader::Dim;
+        assert_eq!(cube.channel_dims(), [Dim::Cube, Dim::D2, Dim::D2, Dim::D2]);
+        assert_eq!(
+            f.image.channel_dims(),
+            [Dim::D2, Dim::Cube, Dim::D2, Dim::D2]
+        );
+        let a = f.buffers[0].as_ref().unwrap();
+        assert_eq!(a.channel_dims(), [Dim::D2, Dim::D2, Dim::Cube, Dim::D2]);
+        assert_eq!(
+            a.cubemap_refs()[2].unwrap().sampler.filter,
+            directive::Filter::Nearest
+        );
+        // Cubemap A のファイルと、その画像も見張る。
+        assert_eq!(
+            watch,
+            vec![
+                d.0.join("a.glsl"),
+                d.0.join("cube.glsl"),
+                d.0.join("sky.png")
+            ]
+        );
+        // 読み直しの鍵は、Cubemap A のファイルが変わっても変わる。
+        let k1 = f.cache_key();
+        d.write(
+            "cube.glsl",
+            "void mainCubemap(out vec4 c, in vec2 p, in vec3 o, in vec3 d) {}\n",
+        );
+        assert_ne!(read(&image, &mut vec![]).unwrap().cache_key(), k1);
+        // mipmap で読まなければミップマップを作らない。
+        let image = d.write(
+            "main.glsl",
+            &format!("// @cubemapA cube.glsl\n// @iChannel0 cubemapA\n{MAIN}"),
+        );
+        assert!(!read(&image, &mut vec![]).unwrap().mipmapped_cubemap());
+    }
+
+    #[test]
+    fn unreadable_cubemap_file_is_still_watched() {
+        let d = Dir::new("cubewatch");
+        let image = d.write("main.glsl", &format!("// @cubemapA cube.glsl\n{MAIN}"));
+        let mut watch = vec![];
+        assert!(read(&image, &mut watch).is_err());
+        assert_eq!(watch, vec![d.0.join("cube.glsl")]);
     }
 
     #[test]

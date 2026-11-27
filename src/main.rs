@@ -3,6 +3,7 @@ mod app;
 mod bench;
 mod buffers;
 mod cli;
+mod cubemap_pass;
 mod directive;
 mod egl;
 mod gl_program;
