@@ -284,6 +284,8 @@ struct ShaderState {
     buffers: Option<BufferSet>,
     /// Cubemap A のテクスチャー（この出力のもの、#72）。Cubemap A を使わない壁紙では None。
     cubemap: Option<CubemapPass>,
+    /// Image を描く framebuffer。画面に描くときは None（テストで、画面の外に描くときだけ使う）。
+    image_target: Option<glow::Framebuffer>,
     /// GPU 時間を測るタイマー。拡張機能がなければ None（見張らずに描く）。
     timer: Option<GpuTimer>,
     /// キーボードの入力のテクスチャー（この出力のもの）。キーボードを使わない壁紙では None。
@@ -340,8 +342,6 @@ impl ShaderState {
         if let Some(set) = &mut self.buffers {
             set.resize(gl, resolution)?;
         }
-        // Image は、描き始めたときの framebuffer に描く（バッファーと Cubemap A は描き終えると 0 に戻すため）。
-        let target = unsafe { gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING) };
         if let Some(t) = self.timer.as_mut() {
             t.begin(gl);
         }
@@ -376,13 +376,16 @@ impl ShaderState {
             );
             pass.program.draw_cubemap(gl, &u, &b, cube);
         }
+        // バッファーと Cubemap A は、描き終えると framebuffer を 0 に戻す。
+        if let Some(t) = self.image_target {
+            unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(t)) };
+        }
         let b = self.passes.image.bindings(
             &self.images.image,
             self.buffers.as_ref(),
             self.cubemap.as_ref(),
             self.keyboard.as_ref(),
         );
-        unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, target) };
         self.passes.image.program.draw(gl, &u, &b);
         if let Some(t) = self.timer.as_mut() {
             t.end(gl);
@@ -827,6 +830,7 @@ impl App {
             images,
             buffers,
             cubemap,
+            image_target: None,
             timer,
             keyboard,
             started: Instant::now(),
@@ -1639,36 +1643,36 @@ void mainImage(out vec4 c, in vec2 p) {
 }
 ";
 
-    /// Cubemap A をアプリと同じ経路（ファイルの読み取り → コンパイル → `ShaderState::draw`）で 3 フレーム描き、
-    /// 向き・描く順番・`iResolution`・`iChannelResolution` が #72 で確かめた Shadertoy の値になることを確かめる。
-    #[test]
-    fn cubemap_pass_matches_shadertoy() {
-        let Some((_egl, gl)) = crate::gpu_test::context() else {
-            eprintln!("skipped: no surfaceless EGL display");
-            return;
-        };
-        let dir = std::env::temp_dir().join(format!("kagegami-cubepass-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("main.glsl"), IMAGE).unwrap();
-        std::fs::write(dir.join("a.glsl"), BUFFER).unwrap();
-        std::fs::write(dir.join("cube.glsl"), CUBE).unwrap();
+    /// `dir` の Image・Buffer A・Cubemap A のファイルで、アプリと同じ経路（ファイルの読み取り → コンパイル →
+    /// `ShaderState::draw`）で描き、`out_size` の Image の結果を読み出す。`frames` はフレームごとの出力のサイズ。
+    fn draw_frames(
+        gl: &glow::Context,
+        dir: &std::path::Path,
+        face: u32,
+        frames: &[(u32, u32)],
+        out_size: (u32, u32),
+    ) -> Vec<u8> {
         let source = Source::open(&dir.join("main.glsl")).unwrap();
         let files = ShaderFiles::read(&source, source.entry(), &mut vec![]).unwrap();
-        cubemap_pass::check_support(&gl).unwrap();
-        let float_linear = buffers::check_support(&gl).unwrap();
-        // 出力は正方形でなく、縦は面のサイズの半分より小さくする（iResolution と viewport の取り違えを見つけるため）。
-        let (size, face) = ((40u32, 4u32), 16u32);
-        let passes = Passes::compile(&gl, &files).unwrap();
-        let images = Rc::new(ShaderImages::load(&gl, &source, &files).unwrap());
+        cubemap_pass::check_support(gl).unwrap();
+        let float_linear = buffers::check_support(gl).unwrap();
+        let passes = Passes::compile(gl, &files).unwrap();
+        let images = Rc::new(ShaderImages::load(gl, &source, &files).unwrap());
         let declared = files.buffers.each_ref().map(Option::is_some);
-        let buffers =
-            BufferSet::new(&gl, size, declared, files.mipmapped_buffers(), float_linear).unwrap();
+        let buffers = BufferSet::new(
+            gl,
+            frames[0],
+            declared,
+            files.mipmapped_buffers(),
+            float_linear,
+        )
+        .unwrap();
         let mut state = ShaderState {
             passes,
             images: images.clone(),
             buffers: Some(buffers),
-            cubemap: Some(CubemapPass::new(&gl, face, files.mipmapped_cubemap()).unwrap()),
+            cubemap: Some(CubemapPass::new(gl, face, files.mipmapped_cubemap()).unwrap()),
+            image_target: None,
             timer: None,
             keyboard: None,
             started: Instant::now(),
@@ -1678,20 +1682,51 @@ void mainImage(out vec4 c, in vec2 p) {
             gl.get_parameter_string(glow::RENDERER)
         });
         let mut stats = OutputStats::default();
-        let out = crate::gpu_test::render(&gl, size, || {
-            for _ in 0..3 {
+        let out = crate::gpu_test::render(gl, out_size, || {
+            state.image_target =
+                unsafe { gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING) };
+            for size in frames {
                 state
-                    .draw(&gl, size, [0.0; 4], Instant::now(), 0.0, &mut stats)
+                    .draw(gl, *size, [0.0; 4], Instant::now(), 0.0, &mut stats)
                     .unwrap();
             }
         });
-        let px = |x: usize| {
-            let o = x * 4;
-            [out[o], out[o + 1], out[o + 2]]
+        assert_eq!(unsafe { gl.get_error() }, glow::NO_ERROR);
+        state.delete(gl);
+        Rc::try_unwrap(images).ok().unwrap().delete(gl);
+        out
+    }
+
+    fn write_files(name: &str, image: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kagegami-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.glsl"), image).unwrap();
+        std::fs::write(dir.join("a.glsl"), BUFFER).unwrap();
+        std::fs::write(dir.join("cube.glsl"), CUBE).unwrap();
+        dir
+    }
+
+    fn px(out: &[u8], x: usize) -> [u8; 3] {
+        let o = x * 4;
+        [out[o], out[o + 1], out[o + 2]]
+    }
+
+    /// 向き・描く順番・`iResolution`・`iChannelResolution` が、#72 で確かめた Shadertoy の値になる。
+    /// 出力のサイズが変わっても、Cubemap A の中身は残る。
+    #[test]
+    fn cubemap_pass_matches_shadertoy() {
+        let Some((_egl, gl)) = crate::gpu_test::context() else {
+            eprintln!("skipped: no surfaceless EGL display");
+            return;
         };
+        let dir = write_files("cubepass", IMAGE);
+        // 出力は正方形でなく、縦は面のサイズの半分より小さくする（iResolution と viewport の取り違えを
+        // 見つけるため）。3 フレーム目でサイズを変える。
+        let out = draw_frames(&gl, &dir, 16, &[(40, 4), (40, 4), (32, 4)], (40, 4));
         for (x, d) in DIRS.iter().enumerate() {
             let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-            let got = px(x).map(|v| v as f32 / 255.0 * 2.0 - 1.0);
+            let got = px(&out, x).map(|v| v as f32 / 255.0 * 2.0 - 1.0);
             for c in 0..3 {
                 // 面の画素の中心の方向なので、半画素ぶん（16 の面で 1/16）と 8 ビットの丸めだけずれる。
                 assert!(
@@ -1701,12 +1736,56 @@ void mainImage(out vec4 c, in vec2 p) {
                 );
             }
         }
-        // Image から読むと今のフレーム（差 0）、Buffer A と Cubemap A 自身からは前のフレーム（差 1）。rayOri は原点。
-        assert_eq!(px(6), [0, 1, 1]);
+        // Image から読むと今のフレーム（差 0）、Buffer A と Cubemap A 自身からは前のフレーム（差 1）。
+        // rayOri は原点。サイズを変えたフレームでも自分の前のフレームを読める（作り直すと差が 2 になる）。
+        assert_eq!(px(&out, 6), [0, 1, 1]);
         // Cubemap A の中の iResolution は出力のサイズ、読む側の iChannelResolution は面のサイズ。
-        assert_eq!(px(7), [40, 4, 16]);
-        state.delete(&gl);
-        Rc::try_unwrap(images).ok().unwrap().delete(&gl);
+        assert_eq!(px(&out, 7), [32, 4, 16]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 面のサイズ 1024 で `filter=mipmap` で読むと、描くたびにミップマップを作る。
+    #[test]
+    fn mipmapped_cubemap_pass_at_full_size() {
+        let Some((_egl, gl)) = crate::gpu_test::context() else {
+            eprintln!("skipped: no surfaceless EGL display");
+            return;
+        };
+        // x = 0〜5: DIRS の方向の、いちばん粗い段（1×1）の値。面の rayDir の平均なので、面の向きを向く。
+        let image = IMAGE
+            .replace(
+                "// @iChannel0 cubemapA filter=nearest",
+                "// @iChannel0 cubemapA filter=mipmap",
+            )
+            .replace(
+                "texture(iChannel0, DIRS[x]).xyz",
+                "textureLod(iChannel0, DIRS[x], 10.0).xyz",
+            );
+        let dir = write_files("cubepass-mip", &image);
+        let face = crate::cubemap_pass::FACE_SIZE;
+        let out = draw_frames(&gl, &dir, face, &[(40, 4); 2], (40, 4));
+        // (+X, -X, +Y, -Y, +Z, -Z) の面の向きの成分。+Y の面は、中心に iResolution などを書いていて
+        // 平均が rayDir にならないので確かめない。
+        for (x, (axis, sign)) in [
+            (0, 1.0),
+            (0, -1.0),
+            (1, 1.0),
+            (1, -1.0),
+            (2, 1.0),
+            (2, -1.0),
+        ]
+        .into_iter()
+        .enumerate()
+        .filter(|(x, _)| *x != 2)
+        {
+            let got = px(&out, x).map(|v| v as f32 / 255.0 * 2.0 - 1.0);
+            assert!(got[axis] * sign > 0.5, "face {x}: {got:?}");
+        }
+        assert_eq!(
+            px(&out, 7)[2],
+            255,
+            "iChannelResolution is 1024 (clamped to 255)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
