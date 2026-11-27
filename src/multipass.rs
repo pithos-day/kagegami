@@ -440,6 +440,41 @@ mod tests {
                 "main.glsl:3: @bufferD: ",
             ),
             ("// @common missing.glsl\n", &[], "main.glsl:1: @common: "),
+            (
+                "// @iChannel3 cubemapA\n",
+                &[],
+                "main.glsl:1: @iChannel3: cubemapA is not declared (write // @cubemapA <file> in",
+            ),
+            (
+                "// @bufferA a.glsl\n",
+                &[("a.glsl", "// @iChannel0 cubemapA\n")],
+                "a.glsl:1: @iChannel0: cubemapA is not declared",
+            ),
+            (
+                "// @cubemapA cube.glsl\n",
+                &[("cube.glsl", "// @bufferA a.glsl\n")],
+                "cube.glsl:1: @bufferA can only be written in the Image file",
+            ),
+            (
+                "// @bufferA a.glsl\n",
+                &[("a.glsl", "// @cubemapA cube.glsl\n")],
+                "a.glsl:1: @cubemapA can only be written in the Image file",
+            ),
+            (
+                "// @common c.glsl\n",
+                &[("c.glsl", "// @cubemapA cube.glsl\n")],
+                "c.glsl:1: @cubemapA cannot be written in the Common file",
+            ),
+            (
+                "// @common c.glsl\n",
+                &[("c.glsl", "// @iChannel2 cubemapA\n")],
+                "c.glsl:1: @iChannel2 cannot be written in the Common file",
+            ),
+            (
+                "\n// @cubemapA missing.glsl\n",
+                &[],
+                "main.glsl:2: @cubemapA: ",
+            ),
         ];
         for (main, others, want) in cases {
             for (name, src) in *others {
@@ -452,6 +487,73 @@ mod tests {
                 std::fs::remove_file(d.0.join(name)).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn reads_the_cubemap_pass() {
+        let d = Dir::new("cube");
+        d.write(
+            "cube.glsl",
+            "// @iChannel0 cubemapA filter=mipmap\n// @iChannel1 sky.png\n\
+             void mainCubemap(out vec4 c, in vec2 p, in vec3 o, in vec3 d) { c = vec4(d, 1.0); }\n",
+        );
+        d.write(
+            "a.glsl",
+            &format!("// @iChannel2 cubemapA filter=nearest\n{MAIN}"),
+        );
+        let image = d.write(
+            "main.glsl",
+            &format!("// @bufferA a.glsl\n// @cubemapA cube.glsl\n// @iChannel1 cubemapA\n{MAIN}"),
+        );
+        let mut watch = vec![];
+        let f = read(&image, &mut watch).unwrap();
+        let cube = f.cubemap.as_ref().unwrap();
+        assert_eq!(cube.path, d.0.join("cube.glsl"));
+        assert_eq!(f.passes().count(), 3);
+        assert!(f.mipmapped_cubemap());
+        use crate::shader::Dim;
+        assert_eq!(cube.channel_dims(), [Dim::Cube, Dim::D2, Dim::D2, Dim::D2]);
+        assert_eq!(
+            f.image.channel_dims(),
+            [Dim::D2, Dim::Cube, Dim::D2, Dim::D2]
+        );
+        let a = f.buffers[0].as_ref().unwrap();
+        assert_eq!(a.channel_dims(), [Dim::D2, Dim::D2, Dim::Cube, Dim::D2]);
+        assert_eq!(
+            a.cubemap_refs()[2].unwrap().sampler.filter,
+            directive::Filter::Nearest
+        );
+        // Cubemap A のファイルと、その画像も見張る。
+        assert_eq!(
+            watch,
+            vec![
+                d.0.join("a.glsl"),
+                d.0.join("cube.glsl"),
+                d.0.join("sky.png")
+            ]
+        );
+        // 読み直しの鍵は、Cubemap A のファイルが変わっても変わる。
+        let k1 = f.cache_key();
+        d.write(
+            "cube.glsl",
+            "void mainCubemap(out vec4 c, in vec2 p, in vec3 o, in vec3 d) {}\n",
+        );
+        assert_ne!(read(&image, &mut vec![]).unwrap().cache_key(), k1);
+        // mipmap で読まなければミップマップを作らない。
+        let image = d.write(
+            "main.glsl",
+            &format!("// @cubemapA cube.glsl\n// @iChannel0 cubemapA\n{MAIN}"),
+        );
+        assert!(!read(&image, &mut vec![]).unwrap().mipmapped_cubemap());
+    }
+
+    #[test]
+    fn unreadable_cubemap_file_is_still_watched() {
+        let d = Dir::new("cubewatch");
+        let image = d.write("main.glsl", &format!("// @cubemapA cube.glsl\n{MAIN}"));
+        let mut watch = vec![];
+        assert!(read(&image, &mut watch).is_err());
+        assert_eq!(watch, vec![d.0.join("cube.glsl")]);
     }
 
     #[test]

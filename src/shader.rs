@@ -778,6 +778,18 @@ out vec4 kagegami_FragColor;
     }
 
     #[test]
+    fn cubemap_pass_calls_main_cubemap_after_the_same_prefix() {
+        let src = "void mainCubemap(out vec4 c, in vec2 p, in vec3 o, in vec3 d) {}";
+        let dims = [Dim::Cube, Dim::D2, Dim::D2, Dim::D2];
+        let s = wrap(None, src, PassKind::Cubemap, dims);
+        // 前置きはほかのパスと同じで、面ごとの uniform はパスのソースの後ろに置く。
+        assert!(s.starts_with(&format!("{}#line 1\n{src}", prefix(dims))));
+        assert!(s.contains("mainCubemap(kagegami_c, gl_FragCoord.xy, vec3(0.0), kagegami_dir);"));
+        assert!(s.contains("kagegami_FragColor = kagegami_c;"));
+        assert!(!wrap(None, src, PassKind::Buffer, dims).contains("kagegami_face"));
+    }
+
+    #[test]
     fn wrap_puts_common_between_uniforms_and_the_pass() {
         let s = wrap(
             Some("float k() { return 1.0; }"),

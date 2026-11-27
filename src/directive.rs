@@ -1200,6 +1200,97 @@ mod tests {
     }
 
     #[test]
+    fn reads_cubemap_pass_and_its_channels() {
+        let h = parse_glsl(
+            "// @cubemapA cube.glsl\n\
+             // @iChannel0 cubemapA\n\
+             // @iChannel2 cubemapA filter=mipmap\n\
+             // @iChannel1 ./cubemapA\n\
+             // @iChannel3 cubemap.png\n",
+        )
+        .unwrap();
+        assert_eq!(
+            h.cubemap,
+            Some(FileDecl {
+                path: "cube.glsl".into(),
+                line: 1
+            })
+        );
+        assert_eq!(h.first_pass_decl(), Some((1, "@cubemapA".into())));
+        assert_eq!(h.cubemap_refs.len(), 2);
+        assert_eq!(h.cubemap_refs[0].channel, 0);
+        // 既定は Shadertoy で Cubemap A を選んだときと同じ linear・clamp（#72）。
+        assert_eq!(
+            h.cubemap_refs[0].sampler,
+            Sampler {
+                filter: Filter::Linear,
+                wrap: Wrap::Clamp,
+                vflip: false
+            }
+        );
+        assert_eq!(h.cubemap_refs[1].channel, 2);
+        assert_eq!(h.cubemap_refs[1].sampler.filter, Filter::Mipmap);
+        // ./cubemapA と cubemap.png は画像のファイル。
+        assert_eq!(h.images[0].path, "./cubemapA");
+        assert_eq!(h.images[1].path, "cubemap.png");
+        assert_eq!(h.first_channel(), Some((2, 0)));
+    }
+
+    #[test]
+    fn bad_cubemap_pass_directives_are_errors() {
+        for (src, want) in [
+            (
+                "// @iChannel0 cubemapA wrap=clamp",
+                "1: @iChannel0: wrap cannot be used with cubemapA",
+            ),
+            (
+                "// @iChannel0 cubemapA vflip=false",
+                "@iChannel0: vflip cannot be used with cubemapA",
+            ),
+            (
+                "// @iChannel0 cubemapA type=cubemap",
+                "@iChannel0: type cannot be used with cubemapA",
+            ),
+            (
+                "// @iChannel0 cubemapA filter=cubic",
+                "@iChannel0: unknown value \"cubic\" for filter",
+            ),
+            ("// @iChannel0 cubemapA size=512", "unknown option \"size\""),
+            (
+                "// @iChannel0 CubemapA",
+                "unknown cubemap \"CubemapA\" (write cubemapA; use ./CubemapA for a file)",
+            ),
+            ("// @iChannel0 cubemapB", "unknown cubemap \"cubemapB\""),
+            ("// @iChannel0 cubemap", "unknown cubemap \"cubemap\""),
+            (
+                "// @iChannel0 cubemapA\n// @iChannel0 bufferA",
+                "2: @iChannel0 is specified twice",
+            ),
+            (
+                "// @cubemapB b.glsl",
+                "unknown directive @cubemapB (use @cubemapA)",
+            ),
+            ("// @CubemapA b.glsl", "unknown directive @CubemapA"),
+            ("// @cubemapA", "@cubemapA: expected a path"),
+            ("// @cubemapA a.glsl b.glsl", "unexpected argument"),
+            (
+                "// @cubemapA a.glsl\n// @cubemapA b.glsl",
+                "2: @cubemapA is specified twice",
+            ),
+            (
+                "void mainImage(out vec4 c, in vec2 p) {}\n// @cubemapA a.glsl",
+                "2: @cubemapA must be in the comments at the top of the file",
+            ),
+        ] {
+            let e = parse_glsl(src).unwrap_err();
+            assert!(e.contains(want), "{src}: {e}");
+        }
+        // Lua の壁紙では @cubemapA はただのコメントで、cubemapA は画像のファイルの名前。
+        assert_eq!(lua("-- @cubemapA a.glsl").unwrap(), vec![]);
+        assert_eq!(lua("-- @image sky cubemapA").unwrap()[0].path, "cubemapA");
+    }
+
+    #[test]
     fn lua_images_default_to_mipmap_clamp_without_flip() {
         let s =
             lua("-- @image bg a.png\n-- @image dots b.png filter=nearest wrap=repeat\n").unwrap();
