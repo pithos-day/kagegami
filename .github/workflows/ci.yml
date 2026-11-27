@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Wayland と EGL のライブラリを入れる
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwayland-dev libegl-dev
+      - name: Wayland・EGL・xkbcommon のライブラリを入れる
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwayland-dev libegl-dev libxkbcommon-dev
       - name: rust-toolchain.toml の版の Rust を入れる
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2

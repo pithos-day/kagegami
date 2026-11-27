@@ -12,20 +12,21 @@ use smithay_client_toolkit::{
     registry_handlers,
     seat::{
         Capability, SeatHandler, SeatState,
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
         pointer::{PointerEvent, PointerHandler},
     },
     shell::{
         WaylandSurface,
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-            LayerSurfaceConfigure,
+            LayerSurfaceConfigure, SurfaceKind,
         },
     },
 };
 use wayland_client::{
-    Connection, QueueHandle, delegate_noop,
+    Connection, Proxy, QueueHandle, delegate_noop,
     globals::GlobalList,
-    protocol::{wl_output, wl_pointer, wl_seat, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
 };
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
@@ -36,6 +37,7 @@ use crate::cli::{Args, LayerName};
 use crate::directive::Sampler;
 use crate::directive::{self, Syntax};
 use crate::egl::{EglContext, EglSurface};
+use crate::keyboard::{self, Keys};
 use crate::lua_images::Images;
 use crate::multipass::{PassFile, ShaderFiles};
 use crate::perf::{self, OutputStats};
@@ -45,6 +47,7 @@ use crate::script::{self, MouseState, Script};
 use crate::shader::{self, Bindings, Channels, GpuTimer, PassKind, ShaderImages, ShaderProgram};
 use crate::source::Source;
 use crate::stderr::elog;
+use crate::texture::{self, Texture};
 
 /// 出力ごとに違う乱数の種を作る。
 fn seed_for<T: std::hash::Hash>(salt: &T) -> u64 {
@@ -125,6 +128,8 @@ pub struct Wallpaper {
     mouse: MouseState,
     /// シェーダーの `iMouse` と、Lua の `mouse.press_x`・`press_y`・`dragging`。
     drag: Drag,
+    /// キーボードの入力（#69）。キーのイベントは、キーボードのフォーカスを持っている出力にだけ渡す（マウスと同じ）。
+    keys: Keys,
     /// `--perf` で出す負荷の集計。
     stats: OutputStats,
     /// `--perf` のときだけ使う、Lua の壁紙の GPU 時間を測るタイマー。
@@ -153,6 +158,8 @@ struct Pass {
     program: ShaderProgram,
     /// チャンネルごとの (バッファーの添字, 読むときの設定)。画像のチャンネルは None。
     buffer_refs: [Option<(usize, Sampler)>; 4],
+    /// キーボードの入力を渡すチャンネル（#69）。
+    keyboard: [bool; 4],
 }
 
 impl Pass {
@@ -172,11 +179,22 @@ impl Pass {
         Ok(Self {
             program,
             buffer_refs: file.buffer_refs().map(|r| r.map(|r| (r.buffer, r.sampler))),
+            keyboard: file.keyboard_channels(),
         })
     }
 
-    fn bindings(&self, channels: &Channels, buffers: Option<&BufferSet>) -> Bindings {
+    fn bindings(
+        &self,
+        channels: &Channels,
+        buffers: Option<&BufferSet>,
+        keyboard: Option<&Texture>,
+    ) -> Bindings {
         let mut b = Bindings::images(channels);
+        if let Some(t) = keyboard {
+            for (i, _) in self.keyboard.iter().enumerate().filter(|(_, k)| **k) {
+                b.set_keyboard(i, t);
+            }
+        }
         if let Some(set) = buffers {
             for (i, r) in self.buffer_refs.iter().enumerate() {
                 if let Some((k, sampler)) = r
@@ -241,6 +259,8 @@ struct ShaderState {
     buffers: Option<BufferSet>,
     /// GPU 時間を測るタイマー。拡張機能がなければ None（見張らずに描く）。
     timer: Option<GpuTimer>,
+    /// キーボードの入力のテクスチャー（この出力のもの）。キーボードを使わない壁紙では None。
+    keyboard: Option<Texture>,
     started: Instant,
     frame: i32,
 }
@@ -251,6 +271,9 @@ impl ShaderState {
         self.passes.delete(gl);
         if let Some(set) = self.buffers {
             set.delete(gl);
+        }
+        if let Some(t) = self.keyboard {
+            texture::delete(gl, t);
         }
         self.timer
     }
@@ -298,15 +321,16 @@ impl ShaderState {
             else {
                 continue;
             };
-            let b = pass.bindings(channels, Some(set));
+            let b = pass.bindings(channels, Some(set), self.keyboard.as_ref());
             set.begin(gl, i);
             pass.program.draw(gl, &u, &b);
             set.end(gl, i);
         }
-        let b = self
-            .passes
-            .image
-            .bindings(&self.images.image, self.buffers.as_ref());
+        let b = self.passes.image.bindings(
+            &self.images.image,
+            self.buffers.as_ref(),
+            self.keyboard.as_ref(),
+        );
         self.passes.image.program.draw(gl, &u, &b);
         if let Some(t) = self.timer.as_mut() {
             t.end(gl);
@@ -334,6 +358,10 @@ fn draw_content(
                 w.output_size,
                 w.drag.imouse(w.output_size.1 as f32),
             );
+            // キーボードの入力は、出力ごとに描く直前に送る（押したフレームの印が出力ごとに違うため）。
+            if let Some(t) = &sh.keyboard {
+                texture::update_keyboard(renderer.gl(), t, &w.keys.texture());
+            }
             sh.draw(renderer.gl(), w.buffer_size, mouse, now, dt, &mut w.stats)
         }
         Some(Content::Lua(script)) if !w.failed => {
@@ -373,6 +401,18 @@ pub struct App {
     output_state: OutputState,
     seat_state: SeatState,
     pointer: Option<wl_pointer::WlPointer>,
+    /// キーボードを使う壁紙の間だけ取る（使わない壁紙で keymap を読んで持たないため）。
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    /// キーボードを持つ seat。
+    keyboard_seat: Option<wl_seat::WlSeat>,
+    /// キーボードのフォーカスを持っている壁紙の surface。
+    keyboard_focus: Option<wl_surface::WlSurface>,
+    /// キーの番号から記号を引く、キーボードの配列。
+    layout: keyboard::Layout,
+    /// 壁紙の layer surface を `KeyboardInteractivity::OnDemand` にしているか（#69）。
+    keyboard_on: bool,
+    /// wlr-layer-shell が古く `on_demand` を使えないことを一度警告したか。
+    keyboard_warned: bool,
     compositor: CompositorState,
     layer_shell: LayerShell,
     viewporter: Option<WpViewporter>,
@@ -515,6 +555,12 @@ impl App {
             output_state: OutputState::new(globals, qh),
             seat_state: SeatState::new(globals, qh),
             pointer: None,
+            keyboard: None,
+            keyboard_seat: None,
+            keyboard_focus: None,
+            layout: keyboard::Layout::default(),
+            keyboard_on: false,
+            keyboard_warned: false,
             compositor,
             layer_shell,
             viewporter,
@@ -561,7 +607,12 @@ impl App {
         );
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_exclusive_zone(-1);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        // キーボードを使う壁紙のときだけ on_demand にする（#69）。使えるかは sync_keyboard で確かめてある。
+        layer.set_keyboard_interactivity(if self.keyboard_on {
+            KeyboardInteractivity::OnDemand
+        } else {
+            KeyboardInteractivity::None
+        });
         layer.set_size(0, 0);
         let output_scale = info.scale_factor.max(1);
         let viewport = self
@@ -593,6 +644,7 @@ impl App {
             seed: seed_for(&self.wallpapers.len()),
             mouse: MouseState::default(),
             drag: Drag::default(),
+            keys: Keys::default(),
             stats: OutputStats::default(),
             lua_timer: LuaTimer::Unchecked,
         });
@@ -657,6 +709,20 @@ impl App {
         } else {
             None
         };
+        let keyboard = if files.uses_keyboard() {
+            match texture::keyboard(gl) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    passes.delete(gl);
+                    if let Some(set) = buffers {
+                        set.delete(gl);
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
         let old = match self.wallpapers[i].content.take() {
             Some(Content::Shader(old)) => Some(old),
             _ => None,
@@ -688,6 +754,7 @@ impl App {
             images,
             buffers,
             timer,
+            keyboard,
             started: Instant::now(),
             frame: 0,
         })));
@@ -782,6 +849,80 @@ impl App {
                 Err(e) => report(&self.wallpapers[i].name, e),
             }
         }
+        // keyboard_interactivity は、このあとの render_due で合わせる。
+    }
+
+    /// 壁紙がキーボードを使うか。シェーダーは `@iChannelN keyboard` の指定があるとき、Lua は
+    /// `keyboard.down` を一度でも呼んだとき（#69）。
+    fn wants_keyboard(&self) -> bool {
+        self.wallpapers.iter().any(|w| match &w.content {
+            Some(Content::Shader(sh)) => sh.keyboard.is_some(),
+            Some(Content::Lua(script)) => script.uses_keyboard(),
+            None => false,
+        })
+    }
+
+    /// layer surface の keyboard_interactivity を、壁紙がキーボードを使うかに合わせる。
+    /// キーボードを使わない壁紙では None のままにし、ほかのアプリへの入力を邪魔しない。
+    fn sync_keyboard(&mut self, qh: &QueueHandle<Self>) {
+        let want = self.wants_keyboard();
+        if want == self.keyboard_on {
+            return;
+        }
+        // on_demand は wlr-layer-shell のバージョン 4 から。古いコンポジターに送ると protocol error になる。
+        let supported = self.wallpapers.iter().all(|w| match w.layer.kind() {
+            SurfaceKind::Wlr(s) => s.version() >= 4,
+            _ => false,
+        });
+        if want && !supported {
+            if !self.keyboard_warned {
+                self.keyboard_warned = true;
+                elog!(
+                    "kagegami: warning: the compositor does not support keyboard_interactivity \
+                     on_demand (wlr-layer-shell v4); keyboard input is not available"
+                );
+            }
+            return;
+        }
+        self.keyboard_on = want;
+        let value = if want {
+            KeyboardInteractivity::OnDemand
+        } else {
+            KeyboardInteractivity::None
+        };
+        for w in &mut self.wallpapers {
+            w.layer.set_keyboard_interactivity(value);
+            w.layer.commit();
+        }
+        if want {
+            self.acquire_keyboard(qh);
+        } else {
+            self.release_keyboard();
+        }
+    }
+
+    fn acquire_keyboard(&mut self, qh: &QueueHandle<Self>) {
+        if self.keyboard.is_some() {
+            return;
+        }
+        let Some(seat) = &self.keyboard_seat else {
+            return;
+        };
+        match self.seat_state.get_keyboard(qh, seat, None) {
+            Ok(k) => self.keyboard = Some(k),
+            Err(e) => elog!("kagegami: keyboard: {e}"),
+        }
+    }
+
+    fn release_keyboard(&mut self) {
+        if let Some(k) = self.keyboard.take() {
+            k.release();
+        }
+        self.keyboard_focus = None;
+        self.layout = keyboard::Layout::default();
+        for w in &mut self.wallpapers {
+            w.keys.release_all();
+        }
     }
 
     /// 見張るファイルが変わっていれば、その一覧を返す。
@@ -869,15 +1010,18 @@ impl App {
             }
             self.render(i, qh, now);
         }
+        // Lua の壁紙は、keyboard.down を呼んだフレームのあとで on_demand にする。
+        self.sync_keyboard(qh);
     }
 
     /// i 番目の出力の壁紙を 1 フレーム描いて提示する。
     fn render(&mut self, i: usize, qh: &QueueHandle<Self>, now: Instant) {
         let w = &mut self.wallpapers[i];
-        if let Some(Content::Lua(script)) = &w.content
-            && let Err(e) = script.set_mouse(&w.mouse)
-        {
-            report(&w.name, e);
+        if let Some(Content::Lua(script)) = &w.content {
+            script.set_keys(w.keys.names_down());
+            if let Err(e) = script.set_mouse(&w.mouse) {
+                report(&w.name, e);
+            }
         }
         let dt = w
             .last_frame
@@ -956,6 +1100,7 @@ impl App {
         w.stats.frame();
         w.failed |= failed;
         w.drag.frame_rendered();
+        w.keys.frame_rendered();
     }
 }
 
@@ -1178,18 +1323,28 @@ impl SeatHandler for App {
                 Err(e) => elog!("kagegami: pointer: {e}"),
             }
         }
+        if capability == Capability::Keyboard && self.keyboard_seat.is_none() {
+            self.keyboard_seat = Some(seat);
+            if self.keyboard_on {
+                self.acquire_keyboard(qh);
+            }
+        }
     }
     fn remove_capability(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
+        seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
         if capability == Capability::Pointer
             && let Some(p) = self.pointer.take()
         {
             p.release();
+        }
+        if capability == Capability::Keyboard && self.keyboard_seat.as_ref() == Some(&seat) {
+            self.keyboard_seat = None;
+            self.release_keyboard();
         }
     }
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
@@ -1225,6 +1380,117 @@ impl PointerHandler for App {
                 }
             }
         }
+    }
+}
+
+impl App {
+    fn release_all_keys(&mut self) {
+        for w in &mut self.wallpapers {
+            w.keys.release_all();
+        }
+    }
+}
+
+impl KeyboardHandler for App {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+        raw: &[u32],
+        keysyms: &[Keysym],
+    ) {
+        self.keyboard_focus = Some(surface.clone());
+        let keys: Vec<_> = raw
+            .iter()
+            .zip(keysyms)
+            .map(|(&r, &sym)| (r, self.layout.key(r, sym)))
+            .collect();
+        if let Some(w) = self.find(surface) {
+            for (r, key) in keys {
+                w.keys.hold(r, key);
+            }
+        }
+    }
+
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        // フォーカスが外れた出力のキーを離した扱いにする。ほかの出力は押していないので、全部に行ってよい。
+        self.keyboard_focus = None;
+        self.release_all_keys();
+    }
+
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        let key = self.layout.key(event.raw_code, event.keysym);
+        let Some(surface) = self.keyboard_focus.clone() else {
+            return;
+        };
+        if let Some(w) = self.find(&surface) {
+            w.keys.press(event.raw_code, key);
+        }
+    }
+
+    /// キーのリピートは、押したままと同じなので使わない。
+    fn repeat_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        // 押していない出力では何も変わらないので、全部の出力で離す。
+        for w in &mut self.wallpapers {
+            w.keys.release(event.raw_code);
+        }
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: Modifiers,
+        _: RawModifiers,
+        layout: u32,
+    ) {
+        self.layout.set_group(layout);
+    }
+
+    fn update_keymap(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        keymap: smithay_client_toolkit::seat::keyboard::Keymap<'_>,
+    ) {
+        self.layout.set_keymap(keymap.as_string());
     }
 }
 

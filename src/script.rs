@@ -103,6 +103,15 @@ impl Button {
     }
 }
 
+/// `keyboard.down` が読むキーの状態（#69）。
+#[derive(Default)]
+struct KeyboardState {
+    /// 押しているキーの名前。
+    down: Vec<&'static str>,
+    /// `keyboard.down` を一度でも呼んだか。呼んだら、壁紙にキーボードのフォーカスを受け取れるようにする。
+    used: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MouseState {
     pub x: f32,
@@ -479,6 +488,31 @@ impl Script {
         g.set("screen", &screen)?;
         let mouse = lua.create_table()?;
         g.set("mouse", &mouse)?;
+        lua.set_app_data(KeyboardState::default());
+        let keyboard = lua.create_table()?;
+        keyboard.set(
+            "down",
+            lua.create_function(|lua, name: mlua::Value| {
+                let name = match &name {
+                    mlua::Value::String(s) => s.to_str()?.to_string(),
+                    v => {
+                        return Err(mlua::Error::runtime(format!(
+                            "keyboard.down: expected a key name, got {}",
+                            v.type_name()
+                        )));
+                    }
+                };
+                if !crate::keyboard::is_key_name(&name) {
+                    return Err(mlua::Error::runtime(format!(
+                        "keyboard.down: unknown key name {name:?}"
+                    )));
+                }
+                let mut k = lua.app_data_mut::<KeyboardState>().unwrap();
+                k.used = true;
+                Ok(k.down.contains(&name.as_str()))
+            })?,
+        )?;
+        g.set("keyboard", &keyboard)?;
 
         // 無限ループ対策。JIT コンパイルされたコードでは呼ばれないことがあるので、
         // 最終的な歯止めは main 側の watchdog が担う。
@@ -535,6 +569,16 @@ impl Script {
             self.mouse.set("dragging", m.dragging)
         })()
         .map_err(|e| e.to_string())
+    }
+
+    /// `keyboard.down` で読む、押しているキーの名前。
+    pub fn set_keys(&self, names: Vec<&'static str>) {
+        self.lua.app_data_mut::<KeyboardState>().unwrap().down = names;
+    }
+
+    /// `keyboard.down` を一度でも呼んだか（読み込みのときも含む）。
+    pub fn uses_keyboard(&self) -> bool {
+        self.lua.app_data_ref::<KeyboardState>().unwrap().used
     }
 
     /// マウスのボタン操作をコールバックに渡す。
@@ -686,6 +730,54 @@ mod tests {
             ]
         );
         assert_eq!(dl.batch.vertices[0].color, [255, 0, 0, 128]);
+    }
+
+    #[test]
+    fn keyboard_down_reads_held_keys_and_marks_use() {
+        let s = run(r#"
+            got = {}
+            function update() got.a = keyboard.down("a"); got.space = keyboard.down("space") end
+        "#)
+        .unwrap();
+        // 読み込んだだけでは、キーボードを使う壁紙にしない。
+        assert!(!s.uses_keyboard());
+        s.set_keys(vec!["a", "lshift"]);
+        drop(s.frame(0.1).unwrap());
+        assert!(s.uses_keyboard());
+        s.lua
+            .load("assert(got.a == true and got.space == false)")
+            .exec()
+            .unwrap();
+        s.set_keys(Vec::new());
+        drop(s.frame(0.1).unwrap());
+        s.lua.load("assert(got.a == false)").exec().unwrap();
+    }
+
+    #[test]
+    fn keyboard_down_at_load_marks_use_and_rejects_unknown_names() {
+        let s = run(r#"local held = keyboard.down("return")"#).unwrap();
+        assert!(s.uses_keyboard());
+        for (src, want) in [
+            (
+                r#"keyboard.down("A")"#,
+                r#"keyboard.down: unknown key name "A""#,
+            ),
+            (
+                r#"keyboard.down("enter")"#,
+                r#"keyboard.down: unknown key name "enter""#,
+            ),
+            (
+                "keyboard.down(65)",
+                "keyboard.down: expected a key name, got integer",
+            ),
+            (
+                "keyboard.down()",
+                "keyboard.down: expected a key name, got nil",
+            ),
+        ] {
+            let e = run(src).err().unwrap();
+            assert!(e.contains(want), "{src}: {e}");
+        }
     }
 
     #[test]

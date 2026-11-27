@@ -9,7 +9,7 @@ Shadertoy 形式の GLSL のシェーダーも、そのまま壁紙にできる�
 
 ## ビルド
 
-必要なもの: Rust、`wayland-client` / `wayland-egl` / EGL / GLES の開発ファイル、C コンパイラー（LuaJIT を同梱してビルドするため）。
+必要なもの: Rust、`wayland-client` / `wayland-egl` / EGL / GLES / `libxkbcommon` の開発ファイル、pkg-config、C コンパイラー（LuaJIT を同梱してビルドするため）。
 
 実行には OpenGL ES 3.0 以上を使える GPU とドライバーが要る。GLES3 のコンテキストを作れない環境では、エラーを出して起動しない。
 

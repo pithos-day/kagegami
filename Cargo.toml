@@ -11,11 +11,12 @@ libc = "0.2.191"
 miniz_oxide = "0.8.9"
 mlua = { version = "0.12.2", features = ["luajit", "vendored"] }
 png = "0.18.1"
-smithay-client-toolkit = { version = "0.21.1", default-features = false }
+smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["xkbcommon"] }
 wayland-backend = { version = "0.3.17", features = ["client_system"] }
 wayland-client = "0.31.15"
 wayland-egl = "0.32.11"
 wayland-protocols = { version = "0.32.13", features = ["client"] }
+xkbcommon = "0.8.0"
 zune-core = "0.5.3"
 zune-jpeg = "0.5.15"
 
