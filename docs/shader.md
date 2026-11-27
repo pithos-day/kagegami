@@ -97,7 +97,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
 ## キューブマップ
 
-画像の指定に `type=cubemap` を付けると、正距円筒図法（縦横比 2:1 のパノラマ）の画像からキューブマップを作り、`samplerCube` で読める。360° 写真などのパノラマを、PNG か JPEG でそのまま使える（#68）。
+画像の指定に `type=cubemap` を付けると、正距円筒図法（縦横比 2:1 のパノラマ）の画像からキューブマップを作り、`samplerCube` で読める。360° 写真などのパノラマを、PNG か JPEG でそのまま使える（#68）。例は `examples/aero.glsl`。
 
 ```glsl
 // @iChannel0 sky.jpg type=cubemap
