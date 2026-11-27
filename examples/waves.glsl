@@ -1,4 +1,4 @@
-// Shadertoy 形式のシェーダーの壁紙の例。ドラッグすると波の中心が動く。
+// Shadertoy 形式の GLSL の壁紙の例。ドラッグすると波の中心が動く。
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     vec2 uv = fragCoord / iResolution.y;
     // 一度も押していなければ iMouse は全部 0。押した後は、画面外（負の座標）でもその位置を使う。
