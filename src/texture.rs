@@ -436,90 +436,19 @@ mod tests {
 #[cfg(test)]
 mod gpu_tests {
     use super::*;
-    use khronos_egl as egl;
+    use crate::gpu_test::{self, UNWRAP_FRAG};
 
-    const PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31DD;
-
-    /// surfaceless の GLES 3 のコンテキストを作って current にする。
-    fn context() -> Option<(egl::Instance<egl::Static>, glow::Context)> {
-        let egl = egl::Instance::new(egl::Static);
-        let display = unsafe {
-            egl.get_platform_display(
-                PLATFORM_SURFACELESS_MESA,
-                egl::DEFAULT_DISPLAY,
-                &[egl::ATTRIB_NONE],
-            )
-        }
-        .ok()?;
-        egl.initialize(display).ok()?;
-        egl.bind_api(egl::OPENGL_ES_API).ok()?;
-        let config = egl
-            .choose_first_config(
-                display,
-                // 既定の SURFACE_TYPE は WINDOW_BIT で、surfaceless のディスプレイには合う設定がない。
-                &[
-                    egl::SURFACE_TYPE,
-                    0,
-                    egl::RENDERABLE_TYPE,
-                    egl::OPENGL_ES3_BIT,
-                    egl::NONE,
-                ],
-            )
-            .ok()??;
-        let ctx = egl
-            .create_context(
-                display,
-                config,
-                None,
-                &[egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE],
-            )
-            .ok()?;
-        egl.make_current(display, None, None, Some(ctx)).ok()?;
-        let gl = unsafe {
-            glow::Context::from_loader_function(|s| {
-                egl.get_proc_address(s)
-                    .map_or(std::ptr::null(), |f| f as *const std::ffi::c_void)
-            })
-        };
-        Some((egl, gl))
-    }
-
-    /// キューブマップを、#68 で Shadertoy と照らし合わせた式で正距円筒図法に広げて描く。
-    const UNWRAP_FRAG: &str = "#version 300 es
-precision highp float;
-precision highp samplerCube;
-uniform samplerCube cube;
-uniform vec2 size;
-out vec4 o;
-void main() {
-    vec2 uv = gl_FragCoord.xy / size;
-    float lon = (uv.x - 0.5) * 6.2831853;
-    float lat = (uv.y - 0.5) * 3.1415927;
-    vec3 dir = vec3(sin(lon) * cos(lat), sin(lat), -cos(lon) * cos(lat));
-    o = texture(cube, dir);
-}
-";
-
-    /// 左右・上下が非対称な画像を、キューブマップにしてから正距円筒図法に広げ直すと、元の画像に戻る。
+    /// 非対称な画像を、キューブマップにしてから正距円筒図法に広げ直すと、元の画像に戻る。
     /// キューブマップを引くのはドライバーの `texture(samplerCube, dir)` なので、変換の面の表の誤り
     /// （面の取り違え・反転・回転）は打ち消されずに残る。
     #[test]
     fn equirect_round_trips_through_the_cubemap() {
-        let Some((_egl, gl)) = context() else {
+        let Some((_egl, gl)) = gpu_test::context() else {
             eprintln!("skipped: no surfaceless EGL display");
             return;
         };
         let (w, h) = (256u32, 128u32);
-        // r: 左端 0 → 右端 255（経度）、g: 上端 255 → 下端 0（緯度）、b: 経度で 2 周する波。
-        let mut rgba = Vec::new();
-        for y in 0..h {
-            for x in 0..w {
-                let u = (x as f32 + 0.5) / w as f32;
-                let v = (y as f32 + 0.5) / h as f32;
-                let b = 127.5 + 127.5 * (u * 4.0 * std::f32::consts::PI).sin();
-                rgba.extend([(u * 255.0) as u8, ((1.0 - v) * 255.0) as u8, b as u8, 255]);
-            }
-        }
+        let rgba = gpu_test::panorama(w, h);
         let img = Image {
             width: w,
             height: h,
@@ -547,30 +476,16 @@ void main() {
         assert_eq!((cube.width, cube.height, cube.depth), (64, 64, 1));
         assert_eq!(cube.target, glow::TEXTURE_CUBE_MAP);
 
-        let out = unsafe {
-            let program = crate::gl_program::build(
-                &gl,
-                &[
-                    (glow::VERTEX_SHADER, CUBE_VERT),
-                    (glow::FRAGMENT_SHADER, UNWRAP_FRAG),
-                ],
-                |_| {},
-            )
-            .unwrap();
-            let target = gl.create_texture().unwrap();
-            gl.bind_texture(glow::TEXTURE_2D, Some(target));
-            gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, w as i32, h as i32);
-            let fbo = gl.create_framebuffer().unwrap();
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                Some(target),
-                0,
-            );
-            let vao = gl.create_vertex_array().unwrap();
-            gl.bind_vertex_array(Some(vao));
+        let program = crate::gl_program::build(
+            &gl,
+            &[
+                (glow::VERTEX_SHADER, CUBE_VERT),
+                (glow::FRAGMENT_SHADER, UNWRAP_FRAG),
+            ],
+            |_| {},
+        )
+        .unwrap();
+        let out = gpu_test::render(&gl, (w, h), || unsafe {
             gl.use_program(Some(program));
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_CUBE_MAP, Some(cube.tex));
@@ -580,50 +495,8 @@ void main() {
                 w as f32,
                 h as f32,
             );
-            gl.viewport(0, 0, w as i32, h as i32);
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
-            let mut out = vec![0u8; (w * h * 4) as usize];
-            gl.read_pixels(
-                0,
-                0,
-                w as i32,
-                h as i32,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut out)),
-            );
-            assert_eq!(gl.get_error(), glow::NO_ERROR);
-            out
-        };
-
-        // 読み出した行 0 は下端。元の画像の行 0 は上端。
-        // 経度の継ぎ目の近く（r が 0 と 255 の間で跳ぶ）と、画素の細かさが大きく変わる極の近くは除く。
-        let mut worst = 0;
-        let mut checked = 0;
-        for y in 0..h {
-            let lat = ((y as f32 + 0.5) / h as f32 - 0.5) * 180.0;
-            if lat.abs() > 60.0 {
-                continue;
-            }
-            for x in 0..w {
-                let u = (x as f32 + 0.5) / w as f32;
-                if !(0.05..0.95).contains(&u) {
-                    continue;
-                }
-                let o = ((y * w + x) * 4) as usize;
-                let s = (((h - 1 - y) * w + x) * 4) as usize;
-                for c in 0..3 {
-                    let d = (out[o + c] as i32 - rgba[s + c] as i32).abs();
-                    worst = worst.max(d);
-                }
-                checked += 1;
-            }
-        }
-        eprintln!(
-            "renderer: {}, checked {checked} pixels, max difference {worst}",
-            unsafe { gl.get_parameter_string(glow::RENDERER) }
-        );
-        assert!(checked > 10000, "{checked}");
-        assert!(worst <= 3, "max difference {worst}");
+        });
+        gpu_test::assert_unwrapped(&gl, &out, &rgba, (w, h));
     }
 }

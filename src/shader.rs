@@ -710,6 +710,91 @@ out vec4 kagegami_FragColor;
         }
     }
 
+    /// `type=cubemap` の壁紙を、アプリと同じ経路（指定の読み取り → コンパイル → 画像の読み込み →
+    /// 描画）で描くと、#68 の向きの式で元の画像に戻る。縦横比が 2:1 でない画像はエラーになる。
+    #[test]
+    fn cubemap_wallpaper_draws_the_panorama() {
+        let Some((_egl, gl)) = crate::gpu_test::context() else {
+            eprintln!("skipped: no surfaceless EGL display");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("kagegami-cubemap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = |name: &str, w: u32, h: u32, rgba: &[u8]| {
+            let mut out = Vec::new();
+            let mut e = png::Encoder::new(&mut out, w, h);
+            e.set_color(png::ColorType::Rgba);
+            e.write_header().unwrap().write_image_data(rgba).unwrap();
+            std::fs::write(dir.join(name), out).unwrap();
+        };
+        let (w, h) = (256u32, 128u32);
+        let rgba = crate::gpu_test::panorama(w, h);
+        png("pano.png", w, h, &rgba);
+        png("bad.png", w, 100, &rgba[..(w * 100 * 4) as usize]);
+        std::fs::write(
+            dir.join("main.glsl"),
+            "// @iChannel0 pano.png type=cubemap filter=linear
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec2 uv = fragCoord / iResolution.xy;
+    float lon = (uv.x - 0.5) * 6.2831853;
+    float lat = (uv.y - 0.5) * 3.1415927;
+    vec3 dir = vec3(sin(lon) * cos(lat), sin(lat), -cos(lon) * cos(lat));
+    fragColor = texture(iChannel0, dir);
+}
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("bad.glsl"),
+            "// @iChannel1 bad.png type=cubemap
+void mainImage(out vec4 c, in vec2 p) { c = texture(iChannel1, vec3(p, 1.0)); }
+",
+        )
+        .unwrap();
+
+        let source = Source::open(&dir.join("main.glsl")).unwrap();
+        let files = ShaderFiles::read(&source, source.entry(), &mut vec![]).unwrap();
+        let program = ShaderProgram::new(
+            &gl,
+            None,
+            &files.image.src,
+            PassKind::Image,
+            files.image.channel_dims(),
+        )
+        .unwrap();
+        let images = ShaderImages::load(&gl, &source, &files).unwrap();
+        let bindings = Bindings::images(&images.image);
+        // iChannelResolution は (面のサイズ, 面のサイズ, 1)。
+        assert_eq!(bindings.resolutions[..3], [64.0, 64.0, 1.0]);
+        assert_eq!(bindings.textures[0].0, glow::TEXTURE_CUBE_MAP);
+        let u = Uniforms {
+            resolution: (w, h),
+            time: 0.0,
+            time_delta: 0.0,
+            frame: 0,
+            mouse: [0.0; 4],
+            date: [0.0; 4],
+        };
+        let out = crate::gpu_test::render(&gl, (w, h), || program.draw(&gl, &u, &bindings));
+        crate::gpu_test::assert_unwrapped(&gl, &out, &rgba, (w, h));
+        program.delete(&gl);
+        images.delete(&gl);
+
+        let source = Source::open(&dir.join("bad.glsl")).unwrap();
+        let files = ShaderFiles::read(&source, source.entry(), &mut vec![]).unwrap();
+        let e = match ShaderImages::load(&gl, &source, &files) {
+            Ok(_) => panic!("bad.png was loaded"),
+            Err(e) => e,
+        };
+        assert!(e.contains("bad.glsl:1: "), "{e}");
+        assert!(
+            e.ends_with("bad.png: a cubemap must be an equirectangular image with a 2:1 aspect ratio (got 256x100)"),
+            "{e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn date_is_plausible() {
         let [y, m, d, s] = local_date();
