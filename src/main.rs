@@ -6,6 +6,8 @@ mod cli;
 mod directive;
 mod egl;
 mod gl_program;
+#[cfg(test)]
+mod gpu_test;
 mod gpu_usage;
 mod image;
 mod keyboard;

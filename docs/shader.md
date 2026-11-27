@@ -19,10 +19,10 @@ GLSL ES 3.00（`#version 300 es`）として、出力ごとにコンパイルす
 | `int iFrame` | 読み込んでからのフレーム数 |
 | `vec4 iMouse` | マウス（下を参照） |
 | `vec4 iDate` | (年, 月 - 1, 日, 0 時からの秒数)。ローカル時刻 |
-| `sampler2D iChannel0`〜`3` | 画像（下の「画像」を参照）、バッファー（下の「バッファーと Common」を参照）、キーボード（下の「キーボード」を参照）。指定していないチャンネルは黒。3D ノイズを指定したチャンネルだけ `sampler3D`（下の「3D ノイズ」を参照） |
-| `vec3 iChannelResolution[4]` | 画像・バッファー・キーボードのピクセルサイズ（z は 1）。3D ノイズは (32, 32, 32)。指定していないチャンネルは (0, 0, 0) |
+| `sampler2D iChannel0`〜`3` | 画像（下の「画像」を参照）、バッファー（下の「バッファーと Common」を参照）、キーボード（下の「キーボード」を参照）。指定していないチャンネルは黒。キューブマップを指定したチャンネルは `samplerCube`（下の「キューブマップ」を参照）、3D ノイズを指定したチャンネルは `sampler3D`（下の「3D ノイズ」を参照） |
+| `vec3 iChannelResolution[4]` | 画像・バッファー・キーボードのピクセルサイズ（z は 1）。キューブマップは (面のサイズ, 面のサイズ, 1)。3D ノイズは (32, 32, 32)。指定していないチャンネルは (0, 0, 0) |
 
-`iChannel0`〜`3` に渡せるのは、画像（PNG・JPEG）、バッファー（Buffer A〜D）、組み込みの 3D ノイズ、キーボード。音声・キューブマップ・動画は使えない。
+`iChannel0`〜`3` に渡せるのは、画像（PNG・JPEG）、キューブマップ（正距円筒図法の画像から作る）、バッファー（Buffer A〜D）、組み込みの 3D ノイズ、キーボード。音声・動画と、キューブマップに描くパス（Shadertoy の Cubemap A）は使えない。
 
 ## 画像
 
@@ -94,6 +94,28 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 - GPU が `GL_OES_texture_float_linear` に対応していなければ、起動時に警告を出し、`linear`・`mipmap` を `nearest` として読む（Shadertoy と同じ）
 - Common のエラーは、行番号の前の数字が 1 になる（Mesa では `1:行(列)`。パスのファイルは `0:行(列)`）。Common の中で閉じていない括弧などは、続くパスのファイルの位置でエラーになることがある
 - VRAM: 1 つのバッファーにつき、RGBA32F のテクスチャーを 2 枚（前のフレームの結果と、今描いている方）、出力ごとに持つ。1 枚は 横 × 縦 × 16 バイト。#58 の計測では、バッファーを使わない壁紙と比べて、1920×1080 でバッファー 1 つが約 66MiB、4 つが約 255MiB、3840×2160 で 4 つが約 1.0GiB 増えた（1 つの出力あたり）。`filter=mipmap` で読むバッファーは、計算ではさらに約 1/3 増える（測っていない）。`--scale 0.5` で約 1/4 になる
+
+## キューブマップ
+
+画像の指定に `type=cubemap` を付けると、正距円筒図法（縦横比 2:1 のパノラマ）の画像からキューブマップを作り、`samplerCube` で読める。360° 写真などのパノラマを、PNG か JPEG でそのまま使える（#68）。例は `examples/aero.glsl`。
+
+```glsl
+// @iChannel0 sky.jpg type=cubemap
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec2 p = (2.0 * fragCoord - iResolution.xy) / iResolution.y;
+    vec3 rd = normalize(vec3(p, -1.5));  // -Z を向くカメラ
+    fragColor = texture(iChannel0, rd);
+}
+```
+
+- 画像の向き: 画像の中心が -Z、右へ 1/4 進んだ位置が +X、上が +Y。経度 lon（-π〜π、中心が 0）・緯度 lat（-π/2〜π/2、上が正）の画素は、方向 `(sin(lon)·cos(lat), sin(lat), -cos(lon)·cos(lat))` に当たる。Shadertoy の組み込みのキューブマップを、この式で正距円筒図法に広げた絵と、チャンネルのサムネイルが一致する（#68）
+- 画像の縦横比はちょうど 2:1 にする。そうでなければエラーになる
+- 面のサイズは画像の幅 ÷ 4（4 で割り切れなければ切り捨て）。縦横が `GL_MAX_TEXTURE_SIZE` を超える画像と、面のサイズが `GL_MAX_CUBE_MAP_TEXTURE_SIZE` を超える画像はエラーになる
+- オプションは `filter`（`nearest` / `linear` / `mipmap`、既定 `mipmap`。Shadertoy と同じ）だけ。`wrap` は面の境目が常につながるので意味がなく、`vflip` は Shadertoy のキューブマップにない。どちらも書くとエラーになる
+- `textureSize(iChannelN, 0)` は面のサイズを返す（Shadertoy では常に 1 になる）
+- 読み込むときに 1 回だけ、GPU で画像を 6 面に写す。`filter=mipmap` なら、その後にミップマップを作る
+- VRAM: 計算では、幅 W の画像で、キューブマップ（mipmap 付き）は約 2W² バイト（同じ画像を普通の画像として mipmap 付きで読むと約 2.7W² バイト）。写す間だけ、元の画像のテクスチャー（2W² バイト）も持つ（どちらも測っていない）
+- Lua の壁紙では使えない
 
 ## 3D ノイズ
 
