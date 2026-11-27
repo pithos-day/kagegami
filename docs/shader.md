@@ -19,10 +19,10 @@ GLSL ES 3.00（`#version 300 es`）として、出力ごとにコンパイルす
 | `int iFrame` | 読み込んでからのフレーム数 |
 | `vec4 iMouse` | マウス（下を参照） |
 | `vec4 iDate` | (年, 月 - 1, 日, 0 時からの秒数)。ローカル時刻 |
-| `sampler2D iChannel0`〜`3` | 画像（下の「画像」を参照）、バッファー（下の「バッファーと Common」を参照）、キーボード（下の「キーボード」を参照）。指定していないチャンネルは黒。キューブマップを指定したチャンネルは `samplerCube`（下の「キューブマップ」を参照）、3D ノイズを指定したチャンネルは `sampler3D`（下の「3D ノイズ」を参照） |
-| `vec3 iChannelResolution[4]` | 画像・バッファー・キーボードのピクセルサイズ（z は 1）。キューブマップは (面のサイズ, 面のサイズ, 1)。3D ノイズは (32, 32, 32)。指定していないチャンネルは (0, 0, 0) |
+| `sampler2D iChannel0`〜`3` | 画像（下の「画像」を参照）、バッファー（下の「バッファーと Common」を参照）、キーボード（下の「キーボード」を参照）。指定していないチャンネルは黒。キューブマップと Cubemap A を指定したチャンネルは `samplerCube`（下の「キューブマップ」「Cubemap A」を参照）、3D ノイズを指定したチャンネルは `sampler3D`（下の「3D ノイズ」を参照） |
+| `vec3 iChannelResolution[4]` | 画像・バッファー・キーボードのピクセルサイズ（z は 1）。キューブマップは (面のサイズ, 面のサイズ, 1)、Cubemap A は (1024, 1024, 1)。3D ノイズは (32, 32, 32)。指定していないチャンネルは (0, 0, 0) |
 
-`iChannel0`〜`3` に渡せるのは、画像（PNG・JPEG）、キューブマップ（正距円筒図法の画像から作る）、バッファー（Buffer A〜D）、組み込みの 3D ノイズ、キーボード。音声・動画と、キューブマップに描くパス（Shadertoy の Cubemap A）は使えない。
+`iChannel0`〜`3` に渡せるのは、画像（PNG・JPEG）、キューブマップ（正距円筒図法の画像から作る）、バッファー（Buffer A〜D）、キューブマップに描くパス（Cubemap A）、組み込みの 3D ノイズ、キーボード。音声・動画は使えない。
 
 ## 画像
 
@@ -49,7 +49,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
 - `vflip=true` は、画像の上が画面の上に来る向き（`fragCoord / iResolution.xy` で画像の左下が画面の左下に来る）
 - 既定の値は、Shadertoy のサイトで iChannel に新しく画像を指定したときの設定（mipmap・repeat・vflip 有効）と同じ
-- 大文字・小文字を問わず `@ichannel`・`@image`・`@buffer`・`@common` で始まる名前は指定として確かめ、正しくなければエラーにする（`@iChannel4`・`@ichannel0`・`@bufferE` など）。それ以外の `@author` などは、ただのコメントとして無視する
+- 大文字・小文字を問わず `@ichannel`・`@image`・`@buffer`・`@common`・`@cubemap` で始まる名前は指定として確かめ、正しくなければエラーにする（`@iChannel4`・`@ichannel0`・`@bufferE`・`@cubemapB` など）。それ以外の `@author` などは、ただのコメントとして無視する
 - 画像はすべての出力で 1 回だけ読み込み、出力の間で共有する。読み込みは、壁紙のファイルを読むときに行う（読み込む間は描画が止まる。4K の JPEG のデコードは、#36 の計測で約 20ms）
 
 ## バッファーと Common
@@ -79,7 +79,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 - `@iChannel0 bufferA` のように、チャンネルにバッファーの名前（`bufferA`〜`bufferD`）を書く。Image のファイルでも、バッファーのファイルでも書ける。宣言していないバッファーはエラーになる。`bufferA` という名前の画像のファイルは `./bufferA` と書く
 - バッファーのファイルは Shadertoy の Buffer のタブと同じ形（`mainImage` を定義する）で、自分の `@iChannel` を書ける。画像のパスは、そのファイルがあるディレクトリから探す
 - Common のファイルの中身は、すべてのパスの uniform の宣言の後、パスのソースの前に入る（Shadertoy と同じ）。Common のファイルには指定を書けない
-- 毎フレーム、A → B → C → D → Image の順に描く。自分より前のバッファーを読むと今のフレームの結果、自分か後ろのバッファーを読むと前のフレームの結果になる（Shadertoy と同じ）
+- 毎フレーム、A → B → C → D → Image の順に描く（Cubemap A を使う壁紙では D と Image の間に描く。下の「Cubemap A」を参照）。自分より前のバッファーを読むと今のフレームの結果、自分か後ろのバッファーを読むと前のフレームの結果になる（Shadertoy と同じ）
 - バッファーの形式は RGBA32F（Shadertoy と同じ）。書いた値はアルファも含めてそのまま残り、0〜1 に丸められない
 - バッファーのサイズは描画するバッファーのピクセル（`iResolution` と同じ）で、出力ごとに持つ。最初と、壁紙を読み直したとき（`iFrame` が 0 に戻る）は (0, 0, 0, 0) から始まる。出力のサイズが変わったときは、重なる範囲（左下から）の中身を写し、ほかは 0 にする
 - オプション（どれも省略できる）:
@@ -115,6 +115,45 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 - `textureSize(iChannelN, 0)` は面のサイズを返す（Shadertoy では常に 1 になる）
 - 読み込むときに 1 回だけ、GPU で画像を 6 面に写す。`filter=mipmap` なら、その後にミップマップを作る
 - VRAM: 計算では、幅 W の画像で、キューブマップ（mipmap 付き）は約 2W² バイト（同じ画像を普通の画像として mipmap 付きで読むと約 2.7W² バイト）。写す間だけ、元の画像のテクスチャー（2W² バイト）も持つ（どちらも測っていない）
+- Lua の壁紙では使えない
+
+## Cubemap A
+
+Shadertoy の Cubemap A のタブ（キューブマップに描くパス）を、別のファイルに書く。Image のファイルの先頭のコメントで `@cubemapA` と宣言し、`@iChannel` に `cubemapA` と書くと `samplerCube` で読める（#72）。
+
+```glsl
+// main.glsl（Image）
+// @cubemapA cube.glsl
+// @iChannel0 cubemapA
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec2 p = (2.0 * fragCoord - iResolution.xy) / iResolution.y;
+    fragColor = texture(iChannel0, normalize(vec3(p, -1.5)));
+}
+```
+
+```glsl
+// cube.glsl（Cubemap A）。自分を読むと前のフレームの結果になる
+// @iChannel0 cubemapA
+void mainCubemap(out vec4 fragColor, in vec2 fragCoord, in vec3 rayOri, in vec3 rayDir) {
+    vec3 prev = texture(iChannel0, rayDir).rgb;
+    vec3 sky = 0.5 + 0.5 * rayDir * sin(iTime);
+    fragColor = vec4(mix(prev, sky, 0.05), 1.0);
+}
+```
+
+- `@cubemapA` は Image のファイルにだけ書ける。パスの書き方は画像・バッファーと同じ（Image のファイルがあるディレクトリから）
+- `@iChannel0 cubemapA` のように、チャンネルに `cubemapA` と書く。Image・バッファー・Cubemap A のどのファイルでも書ける。宣言していなければエラーになる。`cubemapA` という名前の画像のファイルは `./cubemapA` と書く
+- Cubemap A のファイルは、Shadertoy の Cubemap A のタブと同じく `mainCubemap(out vec4 fragColor, in vec2 fragCoord, in vec3 rayOri, in vec3 rayDir)` を定義する。自分の `@iChannel` を書ける。画像のパスは、そのファイルがあるディレクトリから探す。Common も、ほかのパスと同じように入る
+- 毎フレーム、6 面すべてに描く。`rayDir` は、描いている画素を `texture(iChannelN, rayDir)` で読むときの向きの単位ベクトル。`rayOri` は (0, 0, 0)（Shadertoy で確かめた値）。`fragCoord` は面の中の画素の位置（0〜1024）
+- Cubemap A の中の `iResolution` は、面のサイズではなく、Image と同じ描画するバッファーのサイズになる（Shadertoy と同じ）。ほかの uniform も Image と同じ値
+- 描く順番は Buffer A〜D → Cubemap A → Image。Image から読むと今のフレームの結果、バッファーと Cubemap A 自身から読むと前のフレームの結果になる（Shadertoy で確かめた。Buffer B〜D と Cubemap A の順番は確かめていない）
+- 面のサイズは 1024、形式は RGBA16F（Shadertoy と同じ）。書いた値はアルファも含めてそのまま残り、0〜1 に丸められないが、16 ビットの浮動小数点数なので細かさは約 3 桁（例えば 2048 を超える整数は丸められる）
+- 最初と、壁紙を読み直したとき（`iFrame` が 0 に戻る）は (0, 0, 0, 0) から始まる。出力のサイズや `--scale` が変わっても、中身を残す（Shadertoy と同じ）
+- 読む側の `iChannelResolution` は (1024, 1024, 1)、`textureSize(iChannelN, 0)` は 1024
+- オプションは `filter`（`nearest` / `linear` / `mipmap`、既定 `linear`。Shadertoy と同じ）だけ。`wrap` は面の境目が常につながるので意味がなく（Shadertoy でも clamp しか選べない）、`vflip` はキューブマップにない。どちらも書くとエラーになる
+- `filter=mipmap` で読むときは、描くたびにミップマップを作る。その分 GPU 時間が増える
+- 負荷: 毎フレーム 1024 × 1024 × 6 面（約 630 万画素。1920×1080 の約 3 倍）を描く。1 フレームの GPU 時間の制限（0.25 秒）には Cubemap A を描く時間も含む
+- VRAM: 計算では、1 つの出力あたり、1024 × 1024 × 6 面 × 8 バイトのキューブマップを 2 枚（前のフレームの結果と、今描いている方）で 96MiB。`filter=mipmap` で読むと、さらに約 1/3 増える（どちらも測っていない）
 - Lua の壁紙では使えない
 
 ## 3D ノイズ
@@ -182,8 +221,9 @@ Shadertoy と同じく、ボタンを押している間のドラッグを表す�
 
 - 起動時にファイルを読めなければ、Lua の壁紙と同じように終了コード 1 で終了する
 - 画像の指定の書き間違いや、画像を読めない（ファイルがない・壊れている・大きすぎる）ときは、コンパイルエラーと同じように止まる。画像を直して保存すれば再開する。指定した画像は、読めなかったものも見張っている（zip ファイルで渡したときは、zip ファイルを見張る）
-- バッファー・Common のファイルを読めないとき、宣言していないバッファーを読もうとしたときも、同じように止まる。宣言したファイルは、読めなかったものも見張っている（zip ファイルで渡したときは、zip ファイルを見張る）
+- バッファー・Common・Cubemap A のファイルを読めないとき、宣言していないバッファーや Cubemap A を読もうとしたときも、同じように止まる。宣言したファイルは、読めなかったものも見張っている（zip ファイルで渡したときは、zip ファイルを見張る）
 - バッファーを使う壁紙は、GPU が `GL_EXT_color_buffer_float`（RGBA32F のテクスチャーへの描画）に対応していなければ、エラーとして止まる。VRAM が足りずにバッファーを作れないときも、同じように止まる
+- Cubemap A を使う壁紙は、GPU が `GL_EXT_color_buffer_float` か `GL_EXT_color_buffer_half_float`（RGBA16F のテクスチャーへの描画）に対応していなければ、エラーとして止まる。VRAM が足りずに作れないときも、同じように止まる
 - コンパイルエラーは標準エラー出力に出して、直前のフレームを表示したまま止まる。ファイルを直して保存すれば再開する
-- 1 フレームの GPU 時間（バッファーを使う壁紙では、すべてのパスとミップマップの作成を合わせた時間）が 0.25 秒を超えたら、エラーとして同じように止める。GPU 時間は `GL_EXT_disjoint_timer_query` で測るので、止まるのは超えたフレームの数フレーム後になる。この拡張機能がない環境では、起動時に警告を出し、時間を見張らずに描く
+- 1 フレームの GPU 時間（バッファーや Cubemap A を使う壁紙では、すべてのパスとミップマップの作成を合わせた時間）が 0.25 秒を超えたら、エラーとして同じように止める。GPU 時間は `GL_EXT_disjoint_timer_query` で測るので、止まるのは超えたフレームの数フレーム後になる。この拡張機能がない環境では、起動時に警告を出し、時間を見張らずに描く
 - 終わらないループ（`while (true)` など）は止められない。描画が戻らなくなり、最後は GPU ドライバーが GPU をリセットする。そのあいだ、画面全体が固まることがある
