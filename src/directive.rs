@@ -8,6 +8,8 @@
 //! // @iChannel2 bufferA filter=nearest
 //! // @iChannel3 noise3d-rgba
 //! // @iChannel0 sky.jpg type=cubemap
+//! // @cubemapA cube.glsl
+//! // @iChannel1 cubemapA filter=mipmap
 //! ```
 //!
 //! ```lua
@@ -16,7 +18,7 @@
 //!
 //! - ファイルの先頭から、コメント（行コメント・ブロックコメント）と空行が続く間に書く。
 //!   それより後ろの行コメントに書いた指定はエラーにする
-//! - 大文字・小文字を問わず `@ichannel` か `@image` で始まる名前（シェーダーでは `@buffer`・`@common` も）
+//! - 大文字・小文字を問わず `@ichannel` か `@image` で始まる名前（シェーダーでは `@buffer`・`@common`・`@cubemap` も）
 //!   だけを指定として確かめる。それ以外の `@author` などは、ただのコメントとして無視する
 
 use std::path::{Path, PathBuf};
@@ -110,6 +112,19 @@ pub struct BufferRef {
     pub line: usize,
 }
 
+/// キューブマップに描くパス（Shadertoy の Cubemap A、#72）の名前。
+pub const CUBEMAP_NAME: &str = "cubemapA";
+
+/// `@iChannelN cubemapA` のように、チャンネルに Cubemap A を渡す指定（#72）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct CubemapRef {
+    /// チャンネルの番号（0〜3）。
+    pub channel: usize,
+    /// filter だけを使う。既定は linear（Shadertoy で Cubemap A を選んだときの既定）。
+    pub sampler: Sampler,
+    pub line: usize,
+}
+
 /// チャンネルにキーボードの入力を渡す指定の名前（#69）。
 pub const KEYBOARD: &str = "keyboard";
 
@@ -158,23 +173,33 @@ pub struct GlslHeader {
     pub buffer_refs: Vec<BufferRef>,
     pub keyboard_refs: Vec<KeyboardRef>,
     pub noise_refs: Vec<NoiseRef>,
+    pub cubemap_refs: Vec<CubemapRef>,
     /// `@bufferA`〜`@bufferD`。添字はバッファーの添字。
     pub buffers: [Option<FileDecl>; 4],
     pub common: Option<FileDecl>,
+    /// `@cubemapA`（#72）。
+    pub cubemap: Option<FileDecl>,
 }
 
 impl GlslHeader {
-    /// `@bufferA`〜`D`・`@common` の、最初に書かれた行。どれもなければ None。
+    /// `@bufferA`〜`D`・`@common`・`@cubemapA` の、最初に書かれた行。どれもなければ None。
     pub fn first_pass_decl(&self) -> Option<(usize, String)> {
         let buffers = self.buffers.iter().enumerate().filter_map(|(i, d)| {
             d.as_ref()
                 .map(|d| (d.line, format!("@{}", BUFFER_NAMES[i])))
         });
         let common = self.common.iter().map(|d| (d.line, "@common".to_string()));
-        buffers.chain(common).min_by_key(|(line, _)| *line)
+        let cubemap = self
+            .cubemap
+            .iter()
+            .map(|d| (d.line, format!("@{CUBEMAP_NAME}")));
+        buffers
+            .chain(common)
+            .chain(cubemap)
+            .min_by_key(|(line, _)| *line)
     }
 
-    /// 画像・バッファー・ノイズ・キーボードの指定のうち、最初に書かれた行。どれもなければ None。
+    /// 画像・バッファー・ノイズ・キーボード・Cubemap A の指定のうち、最初に書かれた行。どれもなければ None。
     pub fn first_channel(&self) -> Option<(usize, usize)> {
         let images = self
             .images
@@ -183,10 +208,12 @@ impl GlslHeader {
         let refs = self.buffer_refs.iter().map(|r| (r.line, r.channel));
         let keyboard = self.keyboard_refs.iter().map(|r| (r.line, r.channel));
         let noise = self.noise_refs.iter().map(|r| (r.line, r.channel));
+        let cubemap = self.cubemap_refs.iter().map(|r| (r.line, r.channel));
         images
             .chain(refs)
             .chain(noise)
             .chain(keyboard)
+            .chain(cubemap)
             .min_by_key(|(line, _)| *line)
     }
 }
@@ -197,8 +224,10 @@ enum Item {
     BufferRef(BufferRef),
     KeyboardRef(KeyboardRef),
     NoiseRef(NoiseRef),
+    CubemapRef(CubemapRef),
     Buffer(usize, FileDecl),
     Common(FileDecl),
+    Cubemap(FileDecl),
 }
 
 /// 絶対パスはそのまま、先頭の `~/` は `$HOME` に置き換え、それ以外は壁紙のファイルのディレクトリから。
@@ -230,6 +259,9 @@ pub fn parse(src: &str, syntax: Syntax) -> Result<Vec<ImageSpec>, String> {
             Item::NoiseRef(r) => {
                 return Err(format!("{}: noise can only be used in shaders", r.line));
             }
+            Item::CubemapRef(CubemapRef { line, .. }) | Item::Cubemap(FileDecl { line, .. }) => {
+                return Err(format!("{line}: cubemaps can only be used in shaders"));
+            }
             Item::Buffer(_, d) | Item::Common(d) => {
                 return Err(format!("{}: buffers can only be used in shaders", d.line));
             }
@@ -247,6 +279,7 @@ pub fn parse_glsl(src: &str) -> Result<GlslHeader, String> {
             Item::BufferRef(r) => h.buffer_refs.push(r),
             Item::KeyboardRef(r) => h.keyboard_refs.push(r),
             Item::NoiseRef(r) => h.noise_refs.push(r),
+            Item::CubemapRef(r) => h.cubemap_refs.push(r),
             Item::Buffer(i, d) => {
                 if h.buffers[i].is_some() {
                     return Err(format!(
@@ -261,6 +294,12 @@ pub fn parse_glsl(src: &str) -> Result<GlslHeader, String> {
                     return Err(format!("{}: @common is specified twice", d.line));
                 }
                 h.common = Some(d);
+            }
+            Item::Cubemap(d) => {
+                if h.cubemap.is_some() {
+                    return Err(format!("{}: @{CUBEMAP_NAME} is specified twice", d.line));
+                }
+                h.cubemap = Some(d);
             }
         }
     }
@@ -313,6 +352,7 @@ fn items(src: &str, syntax: Syntax) -> Result<Vec<Item>, String> {
                         Item::BufferRef(r) => Some(r.channel.to_string()),
                         Item::KeyboardRef(r) => Some(r.channel.to_string()),
                         Item::NoiseRef(r) => Some(r.channel.to_string()),
+                        Item::CubemapRef(r) => Some(r.channel.to_string()),
                         _ => None,
                     };
                     if let Some(name) = name {
@@ -371,7 +411,7 @@ fn block_open_len(t: &str, syntax: Syntax) -> usize {
     }
 }
 
-/// 行コメントの中身が `@ichannel…` か `@image…`（シェーダーでは `@buffer…`・`@common…` も）で
+/// 行コメントの中身が `@ichannel…` か `@image…`（シェーダーでは `@buffer…`・`@common…`・`@cubemap…` も）で
 /// 始まっていれば、その名前。
 fn directive_name(comment: &str, syntax: Syntax) -> Option<&str> {
     let rest = comment.trim_start().strip_prefix('@')?;
@@ -379,7 +419,10 @@ fn directive_name(comment: &str, syntax: Syntax) -> Option<&str> {
     let lower = name.to_ascii_lowercase();
     let known = lower.starts_with("ichannel")
         || lower.starts_with("image")
-        || (syntax == Syntax::Glsl && (lower.starts_with("buffer") || lower.starts_with("common")));
+        || (syntax == Syntax::Glsl
+            && (lower.starts_with("buffer")
+                || lower.starts_with("common")
+                || lower.starts_with("cubemap")));
     known.then_some(name)
 }
 
@@ -416,14 +459,47 @@ fn noise_name(token: &str) -> Result<Option<Noise>, String> {
     Ok(None)
 }
 
-/// `@bufferA a.glsl`・`@common common.glsl` を読む。
+/// `cubemapA` なら true。`CubemapA`・`cubemapB` のような書き間違いはエラーにする
+/// （バッファーの名前と同じ理由）。
+fn is_cubemap(token: &str) -> Result<bool, String> {
+    if token == CUBEMAP_NAME {
+        return Ok(true);
+    }
+    let lower = token.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("cubemap")
+        && rest.len() <= 1
+        && rest.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return Err(format!(
+            "unknown cubemap {token:?} (write {CUBEMAP_NAME}; use ./{token} for a file)"
+        ));
+    }
+    Ok(false)
+}
+
+/// どのファイルを指す指定か。
+enum DeclTarget {
+    Buffer(usize),
+    Common,
+    Cubemap,
+}
+
+/// `@bufferA a.glsl`・`@common common.glsl`・`@cubemapA cube.glsl` を読む。
 fn file_decl(name: &str, args: Vec<String>, line: usize) -> Result<Item, String> {
     let err = |msg: String| format!("{line}: {msg}");
     let target = if name == "common" {
-        None
+        DeclTarget::Common
+    } else if name == CUBEMAP_NAME {
+        DeclTarget::Cubemap
+    } else if name.to_ascii_lowercase().starts_with("cubemap") {
+        return Err(err(format!(
+            "unknown directive @{name} (use @{CUBEMAP_NAME})"
+        )));
     } else {
         match name.strip_prefix("buffer") {
-            Some(n @ ("A" | "B" | "C" | "D")) => Some((n.as_bytes()[0] - b'A') as usize),
+            Some(n @ ("A" | "B" | "C" | "D")) => {
+                DeclTarget::Buffer((n.as_bytes()[0] - b'A') as usize)
+            }
             _ if name.to_ascii_lowercase().starts_with("buffer") => {
                 return Err(err(format!(
                     "unknown directive @{name} (use @bufferA to @bufferD)"
@@ -441,8 +517,9 @@ fn file_decl(name: &str, args: Vec<String>, line: usize) -> Result<Item, String>
     }
     let decl = FileDecl { path, line };
     Ok(match target {
-        Some(i) => Item::Buffer(i, decl),
-        None => Item::Common(decl),
+        DeclTarget::Buffer(i) => Item::Buffer(i, decl),
+        DeclTarget::Common => Item::Common(decl),
+        DeclTarget::Cubemap => Item::Cubemap(decl),
     })
 }
 
@@ -454,7 +531,7 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<Item>,
     let err = |msg: String| format!("{line}: {msg}");
     let args = tokenize(comment.trim_start()[1 + name.len()..].trim()).map_err(err)?;
     let lower = name.to_ascii_lowercase();
-    if lower.starts_with("buffer") || lower.starts_with("common") {
+    if lower.starts_with("buffer") || lower.starts_with("common") || lower.starts_with("cubemap") {
         return file_decl(name, args, line).map(Some);
     }
     let mut args = args.into_iter();
@@ -487,6 +564,13 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<Item>,
         Syntax::Glsl => noise_name(&path).map_err(|e| err(format!("{label}: {e}")))?,
         Syntax::Lua => None,
     };
+    let cube_pass = match syntax {
+        Syntax::Glsl => is_cubemap(&path).map_err(|e| err(format!("{label}: {e}")))?,
+        Syntax::Lua => false,
+    };
+    if cube_pass {
+        return cubemap_ref(&label, spec_name.parse().unwrap_or(0), args, line).map(Some);
+    }
     if syntax == Syntax::Glsl && buffer.is_none() && noise.is_none() {
         if path == KEYBOARD {
             if let Some(opt) = args.next() {
@@ -620,6 +704,47 @@ fn directive(comment: &str, syntax: Syntax, line: usize) -> Result<Option<Item>,
         cubemap,
         line,
     })))
+}
+
+/// `@iChannelN cubemapA` のオプションを読む。書けるのは filter だけで、既定は linear（#72）。
+/// wrap は面の境目が常につながるので意味がなく（Shadertoy でも clamp しか選べない）、
+/// vflip は Shadertoy のキューブマップにないので、どちらもエラーにする（#68 の画像のキューブマップと同じ）。
+fn cubemap_ref(
+    label: &str,
+    channel: usize,
+    args: impl Iterator<Item = String>,
+    line: usize,
+) -> Result<Item, String> {
+    let err = |msg: String| format!("{line}: {label}: {msg}");
+    let mut sampler = Sampler {
+        filter: Filter::Linear,
+        wrap: Wrap::Clamp,
+        vflip: false,
+    };
+    for opt in args {
+        let (key, value) = opt
+            .split_once('=')
+            .ok_or_else(|| err(format!("expected key=value, got {opt:?}")))?;
+        match key {
+            "filter" => {
+                sampler.filter = match value {
+                    "nearest" => Filter::Nearest,
+                    "linear" => Filter::Linear,
+                    "mipmap" => Filter::Mipmap,
+                    _ => return Err(err(format!("unknown value {value:?} for {key}"))),
+                }
+            }
+            "wrap" | "vflip" | "type" => {
+                return Err(err(format!("{key} cannot be used with {CUBEMAP_NAME}")));
+            }
+            _ => return Err(err(format!("unknown option {key:?}"))),
+        }
+    }
+    Ok(Item::CubemapRef(CubemapRef {
+        channel,
+        sampler,
+        line,
+    }))
 }
 
 /// 空白で区切る。`"` で囲んだところは空白を含めて 1 つにする。

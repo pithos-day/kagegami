@@ -180,13 +180,33 @@ void main() {
 }
 ";
 
+/// キューブマップの面 `face`（0〜5、+X, -X, +Y, -Y, +Z, -Z）の、`st`（-1〜1、gl_FragCoord の向き）の画素の方向
+/// （正規化していない）。GLES 3.0 の仕様のキューブマップの面の選び方（sc・tc・ma の表）の逆なので、
+/// `texture(samplerCube, 方向)` はこの画素を読む。Cubemap A の `rayDir`（#72）にも使う。
+macro_rules! cube_face_dir {
+    () => {
+        "vec3 kagegami_face_dir(int face, vec2 st) {
+    float sc = st.x;
+    float tc = st.y;
+    if (face == 0) return vec3(1.0, -tc, -sc);
+    if (face == 1) return vec3(-1.0, -tc, sc);
+    if (face == 2) return vec3(sc, 1.0, tc);
+    if (face == 3) return vec3(sc, -1.0, -tc);
+    if (face == 4) return vec3(sc, -tc, 1.0);
+    return vec3(-sc, -tc, -1.0);
+}
+"
+    };
+}
+pub(crate) use cube_face_dir;
+
 /// キューブマップの 1 つの面に、正距円筒図法の画像を写す（#68）。
 ///
-/// 面の画素 (s, t) の方向は、GLES 3.0 の仕様のキューブマップの面の選び方（sc・tc・ma の表）の逆。
-/// 方向 d の経度・緯度は、画像の中心を -Z、右へ 1/4 進んだ位置を +X、上を +Y として
+/// 面の画素の方向は `cube_face_dir` で求める。方向 d の経度・緯度は、画像の中心を -Z、右へ 1/4 進んだ位置を +X、上を +Y として
 /// d = (sin(lon)·cos(lat), sin(lat), -cos(lon)·cos(lat)) から求める。
 /// 画像は上の行から順にテクスチャーにしてあるので、t = 0 が画像の上（緯度 +90°）。
-const CUBE_FRAG: &str = "#version 300 es
+const CUBE_FRAG: &str = concat!(
+    "#version 300 es
 precision highp float;
 precision highp sampler2D;
 uniform sampler2D kagegami_equirect;
@@ -194,24 +214,18 @@ uniform int kagegami_face;
 uniform float kagegami_size;
 out vec4 kagegami_FragColor;
 const float PI = 3.14159265358979;
-void main() {
+",
+    cube_face_dir!(),
+    "void main() {
     vec2 st = gl_FragCoord.xy / kagegami_size * 2.0 - 1.0;
-    float sc = st.x;
-    float tc = st.y;
-    vec3 d;
-    if (kagegami_face == 0) d = vec3(1.0, -tc, -sc);
-    else if (kagegami_face == 1) d = vec3(-1.0, -tc, sc);
-    else if (kagegami_face == 2) d = vec3(sc, 1.0, tc);
-    else if (kagegami_face == 3) d = vec3(sc, -1.0, -tc);
-    else if (kagegami_face == 4) d = vec3(sc, -tc, 1.0);
-    else d = vec3(-sc, -tc, -1.0);
-    d = normalize(d);
+    vec3 d = normalize(kagegami_face_dir(kagegami_face, st));
     float lon = atan(d.x, -d.z);
     float lat = asin(clamp(d.y, -1.0, 1.0));
     vec2 uv = vec2(lon / (2.0 * PI) + 0.5, 0.5 - lat / PI);
     kagegami_FragColor = texture(kagegami_equirect, uv);
 }
-";
+"
+);
 
 /// 正距円筒図法の画像 `img` から、面のサイズが `face` の RGBA8 のキューブマップを作る（#68）。
 /// 画像をいったん 2D のテクスチャーにし、GPU で 6 面に描いてから消す。mipmap ならその後に作る。

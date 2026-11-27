@@ -4,13 +4,14 @@
 //! 1 フレームの GPU 時間を `EXT_disjoint_timer_query` で測り、長すぎたらエラーとして止める。
 //! バッファー（Buffer A〜D）と Common を使う壁紙（#57）は、パスごとに 1 つのプログラムにする。
 //! 組み込みの 3D ノイズ（#70）を渡すチャンネルは `sampler3D`、キューブマップ（#68）を渡すチャンネルは
-//! `samplerCube` で宣言する。
+//! `samplerCube` で宣言する。Cubemap A（#72）のパスは、`mainCubemap` を 6 面それぞれに描く。
 
 use std::path::Path;
 use std::time::Duration;
 
 use glow::HasContext;
 
+use crate::cubemap_pass::CubemapPass;
 use crate::directive::{ImageSpec, NoiseRef};
 use crate::gl_program::{self, ProgramError};
 use crate::multipass::ShaderFiles;
@@ -105,11 +106,32 @@ void main() {
 }
 ";
 
+/// Cubemap A のシェーダーの後に付けるもの（#72）。面ごとに `kagegami_face` を変えて描く。
+/// `fragCoord` は面の画素、`rayOri` は原点（Shadertoy で確かめた値）、`rayDir` は、その画素を
+/// `texture(samplerCube, rayDir)` で読む向きの単位ベクトル。アルファも含めて、書いた値をそのまま残す。
+const CUBEMAP_SUFFIX: &str = concat!(
+    "
+uniform int kagegami_face;
+uniform float kagegami_size;
+",
+    crate::texture::cube_face_dir!(),
+    "void main() {
+    vec4 kagegami_c = vec4(0.0, 0.0, 0.0, 1.0);
+    vec2 kagegami_st = gl_FragCoord.xy / kagegami_size * 2.0 - 1.0;
+    vec3 kagegami_dir = normalize(kagegami_face_dir(kagegami_face, kagegami_st));
+    mainCubemap(kagegami_c, gl_FragCoord.xy, vec3(0.0), kagegami_dir);
+    kagegami_FragColor = kagegami_c;
+}
+"
+);
+
 /// どのパスのシェーダーか。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PassKind {
     Image,
     Buffer,
+    /// Cubemap A（#72）。
+    Cubemap,
 }
 
 /// 全画面を覆う三角形 1 つ。頂点属性を使わず gl_VertexID から作る。
@@ -127,6 +149,7 @@ pub fn wrap(common: Option<&str>, src: &str, kind: PassKind, dims: [Dim; 4]) -> 
     let suffix = match kind {
         PassKind::Image => IMAGE_SUFFIX,
         PassKind::Buffer => BUFFER_SUFFIX,
+        PassKind::Cubemap => CUBEMAP_SUFFIX,
     };
     let prefix = prefix(dims);
     match common {
@@ -179,7 +202,7 @@ pub struct Uniforms {
     pub date: [f32; 4],
 }
 
-/// `iChannel0`〜`3` に渡す画像・キューブマップ・3D ノイズ。どれも指定していないチャンネルは
+/// `iChannel0`〜`3` に渡す画像・キューブマップ・3D ノイズ（Cubemap A のパスは含まない）。どれも指定していないチャンネルは
 /// 黒い 1×1 のテクスチャーにする。
 pub struct Channels {
     images: [Option<Texture>; 4],
@@ -280,6 +303,8 @@ pub struct ShaderImages {
     pub image: Channels,
     /// 添字はバッファーの添字。
     pub buffers: [Option<Channels>; 4],
+    /// Cubemap A のパスの画像（#72）。
+    pub cubemap: Option<Channels>,
 }
 
 impl ShaderImages {
@@ -292,23 +317,39 @@ impl ShaderImages {
             files.image.noise_refs(),
             &files.image.path,
         )?;
-        let mut buffers: [Option<Channels>; 4] = Default::default();
+        let mut images = Self {
+            image,
+            buffers: Default::default(),
+            cubemap: None,
+        };
+        let load = |pass: &crate::multipass::PassFile| {
+            Channels::load(gl, source, pass.images(), pass.noise_refs(), &pass.path)
+        };
         for (i, pass) in files.buffers.iter().enumerate() {
             let Some(pass) = pass else { continue };
-            match Channels::load(gl, source, pass.images(), pass.noise_refs(), &pass.path) {
-                Ok(ch) => buffers[i] = Some(ch),
+            match load(pass) {
+                Ok(ch) => images.buffers[i] = Some(ch),
                 Err(e) => {
-                    Self { image, buffers }.delete(gl);
+                    images.delete(gl);
                     return Err(e);
                 }
             }
         }
-        Ok(Self { image, buffers })
+        if let Some(pass) = &files.cubemap {
+            match load(pass) {
+                Ok(ch) => images.cubemap = Some(ch),
+                Err(e) => {
+                    images.delete(gl);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(images)
     }
 
     pub fn delete(self, gl: &glow::Context) {
         self.image.delete(gl);
-        for ch in self.buffers.into_iter().flatten() {
+        for ch in self.buffers.into_iter().chain([self.cubemap]).flatten() {
             ch.delete(gl);
         }
     }
@@ -342,6 +383,15 @@ impl Bindings {
         self.resolutions[i * 3 + 2] = 1.0;
     }
 
+    /// チャンネル `i` を Cubemap A のテクスチャーにする（#72）。`iChannelResolution` は (面のサイズ, 面のサイズ, 1)。
+    pub fn set_cubemap(&mut self, i: usize, tex: glow::Texture, sampler: glow::Sampler, size: u32) {
+        self.textures[i] = (glow::TEXTURE_CUBE_MAP, tex);
+        self.samplers[i] = Some(sampler);
+        self.resolutions[i * 3] = size as f32;
+        self.resolutions[i * 3 + 1] = size as f32;
+        self.resolutions[i * 3 + 2] = 1.0;
+    }
+
     /// チャンネル `i` をバッファーのテクスチャーにする。
     pub fn set_buffer(
         &mut self,
@@ -362,6 +412,8 @@ pub struct ShaderProgram {
     program: glow::Program,
     vao: glow::VertexArray,
     loc: [Option<glow::UniformLocation>; 7],
+    /// Cubemap A のパスの `kagegami_face`・`kagegami_size`。ほかのパスでは None。
+    face_loc: [Option<glow::UniformLocation>; 2],
 }
 
 impl ShaderProgram {
@@ -406,20 +458,62 @@ impl ShaderProgram {
                 "iChannelResolution[0]",
             ]
             .map(|n| gl.get_uniform_location(program, n));
+            let face_loc =
+                ["kagegami_face", "kagegami_size"].map(|n| gl.get_uniform_location(program, n));
             // sampler の uniform は既定ですべてユニット 0 を指すので、チャンネルの番号のユニットにする。
             gl.use_program(Some(program));
             for i in 0..4 {
                 let l = gl.get_uniform_location(program, &format!("iChannel{i}"));
                 gl.uniform_1_i32(l.as_ref(), i);
             }
-            Ok(Self { program, vao, loc })
+            Ok(Self {
+                program,
+                vao,
+                loc,
+                face_loc,
+            })
         }
     }
 
+    /// 今の framebuffer に描く。viewport は `u.resolution`。
     pub fn draw(&self, gl: &glow::Context, u: &Uniforms, channels: &Bindings) {
-        let [res, time, dt, frame, mouse, date, channel_res] = &self.loc;
         unsafe {
             gl.viewport(0, 0, u.resolution.0 as i32, u.resolution.1 as i32);
+            self.set_up(gl, u, channels);
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            self.finish(gl);
+        }
+    }
+
+    /// Cubemap A のパスを、`cube` の読まない方の 6 面に描き、描いた方を読む方にする（#72）。
+    /// viewport は面のサイズで、`iResolution` は `u.resolution`（出力のサイズ。Shadertoy と同じ）のまま。
+    pub fn draw_cubemap(
+        &self,
+        gl: &glow::Context,
+        u: &Uniforms,
+        channels: &Bindings,
+        cube: &mut CubemapPass,
+    ) {
+        let [face_loc, size_loc] = &self.face_loc;
+        let size = cube.size();
+        unsafe {
+            gl.viewport(0, 0, size as i32, size as i32);
+            self.set_up(gl, u, channels);
+            gl.uniform_1_f32(size_loc.as_ref(), size as f32);
+            for face in 0..6 {
+                cube.begin_face(gl, face);
+                gl.uniform_1_i32(face_loc.as_ref(), face as i32);
+                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            }
+            self.finish(gl);
+        }
+        cube.end(gl);
+    }
+
+    /// uniform とチャンネルを設定し、描く準備をする。
+    unsafe fn set_up(&self, gl: &glow::Context, u: &Uniforms, channels: &Bindings) {
+        let [res, time, dt, frame, mouse, date, channel_res] = &self.loc;
+        unsafe {
             gl.use_program(Some(self.program));
             gl.uniform_3_f32(
                 res.as_ref(),
@@ -445,7 +539,12 @@ impl ShaderProgram {
             gl.disable(glow::BLEND);
             // 図形の描画が使う既定の VAO の設定を壊さないように、専用の空の VAO で描く。
             gl.bind_vertex_array(Some(self.vao));
-            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+        }
+    }
+
+    /// `set_up` で変えた状態を戻す。
+    unsafe fn finish(&self, gl: &glow::Context) {
+        unsafe {
             gl.bind_vertex_array(None);
             for i in 0..4 {
                 gl.bind_sampler(i, None);
