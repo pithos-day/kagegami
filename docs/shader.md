@@ -119,7 +119,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 
 ## Cubemap A
 
-Shadertoy の Cubemap A のタブ（キューブマップに描くパス）を、別のファイルに書く。Image のファイルの先頭のコメントで `@cubemapA` と宣言し、`@iChannel` に `cubemapA` と書くと `samplerCube` で読める（#72）。
+Shadertoy の Cubemap A のタブ（キューブマップに描くパス）を、別のファイルに書く。Image のファイルの先頭のコメントで `@cubemapA` と宣言し、`@iChannel` に `cubemapA` と書くと `samplerCube` で読める（#72）。例は `examples/sky/`（`main.glsl` が Image のファイル）。
 
 ```glsl
 // main.glsl（Image）
